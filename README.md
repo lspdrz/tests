@@ -149,4 +149,4 @@ ruff format .
 
 ## License
 
-MIT, see LICENSE.
+BSD-3-Clause, see LICENSE.
