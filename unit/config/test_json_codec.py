@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+from unittest import mock
 
 import aiohttp
 import pytest
@@ -105,7 +106,8 @@ def _read_lines(misc_module, monkeypatch, chunks: list[bytes], max_buffer_size) 
 
     async def read() -> list[bytes]:
         loop = asyncio.get_running_loop()
-        reader = aiohttp.StreamReader(BaseProtocol(loop), limit=64, loop=loop)
+        protocol = mock.create_autospec(BaseProtocol, instance=True)
+        reader = aiohttp.StreamReader(protocol, limit=64, loop=loop)
         for chunk in chunks:
             reader.feed_data(chunk)
         reader.feed_eof()
