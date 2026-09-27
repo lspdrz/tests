@@ -9,9 +9,14 @@ Two fixes to the chat's Share dialog, both in the frontend:
 - Wording (e26b2edaa, open-webui/open-webui#31420, issue open-webui/open-webui#31417). Before a
   link exists the dialog said anyone with the URL could view the chat, but a new link starts
   private. It now says the link is private until you choose who can view it.
+- First click (issue open-webui/open-webui#31486). After 8fc416ee7 the first click inside a
+  dialog opened from a menu was swallowed, so Copy Link needed two clicks. 0082c153f
+  (open-webui/open-webui#31488) fixed the sidebar chat menu only; these tests open Share from the
+  chat header menu and click once, so they stay red until that menu closes first too.
 
-Discriminates: passes on dev efe63bd34, fails on a frontend build with both fixes reverted (the
-relinked dialog still shows Public and the granted account, and the old sentence is shown).
+Discriminates: fails on dev 00a245b9f (the first Copy Link click creates no link); with the header
+menu closing first it passes, and fails on a build with the relinking or wording fix reverted
+(the relinked dialog still shows Public and the granted account, or the old sentence is shown).
 """
 
 from __future__ import annotations
@@ -59,8 +64,6 @@ def share_dialog(page: Page) -> Locator:
     page.get_by_role("menu").get_by_role("button", name="Share").click()
     dialog = page.get_by_role("dialog").filter(has_text="Share Chat")
     expect(dialog).to_be_visible()
-    # the chat menu swallows the first click in the dialog (open-webui/open-webui#31486)
-    dialog.get_by_text("Share Chat", exact=True).click()
     return dialog
 
 
