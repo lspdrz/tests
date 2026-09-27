@@ -8,8 +8,10 @@ key under the same `kid`, the way an IdP rotates without renaming its key.
 
 The token endpoint also takes `grant_type=refresh_token`: a live refresh token gets new tokens
 and is spent (rotation), a spent, revoked or unknown one answers `invalid_grant`. Setting
-`token_lifetime` shortens the `expires_in` of the tokens it issues next, and
-`revoke_refresh_tokens()` withdraws every refresh token issued so far.
+`token_lifetime` shortens the `expires_in` of the tokens it issues next,
+`revoke_refresh_tokens()` withdraws every refresh token issued so far and `refresh_delay` holds
+each refresh answer back that many seconds after the token was spent, so concurrent refreshes
+overlap.
 
 `sso_env(provider)` is the environment that points an instance at it, `sign_in(instance)` walks
 the browser's redirect chain with httpx and returns the session the callback handed out, and
@@ -73,6 +75,7 @@ class OidcProvider:
     refresh_tokens: dict[str, dict] = field(default_factory=dict)  # live ones only
     issued: list[dict] = field(default_factory=list)  # every token response, newest last
     token_lifetime: int = 3600  # seconds, for access tokens and ID tokens issued from now on
+    refresh_delay: float = 0.0  # seconds a refresh answer waits after spending the token
 
     @property
     def issuer(self) -> str:
@@ -88,6 +91,7 @@ class OidcProvider:
             self.requests.clear()
             self.issued.clear()
             self.token_lifetime = 3600
+            self.refresh_delay = 0.0
         self.sign_in_as()
 
     def sign_in_as(
@@ -242,6 +246,7 @@ class OidcProvider:
             return 401, {"error": "invalid_client"}
         with self.lock:
             holder = self.refresh_tokens.pop(form.get("refresh_token", ""), None)
+        time.sleep(self.refresh_delay)
         if holder is None:
             return 400, {"error": "invalid_grant"}
         return 200, self._issue_tokens(holder["userinfo"], holder["sub"])

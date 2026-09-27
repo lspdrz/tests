@@ -78,10 +78,11 @@ def _free_port() -> int:
 
 
 @contextlib.contextmanager
-def _redis_server() -> Iterator[str]:
+def redis_server() -> Iterator[str]:
+    """A redis-server of its own on a free port, for as long as the block runs; yields its URL."""
     binary = shutil.which("redis-server")
     if binary is None:
-        pytest.skip("OWUI_TEST_REDIS=1 needs a redis-server binary on PATH")
+        pytest.skip("needs a redis-server binary on PATH")
     port = _free_port()
     command = [binary, "--port", str(port), "--bind", "127.0.0.1", "--save", ""]
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
@@ -114,7 +115,7 @@ def services_for(extra_env: dict[str, str]) -> Iterator[dict[str, str]]:
         if DATABASE == "postgres" and not _brings_own_database(extra_env):
             env["DATABASE_URL"] = stack.enter_context(_postgres_database())
         if REDIS and not any(name in extra_env for name in REDIS_SETTINGS):
-            env["REDIS_URL"] = stack.enter_context(_redis_server())
+            env["REDIS_URL"] = stack.enter_context(redis_server())
             env["WEBSOCKET_MANAGER"] = "redis"
         yield env
 
