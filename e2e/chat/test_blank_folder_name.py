@@ -6,8 +6,13 @@ before trimming it, so a name of only spaces passed the check, was trimmed to no
 The folder and its chats then disappeared from the sidebar. The name is now trimmed first, and
 a blank one is refused with "Folder name cannot be empty.".
 
-Discriminates: passes on the dev efe63bd34 build, fails on that build with da36d149b reverted
-(the blank name is saved and "Folder updated successfully" shows).
+The dialogs are submitted with one click on Save, as a person does. On dev efe63bd34 that click
+is swallowed because the folder menus leave themselves open behind the dialog (the bug of
+open-webui/open-webui#31486, fixed for the chat menu only), so the dialog tests stay red until the
+folder menus close first.
+
+Discriminates: with the folder menus closing first, passes on the dev build and fails with
+da36d149b reverted (the blank name is saved and "Folder updated successfully" shows).
 """
 
 from __future__ import annotations
@@ -68,9 +73,9 @@ def folder_menu(sidebar: Locator, name: str) -> Locator:
 
 
 def submit_folder_modal(page: Page, name: str) -> None:
-    name_field = page.get_by_role("dialog").get_by_placeholder("Enter folder name")
-    name_field.fill(name)
-    name_field.press("Enter")
+    dialog = page.get_by_role("dialog")
+    dialog.get_by_placeholder("Enter folder name").fill(name)
+    dialog.get_by_role("button", name="Save").click()
 
 
 def expect_refused(page: Page, owner) -> None:
