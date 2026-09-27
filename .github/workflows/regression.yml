@@ -102,9 +102,14 @@ jobs:
           path: tests/report.html
           if-no-files-found: ignore
 
-  # The suite boots its own instances from the checkout.
+  # The suite boots its own instances from the checkout. Split into shards balanced on
+  # the timings in .test_durations; a release is gated on all of them.
   integration:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - name: Check out the test suite
         uses: actions/checkout@v5
@@ -143,18 +148,18 @@ jobs:
         env:
           OPEN_WEBUI_SOURCE_DIR: ${{ github.workspace }}/open-webui/backend
           OPEN_WEBUI_LOG_DIR: test-results/server-logs
-        run: pytest integration -q --junitxml=test-results/junit.xml --html=test-results/integration-report.html --self-contained-html
+        run: pytest integration -q --splits 4 --group ${{ matrix.shard }} --splitting-algorithm duration_based_chunks --junitxml=test-results/junit.xml --html=test-results/integration-report.html --self-contained-html
 
       - name: Summarise the results
         if: always()
         working-directory: tests
-        run: python scripts/junit_summary.py test-results/junit.xml "Integration suite" >> "$GITHUB_STEP_SUMMARY"
+        run: python scripts/junit_summary.py test-results/junit.xml "Integration suite, shard ${{ matrix.shard }} of 4" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload report and server logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: integration-report-${{ inputs.open-webui-ref }}
+          name: integration-report-${{ inputs.open-webui-ref }}-${{ matrix.shard }}
           path: tests/test-results
           if-no-files-found: ignore
 
@@ -163,6 +168,10 @@ jobs:
   integration-postgres-redis:
     runs-on: ubuntu-latest
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - name: Check out the test suite
         uses: actions/checkout@v5
@@ -206,33 +215,28 @@ jobs:
           OPEN_WEBUI_LOG_DIR: test-results/server-logs
           OWUI_TEST_DATABASE: postgres
           OWUI_TEST_REDIS: '1'
-        run: pytest integration -q --junitxml=test-results/junit.xml --html=test-results/integration-report.html --self-contained-html
+        run: pytest integration -q --splits 4 --group ${{ matrix.shard }} --splitting-algorithm duration_based_chunks --junitxml=test-results/junit.xml --html=test-results/integration-report.html --self-contained-html
 
       - name: Summarise the results
         if: always()
         working-directory: tests
-        run: python scripts/junit_summary.py test-results/junit.xml "Integration suite on Postgres and Redis" >> "$GITHUB_STEP_SUMMARY"
+        run: python scripts/junit_summary.py test-results/junit.xml "Integration suite on Postgres and Redis, shard ${{ matrix.shard }} of 4" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload report and server logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: integration-postgres-redis-report-${{ inputs.open-webui-ref }}
+          name: integration-postgres-redis-report-${{ inputs.open-webui-ref }}-${{ matrix.shard }}
           path: tests/test-results
           if-no-files-found: ignore
 
-  # Reports without gating a release until the browser suite has settled.
-  e2e:
+  # Built once for the browser shards, which restore it from the cache.
+  e2e-build:
     runs-on: ubuntu-latest
     continue-on-error: true
+    outputs:
+      cache-key: ${{ steps.key.outputs.cache-key }}
     steps:
-      - name: Check out the test suite
-        uses: actions/checkout@v5
-        with:
-          repository: open-webui/tests
-          ref: ${{ inputs.tests-ref }}
-          path: tests
-
       - name: Check out Open WebUI
         id: open-webui
         uses: actions/checkout@v5
@@ -241,12 +245,17 @@ jobs:
           ref: ${{ inputs.open-webui-ref }}
           path: open-webui
 
-      - name: Restore the frontend build
+      - name: Name the build
+        id: key
+        run: echo "cache-key=e2e-frontend-build-${{ steps.open-webui.outputs.commit }}" >> "$GITHUB_OUTPUT"
+
+      - name: Look up the frontend build
         id: build-cache
         uses: actions/cache/restore@v4
         with:
           path: open-webui/build
-          key: e2e-frontend-build-${{ steps.open-webui.outputs.commit }}
+          key: ${{ steps.key.outputs.cache-key }}
+          lookup-only: true
 
       - uses: actions/setup-node@v5
         if: steps.build-cache.outputs.cache-hit != 'true'
@@ -269,7 +278,38 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: open-webui/build
-          key: e2e-frontend-build-${{ steps.open-webui.outputs.commit }}
+          key: ${{ steps.key.outputs.cache-key }}
+
+  # Reports without gating a release until the browser suite has settled.
+  e2e:
+    needs: e2e-build
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - name: Check out the test suite
+        uses: actions/checkout@v5
+        with:
+          repository: open-webui/tests
+          ref: ${{ inputs.tests-ref }}
+          path: tests
+
+      - name: Check out Open WebUI
+        uses: actions/checkout@v5
+        with:
+          repository: open-webui/open-webui
+          ref: ${{ inputs.open-webui-ref }}
+          path: open-webui
+
+      - name: Restore the frontend build
+        uses: actions/cache/restore@v4
+        with:
+          path: open-webui/build
+          key: ${{ needs.e2e-build.outputs.cache-key }}
+          fail-on-cache-miss: true
 
       - uses: actions/setup-python@v5
         with:
@@ -294,18 +334,18 @@ jobs:
         env:
           OPEN_WEBUI_SOURCE_DIR: ${{ github.workspace }}/open-webui/backend
           OPEN_WEBUI_LOG_DIR: test-results/server-logs
-        run: pytest e2e -q --junitxml=test-results/junit.xml --html=test-results/e2e-report.html --self-contained-html
+        run: pytest e2e -q --splits 2 --group ${{ matrix.shard }} --splitting-algorithm duration_based_chunks --junitxml=test-results/junit.xml --html=test-results/e2e-report.html --self-contained-html
 
       - name: Summarise the results
         if: always()
         working-directory: tests
-        run: python scripts/junit_summary.py test-results/junit.xml "Browser suite" >> "$GITHUB_STEP_SUMMARY"
+        run: python scripts/junit_summary.py test-results/junit.xml "Browser suite, shard ${{ matrix.shard }} of 2" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload report, traces and server logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-report-${{ inputs.open-webui-ref }}
+          name: e2e-report-${{ inputs.open-webui-ref }}-${{ matrix.shard }}
           path: tests/test-results
           if-no-files-found: ignore
 

@@ -93,6 +93,8 @@ They combine. The Redis switch needs `redis-server` on `PATH` and skips without 
 
 `.github/workflows/regression.yml` is called by Open WebUI's release pull requests with the ref under test. It runs the unit, integration, browser and vitest suites in parallel jobs; each writes a summary of failures to the job page and uploads its report, server logs and traces. A further job runs the integration suite with both switches on. It and the browser job report without gating a release for now.
 
+The integration and browser suites run in parallel shards, split by `pytest-split` along the timings in `.test_durations`. A test missing from that file still runs and counts at the average, so the file only needs refreshing when the shards drift apart: run `pytest unit integration e2e --store-durations` against a current checkout and commit the result.
+
 ---
 
 ## Markers
