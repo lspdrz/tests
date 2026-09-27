@@ -237,6 +237,13 @@ def launch(upstream: MockUpstream, extra_env: dict[str, str]) -> Iterator[Launch
                 json={"name": "Admin", "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
                 timeout=60.0,
             )
+            if signup.status_code != 200 and "DATABASE_URL" in extra_env:
+                # an instance joining a database another instance seeded
+                signup = httpx.post(
+                    f"{base_url}/api/v1/auths/signin",
+                    json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+                    timeout=60.0,
+                )
         if signup.status_code != 200:
             pytest.fail(f"admin signup failed: HTTP {signup.status_code} {signup.text}")
         yield LaunchedInstance(
