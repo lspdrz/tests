@@ -38,9 +38,13 @@ def send_message(
     chat_id: str | None = None,
     parent_id: str | None = None,
     history: list[dict] | None = None,
+    files: list[dict] | None = None,
     **extra,
 ) -> ChatTurn:
-    """Start a chat (no `chat_id`) or continue one after the assistant message `parent_id`."""
+    """Start a chat (no `chat_id`) or continue one after the assistant message `parent_id`.
+
+    `files` are attached to the user message, as the client stores an upload on it.
+    """
     user_message_id, assistant_message_id = str(uuid.uuid4()), str(uuid.uuid4())
     user_message = {
         "id": user_message_id,
@@ -51,6 +55,8 @@ def send_message(
         "models": [model],
         "timestamp": int(time.time()),
     }
+    if files:
+        user_message["files"] = files
     payload = {
         "model": model,
         "messages": [*(history or []), {"role": "user", "content": content}],
