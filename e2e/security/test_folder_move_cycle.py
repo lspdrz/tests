@@ -5,8 +5,6 @@ descendant, so the dragged folder and everything below it vanished from the side
 The sidebar only ignores a drop on the dragged folder's direct children, so a drop on a
 grandchild reaches the server, which now refuses it with an error the page shows as a toast.
 
-Twin of unit/security/test_folder_move_cycle.py.
-
 Discriminates: passes on bbfa876af; with the move route's subtree check removed the drop is
 accepted and no error appears.
 """

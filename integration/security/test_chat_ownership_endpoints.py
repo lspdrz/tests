@@ -1,17 +1,17 @@
-"""Regression: a filter or action must not be pointed at someone else's chat.
+"""Regression: a chat request, filter or action must not be pointed at someone else's chat.
 
 open-webui 0.11.0 fix `c882222f6` (PR #27486): `/api/chat/completed` and
 `/api/chat/actions/{action_id}` took `chat_id` from the request body and handed it to the event
 emitter without checking the caller owned that chat. The emitter persists by chat id alone, so
 an action or outlet filter wrote into whichever chat the caller named. The fix adds
 `verify_chat_ownership` in front of both handlers: temporary (`temporary:`, `local:`) ids pass,
-`channel:` ids get 400, and a non-admin who does not own the chat gets 404.
+`channel:` ids get 400, and a non-admin who does not own the chat gets 404. `/api/chat/completions`
+is the third route that reads a body `chat_id`; it checks the owner itself before it writes the
+new turn into the chat.
 
-Twin of unit/security/test_chat_ownership_endpoints.py (its `ast` sweep over main.py stays
-there).
-
-Discriminates: passes on dev bbfa876af; with the two `verify_chat_ownership` calls removed a
-user's action call rewrites the admin's stored reply and neither route answers 404.
+Discriminates: passes on dev ef67cc3fa; with the two `verify_chat_ownership` calls removed a
+user's action call rewrites the admin's stored reply and neither route answers 404, and with the
+owner check in `chat_completion` removed a user's message is written into the admin's chat.
 """
 
 from __future__ import annotations
@@ -77,6 +77,33 @@ def _stored_content(client, turn) -> str:
     return chat["history"]["messages"][turn.assistant_message_id]["content"]
 
 
+def _stored_messages(client, chat_id: str) -> dict:
+    return client.get(f"/api/v1/chats/{chat_id}").json()["chat"]["history"]["messages"]
+
+
+def _continuation(turn, content: str) -> dict:
+    """The next turn of `turn`'s chat, as the web client sends it."""
+    user_message_id, assistant_message_id = str(uuid.uuid4()), str(uuid.uuid4())
+    return {
+        "model": "mock-model",
+        "messages": [{"role": "user", "content": content}],
+        "stream": True,
+        "chat_id": turn.chat_id,
+        "parent_id": turn.assistant_message_id,
+        "id": assistant_message_id,
+        "user_message": {
+            "id": user_message_id,
+            "parentId": turn.assistant_message_id,
+            "childrenIds": [assistant_message_id],
+            "role": "user",
+            "content": content,
+            "models": ["mock-model"],
+        },
+        "session_id": "harness-session",
+        "background_tasks": {"title_generation": False, "tags_generation": False},
+    }
+
+
 @pytest.fixture
 def admin_turn(admin, upstream):
     with admin.client() as client:
@@ -110,6 +137,33 @@ def test_a_users_action_cannot_rewrite_someone_elses_reply(
         assert _stored_content(admin_client, admin_turn) == original, (
             "a user's action call rewrote a reply in the admin's chat (#27486)"
         )
+
+
+def test_a_user_cannot_add_a_turn_to_someone_elses_chat(admin, admin_turn, make_user, upstream):
+    with admin.client() as admin_client:
+        stored_before = _stored_messages(admin_client, admin_turn.chat_id)
+        with make_user().client() as client:
+            response = client.post(
+                "/api/chat/completions",
+                json=_continuation(admin_turn, "a stranger's message"),
+            )
+
+        assert response.status_code == 404, (
+            f"continuing another user's chat answered HTTP {response.status_code} instead of "
+            f"404: {response.text[:200]}"
+        )
+        assert _stored_messages(admin_client, admin_turn.chat_id) == stored_before, (
+            "a stranger's message was written into the admin's chat"
+        )
+
+
+def test_the_owner_can_add_a_turn_to_their_chat(make_user, upstream):
+    with make_user().client() as client:
+        turn, _ = ask(client, "my first question")
+        response = client.post("/api/chat/completions", json=_continuation(turn, "a follow-up"))
+
+        assert response.status_code == 200, response.text
+        assert response.json()["chat_id"] == turn.chat_id
 
 
 @pytest.mark.parametrize("endpoint", ["completed", "action"])

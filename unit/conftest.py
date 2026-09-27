@@ -154,12 +154,6 @@ def misc_module(owui_module):
 
 
 @pytest.fixture(scope="session")
-def web_search_main_module(owui_module):
-    """`open_webui.retrieval.web.main` (get_filtered_results)."""
-    return owui_module("open_webui.retrieval.web.main")
-
-
-@pytest.fixture(scope="session")
 def automations_module(owui_module):
     """`open_webui.utils.automations`, with the recurrence API it re-exports.
 

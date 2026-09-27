@@ -1,4 +1,4 @@
-"""Regression: a folder can never become its own ancestor.
+"""Regression: a folder can never become its own ancestor, and no walk follows a loop forever.
 
 open-webui 0.11.1, fix `23b3a69bc` (#28748): `POST /api/v1/folders/{id}/update/parent` accepted a
 move of a folder under itself or under one of its own descendants. A folder whose parent chain
@@ -7,17 +7,25 @@ The fix answers 400 for such a move and has `GET /api/v1/folders/` put a looping
 the top level, so a loop already in the database becomes reachable again. Loops that predate the
 fix are seeded straight into the scratch instance's database.
 
-Twin of unit/security/test_folder_move_cycle.py.
+Every walk over the folder tree followed such a loop with no record of where it had been: the
+access check behind opening a shared folder, the child walk behind a folder's chat list, the
+subtree walk behind marking a folder read and deleting it, and the delete cascade. The fix bounds
+each walk with the ids it has seen. Those walks run on a throwaway instance of their own, with a
+time limit on every request, because a walk that follows the loop spins until the process goes.
 
-Discriminates: passes on bbfa876af; with the subtree check removed from the move route the moves
+Discriminates: passes on ef67cc3fa; with the subtree check removed from the move route the moves
 into the own subtree answer 200 and write the loop, and with the cycle check removed from the
-listing the seeded loops are listed unchanged; the other tests pass on both.
+listing the seeded loops are listed unchanged. With the visited-id sets of 23b3a69bc removed the
+access check and the subtree walk never answer, and the chat list and the delete leave out the
+folder the loop leads back through. The other tests pass on both.
 """
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
+from harness.actors import create_user
 from harness.backends import write_rows
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
@@ -191,3 +199,118 @@ def test_access_granted_on_an_ancestor_still_reaches_a_nested_folder(owner, tree
         f"a read grant two levels up no longer reaches the nested folder: HTTP {nested.status_code}"
     )
     assert unrelated.status_code == 404
+
+
+# Every walk over a looping tree, on a throwaway instance a spinning walk cannot take down.
+
+WALK_TIME_LIMIT = 15.0
+
+
+@pytest.fixture(scope="module")
+def throwaway(instance_with):
+    return instance_with({"REGRESSION_THROWAWAY_INSTANCE": "folder-parent-loops"})
+
+
+@pytest.fixture
+def loop(throwaway):
+    """Folders 'a' and 'b', each the other's parent, with a chat in each; and their owner."""
+    owner = create_user(throwaway)
+    with owner.client() as client:
+        a = _create_folder(client, "a")
+        b = _create_folder(client, "b", parent_id=a)
+        chats = {
+            folder_id: client.post(
+                "/api/v1/chats/new", json={"chat": {"title": f"in {name}"}, "folder_id": folder_id}
+            ).json()["id"]
+            for name, folder_id in (("a", a), ("b", b))
+        }
+    _write_parents(throwaway, {a: b})
+    return {"owner": owner, "a": a, "b": b, "chats": chats}
+
+
+def _within_the_limit(send, what: str) -> httpx.Response:
+    try:
+        return send(timeout=WALK_TIME_LIMIT)
+    except httpx.TimeoutException:
+        pytest.fail(
+            f"{what} gave no answer within {WALK_TIME_LIMIT:g}s over a two-folder parent loop: "
+            "the walk follows the loop and never stops (#28748)"
+        )
+
+
+@pytest.mark.slow
+def test_opening_a_looping_folder_as_a_stranger_is_refused_in_time(throwaway, loop):
+    with create_user(throwaway).client() as client:
+        response = _within_the_limit(
+            lambda **limit: client.get(f"/api/v1/folders/{loop['a']}", **limit),
+            "a stranger opening the folder",
+        )
+
+    assert response.status_code == 404, response.text
+
+
+@pytest.mark.slow
+def test_a_looping_folders_chat_list_reaches_both_folders(loop):
+    with loop["owner"].client() as client:
+        response = _within_the_limit(
+            lambda **limit: client.get(f"/api/v1/chats/folder/{loop['a']}", **limit),
+            "listing the folder's chats",
+        )
+
+    assert response.status_code == 200, response.text
+    assert {chat["id"] for chat in response.json()} == set(loop["chats"].values()), (
+        "the chat list of a folder in a parent loop lost the other folder's chat: the child walk "
+        "followed the loop until it failed (#28748)"
+    )
+
+
+@pytest.mark.slow
+def test_marking_a_looping_folder_read_covers_both_folders(loop):
+    with loop["owner"].client() as client:
+        response = _within_the_limit(
+            lambda **limit: client.post(f"/api/v1/folders/{loop['a']}/read", **limit),
+            "marking the folder read",
+        )
+
+    assert response.status_code == 200, response.text
+    assert set(response.json()["folder_ids"]) == {loop["a"], loop["b"]}
+
+
+@pytest.mark.slow
+def test_deleting_a_looping_folder_deletes_both_folders(loop):
+    with loop["owner"].client() as client:
+        response = _within_the_limit(
+            lambda **limit: client.delete(f"/api/v1/folders/{loop['a']}", **limit),
+            "deleting the folder",
+        )
+        leftovers = {
+            folder_id: client.get(f"/api/v1/folders/{folder_id}").status_code
+            for folder_id in (loop["a"], loop["b"])
+        }
+
+    assert response.status_code == 200, response.text
+    assert leftovers == {loop["a"]: 404, loop["b"]: 404}, (
+        f"deleting a folder in a parent loop left folders behind: {leftovers} (#28748)"
+    )
+
+
+@pytest.mark.slow
+def test_every_walk_still_reaches_a_whole_acyclic_tree(throwaway):
+    owner = create_user(throwaway)
+    with owner.client() as client:
+        top = _create_folder(client, "top")
+        middle = _create_folder(client, "middle", parent_id=top)
+        bottom = _create_folder(client, "bottom", parent_id=middle)
+        chat_in_bottom = client.post(
+            "/api/v1/chats/new", json={"chat": {"title": "deep"}, "folder_id": bottom}
+        ).json()["id"]
+
+        listed_chats = client.get(f"/api/v1/chats/folder/{top}").json()
+        marked = client.post(f"/api/v1/folders/{top}/read").json()
+        deleted = client.delete(f"/api/v1/folders/{top}")
+        bottom_after = client.get(f"/api/v1/folders/{bottom}")
+
+    assert [chat["id"] for chat in listed_chats] == [chat_in_bottom]
+    assert set(marked["folder_ids"]) == {top, middle, bottom}
+    assert deleted.status_code == 200, deleted.text
+    assert bottom_after.status_code == 404
