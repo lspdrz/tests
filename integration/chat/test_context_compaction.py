@@ -14,9 +14,11 @@ sends the provider the system prompt (with the summary appended) plus the recent
    current message, so the next turn sliced away the whole kept window.
 5. Context size (commits df94268, e8f2c12, #27031, #26752, #24410): a tool loop summed
    `prompt_tokens` over every provider call, and a chat's own threshold is now capped by the
-   global one. The same commits taught the threshold to read Ollama and llama.cpp usage; the
-   message table normalizes usage before compaction reads it, so that part only shows on a
-   legacy chat and stays in unit/chat/test_context_compaction.py.
+   global one. The same commits taught the threshold to read Ollama, llama.cpp and OpenAI usage.
+   A reply stored today has its usage normalized on the way into the message table, but the
+   migration that built that table copied each older reply's usage verbatim, so an upgraded
+   chat still holds the provider's own keys. That chat is made here by rewriting the usage in a
+   copy of the database and booting on it.
 6. Context usage (commit 7a9928ef1, #27362): `GET /api/v1/chats/{id}` reports the tokens the next
    turn will be judged by.
 
@@ -27,20 +29,27 @@ checkpoint, next-turn, no-boundary, retention and summary-text tests; ignoring t
 model fails the configured-model case; folding the system message in fails the system-prompt
 test and the empty-summary fallback; the checkpoint on the current message fails the checkpoint,
 next-turn and summary-text tests; summing `prompt_tokens` fails the tool-loop test; dropping the
-cap fails the capped case; ignoring the retention setting fails the keep-half case. The usage
+cap fails the capped case; ignoring the retention setting fails the keep-half case; reading only
+`input_tokens` (dev ef67cc3fa) fails the upgraded-chat test for all three dialects. The usage
 dialect, under-threshold, compaction-off, clamp and normalization tests pass on all.
 """
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import uuid
+from contextlib import closing
+from pathlib import Path
 
 import httpx
 import pytest
 
+from harness import backends
 from harness import upstream as reply
 from harness.chat import ChatTurn, ask
 from harness.chat_history import seed_chat
+from harness.prepared_data import serving, snapshot_database
 from harness.upstream import MOCK_MODEL_ID
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
@@ -375,3 +384,46 @@ def test_stored_usage_is_normalized(user, upstream, provider_usage):
 
     usage = message["usage"]
     assert (usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]) == (7, 3, 10)
+
+
+UPGRADED_USAGE = {
+    "ollama": {"prompt_eval_count": 90_000, "eval_count": 500},
+    "llama.cpp": {"prompt_n": 90_000, "predicted_n": 500},
+    "openai": {"prompt_tokens": 90_000, "completion_tokens": 500},
+}
+
+
+def store_usage_as_an_upgrade_left_it(database: Path, chat_ids: dict[str, str]) -> None:
+    """The message table migration copied each reply's usage verbatim, provider keys and all."""
+    with closing(sqlite3.connect(database)) as connection, connection:
+        for dialect, chat_id in chat_ids.items():
+            connection.execute(
+                "UPDATE chat_message SET usage = ? WHERE chat_id = ? AND role = 'assistant'",
+                (json.dumps(UPGRADED_USAGE[dialect]), chat_id),
+            )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    backends.DATABASE == "postgres", reason="copies the SQLite file, none on Postgres"
+)
+def test_usage_an_upgrade_stored_in_the_provider_dialect_counts(
+    instance, user, compaction, tmp_path
+):
+    compaction(threshold=80_000)
+    with user.client() as client:
+        chat_ids = {
+            dialect: short_chat_with_usage(client, {"input_tokens": 1})[0]
+            for dialect in UPGRADED_USAGE
+        }
+    store_usage_as_an_upgrade_left_it(snapshot_database(instance, tmp_path), chat_ids)
+
+    with serving(tmp_path) as upgraded, upgraded.client(user.token) as client:
+        counted = {
+            dialect: client.get(f"/api/v1/chats/{chat_id}").json()["context_usage"]["tokens"]
+            for dialect, chat_id in chat_ids.items()
+        }
+
+    assert counted == dict.fromkeys(UPGRADED_USAGE, 90_500), (
+        "usage an upgrade left in a provider's own keys no longer counts toward compaction"
+    )

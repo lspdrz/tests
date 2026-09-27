@@ -2,16 +2,19 @@
 
 Fix commit `061f5e3a6` (#28858) in `utils/anthropic.py` stopped the OpenAI-to-Anthropic stream
 converter from re-parsing a tool call's whole argument buffer after every delta: it now only
-tries once the buffer can be complete (it ends in `}`, or it never opened with `{`). The parse
-count itself stays in unit/chat/test_anthropic_tool_call_streaming.py. These tests pin what a
-client of the endpoint sees however the provider splits the arguments: the `input_json_delta`
-pieces join to exactly the provider's JSON, and each tool block closes exactly once, inline,
-so a fragment arriving after the close is dropped.
+tries once the buffer can be complete (it ends in `}`, or it never opened with `{`). The
+re-parse shows as the CPU the server burns: a long tool call streamed in 2000 pieces costs about
+the same as in one piece with the fix, and seconds more without it, since each failed parse walks
+the whole buffer so far. The other tests pin what a client of the endpoint sees however the
+provider splits the arguments: the `input_json_delta` pieces join to exactly the provider's
+JSON, and each tool block closes exactly once, inline, so a fragment arriving after the close is
+dropped.
 
-Twin of unit/chat/test_anthropic_tool_call_streaming.py (its assembly cases).
+Twin of unit/chat/test_anthropic_tool_call_streaming.py.
 
-Discriminates: passes with the fix and with it reverted (the guard only saves work); a guard
-that also skips non-object buffers leaves the array case open until the end of the stream, so
+Discriminates: with the guard removed on dev ef67cc3fa the CPU test fails (about 6 s of extra
+CPU against 0.01 s with it) and the assembly tests pass; a guard that also skips non-object
+buffers leaves the array case open until the end of the stream, so
 `test_a_non_object_argument_closes_as_soon_as_it_parses` fails and the rest pass.
 """
 
@@ -143,3 +146,32 @@ def test_a_non_object_argument_closes_as_soon_as_it_parses(admin, raw):
 
     assert arguments_by_block(events) == {0: "[1, 2]"}
     assert stops_by_block(events) == [0]
+
+
+# numbers make a failed parse of the partial buffer costly, as a long tool call's tokens do
+LONG_ARGUMENTS = '{"values": [' + "7," * 200_000 + "7]}"
+# splitting costs next to nothing with the fix and about six seconds without it
+ALLOWED_EXTRA_CPU_SECONDS = 1.0
+
+
+def server_cpu_for(instance, admin, raw, pieces: list[str]) -> float:
+    """The server CPU one streamed tool call costs, the cheaper of two readings."""
+    readings = []
+    for _ in range(2):
+        before = instance.cpu_seconds()
+        events = stream_messages(admin, raw, single_tool_call(pieces))
+        readings.append(instance.cpu_seconds() - before)
+        assert arguments_by_block(events) == {0: LONG_ARGUMENTS}
+    return min(readings)
+
+
+@pytest.mark.slow
+def test_a_long_tool_call_costs_about_the_same_however_it_is_split(instance, admin, raw):
+    whole = server_cpu_for(instance, admin, raw, [LONG_ARGUMENTS])
+    pieces = server_cpu_for(instance, admin, raw, split(LONG_ARGUMENTS, 200))
+
+    measured = f"in one piece: {whole:.2f}s CPU, in 2000 pieces: {pieces:.2f}s CPU"
+    print(measured)  # the reading is the point; `-s` shows it whichever way the guard lands
+    assert pieces - whole < ALLOWED_EXTRA_CPU_SECONDS, (
+        f"the argument buffer is re-parsed after every piece (#28858): {measured}"
+    )

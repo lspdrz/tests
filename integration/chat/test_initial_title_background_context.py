@@ -8,13 +8,16 @@ PR #30106 raised it from DEBUG. The title was already written by then and the me
 played no part. The handler now reads `ctx.get('model')`, and the memory review, which accepts
 no model, stops on the title path because that context carries no finished reply.
 
+The log line only exists because PR #30106 made the handler log with `log.exception`; if it
+sinks back to DEBUG a broken title path is invisible again and the tests above pass on a broken
+build. So a title task made to fail (a title answer whose text is not a string) must still leave
+the line and its traceback in the log.
+
 Twin of unit/chat/test_initial_title_background_context.py.
 
-The log line only exists because PR #30106 made the handler log with `log.exception`; the
-unit audit in unit/chat/test_initial_title_background_context.py keeps it that way.
-
 Discriminates: with 6b36f620c reverted both tests that open a new chat fail on the logged
-KeyError; the memory-feature gate passes on both.
+KeyError; the memory-feature gate passes on both. With the handler logging at `log.debug` again
+(as before PR #30106) the failing-title test fails on dev ef67cc3fa (nothing is logged).
 """
 
 from __future__ import annotations
@@ -139,3 +142,19 @@ def test_a_chat_without_the_memory_feature_is_not_reviewed(memory_instance):
         ask(client, "I moved to Vienna last year.", features={"memory": False})
 
     assert memory_reviews(upstream, wait=1.5) == []
+
+
+def test_a_failing_title_task_is_logged_with_its_traceback(
+    instance, user, upstream, title_generation_on
+):
+    # a title answer whose text is not a string makes the title task raise
+    upstream.queue(
+        reply.text("", reasoning=["not", "text"], match=is_task), reply.text("Sure, let's plan.")
+    )
+    offset = instance.log_size()
+    with user.client() as client:
+        ask(client, "help me plan a trip to Rome", background_tasks={"title_generation": True})
+
+    logged = log_after_the_title_task(instance, offset)
+    assert TITLE_ERROR in logged
+    assert "Traceback" in logged
