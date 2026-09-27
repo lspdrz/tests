@@ -9,9 +9,10 @@ PDF's images are opened by Pillow and read by rapidocr on onnxruntime and OpenCV
 bump that breaks one of those paths fails the upload or loses the text, which
 `GET /api/v1/files/{id}/data/content` shows. The library contracts are in unit/deps/.
 
-EUC-KR and Shift-JIS text fail on dev until #31352 is fixed (PR #31356): chardet 7.4.3 says
-CP949 for EUC-KR, which the codec map in `_detect_text_encoding` lacks, and Shift-JIS is missing
-from its try order, so both are decoded as GB18030 mojibake.
+EUC-KR and Shift-JIS text were decoded as GB18030 mojibake (issue #31352, fix 3c47f0d7e, PR
+#31356): chardet 7.4.3 says CP949 for EUC-KR, which the codec map in `_detect_text_encoding`
+lacked, and Shift-JIS was missing from its try order. Both cases pass on dev efe63bd34 and fail
+with 3c47f0d7e reverted.
 
 Discriminates: passes on dev bbfa876af (.rst, .epub and .odt with a pandoc binary on PATH). One
 backend copy broke pypdf's `extract_text`, `docx2txt.process`, the xlsx, rst and epub partitions

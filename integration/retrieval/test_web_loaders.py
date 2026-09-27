@@ -8,7 +8,7 @@
   that cannot be read now names the link. A closed port still got the old message (#31347, PR
   #31351): the default loader swallows the connection error and the empty page fails at the
   vector save. The chat's own attach route answered a generic error for it (PR #31354). Both
-  tests below fail on dev until those fixes merge.
+  tests pass on dev efe63bd34 and fail with 420b4a279 and 91fb33ef5 reverted.
 - Microsoft Web IQ loader (issue #28688, commits 6dcc2d5269 + 140d2cf4b5): its constructor did
   not take the `api_base_url` that `get_web_loader` always passes, so Web IQ never loaded a page.
 - Content-type sniffing (commit 886248de36): any type merely containing `xml` counted as text,

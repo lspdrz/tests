@@ -1,11 +1,12 @@
 """Regression: backslashes in an uploaded HTML file were read as escape codes.
 
-Issue open-webui/open-webui#31440. With the built-in loaders, `.html` and `.htm` files are opened
-with the `unicode_escape` codec, so `C:\\new\\table` is stored with a line break and a tab, and a
-page holding `C:\\Users\\...` cannot be processed at all. Plain text uploads keep backslashes.
+Issue open-webui/open-webui#31440, fix 59ea3b7c2 (open-webui/open-webui#31450). With the
+built-in loaders, `.html` and `.htm` files were opened with the `unicode_escape` codec, so
+`C:\\new\\table` was stored with a line break and a tab, and a page holding `C:\\Users\\...`
+could not be processed at all. Plain text uploads keep backslashes.
 
-Discriminates: fails on dev ac00d40e3 (the stored text holds a line break and a tab, and the
-second page ends `failed`), passes with the HTML branch reading the detected text encoding.
+Discriminates: passes on dev efe63bd34, fails with 59ea3b7c2 reverted (the stored text holds a
+line break and a tab, and the second page ends `failed`).
 """
 
 from __future__ import annotations

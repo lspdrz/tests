@@ -11,8 +11,8 @@ seen from outside.
   empty `Bearer `.
 - 429 and 5xx answers are retried, after `Retry-After` when one is given.
 - A page Firecrawl returns blank, or cannot scrape in three attempts, is refused with a 400
-  that names the link instead of attaching nothing (#31347, PR #31351). Those two tests fail
-  on dev until that fix merges.
+  that names the link instead of attaching nothing (#31347, PR #31351). Those two tests pass
+  on dev efe63bd34 and fail with 420b4a279 reverted.
 
 Twin of unit/retrieval/test_firecrawl.py, which keeps the audit that every web module calling
 `requests` imports it (#23966 Bug 1, broad) and the timeout parsing no route reaches.
