@@ -5,6 +5,8 @@ is recorded with its headers (names lower-cased) and cookies; `route` scripts an
 `redirect` a redirect, and unrouted paths answer 404. A WebSocket upgrade on any path opens a
 `TerminalSession`: its first message is the auth handshake, later ones are recorded and echoed
 back the way a shell prints what it is typed, and `ended` is set once either side closes.
+Setting `cors` lets a page of another origin call it, as a terminal a user added in their own
+settings is called from their browser: every answer allows any origin and a preflight gets 204.
 
 `terminal_session` opens the browser's side of that WebSocket against the instance's proxy.
 """
@@ -65,6 +67,7 @@ class FakeTerminalServer:
     received: list[TerminalRequest] = field(default_factory=list)
     sessions: list[TerminalSession] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    cors: bool = False
 
     def route(self, method: str, path: str, handler: Handler | Answer) -> None:
         """Answer `method path` (path without the query string) with a handler or a fixed answer."""
@@ -142,6 +145,10 @@ def serving_terminal(host: str = "127.0.0.1") -> Iterator[FakeTerminalServer]:
             status, headers, body = (
                 handler(request) if handler else (404, {"Content-Type": "text/plain"}, b"")
             )
+            if server_state.cors:
+                if self.command == "OPTIONS" and not handler:
+                    status, body = 204, b""
+                headers = {**headers, **self._cors_headers()}
             self.send_response(status)
             for name, value in headers.items():
                 self.send_header(name, value)
@@ -149,6 +156,15 @@ def serving_terminal(host: str = "127.0.0.1") -> Iterator[FakeTerminalServer]:
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
+
+        def _cors_headers(self) -> dict[str, str]:
+            return {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": self.headers.get(
+                    "Access-Control-Request-Headers", "*"
+                ),
+            }
 
         def _serve_session(self) -> None:
             session = TerminalSession(
