@@ -29,6 +29,7 @@ from harness.upstream import MockUpstream
 
 ADMIN_EMAIL = "admin@example.com"
 ADMIN_PASSWORD = "adminpassword123"
+WEBUI_SECRET_KEY = "integration-secret-key"  # also the key OAuth client info is encrypted with
 
 # `loop="none"` as `open-webui serve` does: uvicorn's default loop leaves Windows sockets unwired
 LAUNCHER = """
@@ -189,7 +190,7 @@ def launch(upstream: MockUpstream, extra_env: dict[str, str]) -> Iterator[Launch
     env = isolated_env(
         {
             "PYTHONUNBUFFERED": "1",
-            "WEBUI_SECRET_KEY": "integration-secret-key",
+            "WEBUI_SECRET_KEY": WEBUI_SECRET_KEY,
             "WEBUI_AUTH": "true",
             "WEBUI_URL": base_url,
             # socket.io derives its allowed origins from this; a mismatch is a 403 on the handshake

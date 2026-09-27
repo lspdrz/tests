@@ -9,7 +9,8 @@ endpoint for the code and refresh grants. Refresh tokens rotate: a spent, revoke
 answers `invalid_grant`.
 
 The authorization server records every request. `access_token_lifetime` sets the `expires_in`
-of the tokens it issues next, `revoke_refresh_tokens()` withdraws the live refresh tokens and
+of the tokens it issues next, `registration_names_scope = False` leaves the scope out of its
+registration answers, `revoke_refresh_tokens()` withdraws the live refresh tokens and
 `ProtectedMcp.presented` lists every bearer token the MCP server was shown.
 """
 
@@ -79,6 +80,7 @@ class McpAuthorizationServer:
     refresh_tokens: dict[str, dict] = field(default_factory=dict)  # live ones only
     issued: list[dict] = field(default_factory=list)  # every token response, newest last
     access_token_lifetime: int = 3600
+    registration_names_scope: bool = True  # RFC 7591 lets a server leave `scope` out (Atlassian)
 
     @property
     def issuer(self) -> str:
@@ -126,6 +128,8 @@ class McpAuthorizationServer:
             "client_id_issued_at": int(time.time()),
             "client_secret_expires_at": 0,
         }
+        if not self.registration_names_scope:
+            client.pop("scope", None)
         with self.lock:
             self.clients[client["client_id"]] = client
         return 201, client
