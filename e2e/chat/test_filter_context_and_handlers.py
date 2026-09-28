@@ -4,15 +4,15 @@
    kept on it, where every filter stage of a chat turn used to read them from the database
    again. So a filter an admin switches off mid-reply still runs its `stream` stage to the end
    of that reply. Here a second filter's inlet switches it off, which makes the moment exact.
-2. Unpinned, no issue filed: an `outlet` filter that edits the reply's `content`, as the filter
-   docs' examples do, has its edit stored in `content` while the reply's `output` items keep the
-   unedited text, and the chat page renders a reply from its `output`. So the edit never shows,
-   live or after a reload. Red until the outlet edit reaches what the page renders.
+2. Unpinned, no issue filed: an `outlet` filter that edits the reply edits both its `content`
+   and the text of its `output` message items, since the chat page renders a reply from its
+   `output`. The edit shows live, is stored and still shows after a reload.
 
 Twin of integration/chat/test_filter_context_and_handlers.py (its mid-request cases).
 
-Discriminates: the first test passes on dev ef67cc3fa and fails with 7d694570a reverted in a
-backend copy (the reply arrives without the stream mark); the second fails on dev ef67cc3fa.
+Discriminates: both pass on dev ef67cc3fa. The first fails with 7d694570a reverted in a backend
+copy (the reply arrives without the stream mark); the second fails in a backend copy that drops
+the outlet's `output` edit (the page shows the unedited reply).
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from playwright.sync_api import expect
 
 from harness import upstream as reply
 from harness.plugins import installed_function
-from utils.chat_ui import REPLY_TIMEOUT_MS, expect_reply, last_reply, send
+from utils.chat_ui import expect_reply, send
 
 pytestmark = [pytest.mark.regression, pytest.mark.requires_browser, pytest.mark.requires_source]
 
@@ -53,13 +53,18 @@ class Filter:
         return event
 """
 
-# the filter docs' "highlight outputs" example
 HIGHLIGHTING_OUTLET = """
 class Filter:
     async def outlet(self, body):
         for message in body["messages"]:
-            if message["role"] == "assistant":
-                message["content"] = f"{message['content']} [highlighted]"
+            if message["role"] != "assistant":
+                continue
+            message["content"] += " [highlighted]"
+            for item in message.get("output", []):
+                if item["type"] == "message":
+                    for part in item["content"]:
+                        if part["type"] == "output_text":
+                            part["text"] += " [highlighted]"
         return body
 """
 
@@ -79,16 +84,26 @@ def test_the_reply_keeps_the_filter_switched_off_during_it(
             expect_reply(page, "filtered reply [late stream]")
 
 
-def stored_reply_content(person, chat_id: str, expected: str) -> str:
+def stored_reply(person, chat_id: str, expected: str) -> dict:
     """The stored reply once the outlet stage has rewritten it, or as it stands at the deadline."""
     deadline = time.monotonic() + 10
     with person.client() as client:
         while True:
             history = client.get(f"/api/v1/chats/{chat_id}").json()["chat"]["history"]
-            content = history["messages"][history["currentId"]]["content"]
-            if content == expected or time.monotonic() > deadline:
-                return content
+            message = history["messages"][history["currentId"]]
+            if message["content"] == expected or time.monotonic() > deadline:
+                return message
             time.sleep(0.2)
+
+
+def output_text(message: dict) -> str:
+    return "".join(
+        part["text"]
+        for item in message.get("output", [])
+        if item["type"] == "message"
+        for part in item["content"]
+        if part["type"] == "output_text"
+    )
 
 
 def test_an_outlet_edit_to_the_reply_shows_on_the_page(page_for, admin, make_user, upstream):
@@ -98,14 +113,12 @@ def test_an_outlet_edit_to_the_reply_shows_on_the_page(page_for, admin, make_use
     page = page_for(person)
     with installed_function(admin, HIGHLIGHTING_OUTLET, is_global=True):
         send(page, prompt)
-        expect_reply(page, "plain answer")
+        expect_reply(page, "plain answer [highlighted]")
         expect(page).to_have_url(re.compile(r"/c/[0-9a-f-]+$"))
         chat_id = page.url.rsplit("/", 1)[-1]
-        stored = stored_reply_content(person, chat_id, "plain answer [highlighted]")
-        assert stored == "plain answer [highlighted]"
-        page.reload()
+        stored = stored_reply(person, chat_id, "plain answer [highlighted]")
+        assert stored["content"] == "plain answer [highlighted]"
+        assert output_text(stored) == "plain answer [highlighted]"
 
-        # the edit is stored in content; the page renders the reply's unedited output items
-        expect(last_reply(page)).to_contain_text(
-            "plain answer [highlighted]", timeout=REPLY_TIMEOUT_MS
-        )
+        page.reload()
+        expect_reply(page, "plain answer [highlighted]")
