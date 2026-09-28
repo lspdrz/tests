@@ -7,6 +7,10 @@ reload shows. Each test signs in as a fresh account and scripts every reply by i
 Discriminates: passes on upstream dev `176d31d1d`; in a frontend build with the reply switcher
 removed, the edit-and-send branch replacing the question, an edited reply not saved, continue
 sent without its marker or a deleted version not stored, the matching tests turn red.
+
+`test_the_version_picked_with_the_switcher_is_the_one_a_reload_opens` is red on purpose: the
+single-reply switcher moves `currentId` but never saves it, while the multi-model switcher and
+the chat overview do. No upstream issue yet (#30306 asks for the multi-model case only).
 """
 
 from __future__ import annotations
@@ -80,6 +84,24 @@ def test_both_versions_of_a_regenerated_reply_are_there_after_a_reload(chat_page
     expect(conversation(chat_page).get_by_text("2/2")).to_be_visible()
     conversation(chat_page).get_by_role("button", name="Previous message").click()
     expect_reply(chat_page, "kept version")
+
+
+def test_the_version_picked_with_the_switcher_is_the_one_a_reload_opens(chat_page, upstream):
+    upstream.queue(
+        reply.text("older pick", match=reply.answering("name a tree")),
+        reply.text("newer pick", match=reply.answering("name a tree")),
+    )
+    send(chat_page, "name a tree")
+    expect_reply(chat_page, "older pick")
+    _regenerate(chat_page)
+    expect_reply(chat_page, "newer pick")
+
+    conversation(chat_page).get_by_role("button", name="Previous message").click()
+    expect_reply(chat_page, "older pick")
+
+    chat_page.reload()
+    expect(conversation(chat_page).get_by_text("1/2")).to_be_visible()
+    expect_reply(chat_page, "older pick")
 
 
 def test_continue_response_appends_to_the_same_reply(chat_page, upstream):
