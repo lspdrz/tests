@@ -23,7 +23,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from harness import upstream as reply
-from utils.chat_ui import chat_input, expect_reply, send
+from utils.chat_ui import expect_reply, send
 
 pytestmark = [pytest.mark.journey, pytest.mark.requires_browser, pytest.mark.requires_source]
 
@@ -139,17 +139,19 @@ def test_an_admin_can_save_a_banner_without_remembered_dismissal(admin_page, adm
 
 
 def test_a_dismissed_banner_stays_dismissed_after_a_reload(admin, page_for, make_user, no_banners):
-    _publish(admin, [_banner("Please read the new policy")])
+    _publish(
+        admin, [_banner("Please read the new policy"), _banner("Always here", dismissible=False)]
+    )
     page = page_for(make_user())
     expect(page.get_by_text("Please read the new policy")).to_be_visible()
 
-    _close_button(page).click()
+    _close_button(page).first.click()
     expect(page.get_by_text("Please read the new policy")).to_be_hidden()
     page.reload()
 
-    expect(chat_input(page)).to_be_visible()
+    expect(page.get_by_text("Always here")).to_be_visible()
     expect(page.get_by_text("Please read the new policy")).to_be_hidden()
-    expect(_close_button(page)).to_have_count(0)
+    expect(_close_button(page)).to_have_count(1)
 
 
 def test_a_banner_without_remembered_dismissal_closes_only_until_the_next_load(
@@ -195,15 +197,15 @@ def test_banners_are_not_shown_above_an_open_chat(admin, page_for, make_user, up
 def test_an_admin_removes_a_banner_and_users_stop_seeing_it(
     admin_page, admin, page_for, make_user, no_banners
 ):
-    _publish(admin, [_banner("About to be removed")])
+    _publish(admin, [_banner("About to be removed"), _banner("Stays for everyone")])
     user_page = page_for(make_user())
     expect(user_page.get_by_text("About to be removed")).to_be_visible()
 
     settings = _open_general_settings(admin_page)
-    settings.get_by_role("button", name="Delete").click()
+    settings.get_by_role("button", name="Delete").first.click()
     _save(admin_page, settings)
 
-    assert _saved_banners(admin) == []
+    assert [b["content"] for b in _saved_banners(admin)] == ["Stays for everyone"]
     user_page.reload()
-    expect(chat_input(user_page)).to_be_visible()
+    expect(user_page.get_by_text("Stays for everyone")).to_be_visible()
     expect(user_page.get_by_text("About to be removed")).to_be_hidden()
