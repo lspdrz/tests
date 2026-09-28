@@ -14,7 +14,7 @@ small NumPy arrays (no torch, no GPU, no model download): shape-only
 transforms that any consumer relies on. It does not assume any particular
 deep-learning backend beyond NumPy (always present in the env).
 
-Pattern mirrors test_requests.py. Uses the ``depcheck`` fixture.
+Pattern follows unit/deps/README.md. Uses the ``depcheck`` fixture.
 
 Kept as a unit contract: no Open WebUI feature reaches einops. It is imported only by model code
 that brings its own (remote-code embedding and reranking models such as the nomic and jina

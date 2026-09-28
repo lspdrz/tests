@@ -20,7 +20,7 @@ verifies pool *construction* offline (a ``min=0`` pool is lazy — it opens
 no connection — so we never contact a database). NO network, NO real
 Oracle, NO wallet on disk.
 
-Pattern mirrors test_requests.py. Uses ``depcheck`` from conftest.py.
+Pattern follows unit/deps/README.md. Uses ``depcheck`` from conftest.py.
 """
 
 from __future__ import annotations

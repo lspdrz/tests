@@ -7,9 +7,16 @@ shows it, and its body is CHANGELOG.md turned into HTML by Markdown (bold text a
 included) and split into versions and items by BeautifulSoup, each item cut at its first ": "
 into a title and its text.
 aiohttp decodes a Brotli-encoded provider reply with brotlicffi (Brotli when that is absent).
-python-socketio carries the chat events to the browser, and pycrdt merges the live edits two tabs
-make to one note: a long edit still arrives whole after the server has folded its oldest updates
-into one snapshot, and an update that arrives twice counts once.
+python-socketio carries the chat events to the browser: over a websocket by default, and over
+HTTP long polling alone when `ENABLE_WEBSOCKET_SUPPORT` is off, which then refuses a websocket
+(e2e/chat/test_long_polling_chat.py shows the web client streaming a reply that way). Its event
+calls to a tab, the disconnects of a changed account, rooms left when access is revoked and the
+Redis manager between instances are driven in integration/chat/test_socket_runtime.py,
+integration/security/test_revoked_access_leaves_live_rooms.py,
+integration/deps/test_redis_stack.py and integration/chat/test_cross_instance_streaming.py.
+pycrdt merges the live edits two tabs make to one note: a long edit still arrives whole after the
+server has folded its oldest updates into one snapshot, and an update that arrives twice counts
+once.
 
 Discriminates: passes on dev bbfa876af; in a backend copy, dropping `CompressMiddleware` fails
 every encoding, a `brotli.Compressor` that emits nothing (patched in at import) fails the
@@ -20,7 +27,8 @@ an item whose content is its raw HTML fails the changelog test, a provider sessi
 the socket of them and not applying the stored updates before `ydoc.get_update()` sends the
 second tab an empty document. On dev ef67cc3fa, a compaction that keeps an empty snapshot fails
 the long edit, and a merge that appends each stored update's text fails the repeated update.
-Twin of unit/deps/test_pycrdt.py.
+A Socket.IO server that keeps the websocket transport whatever the setting fails both long
+polling tests. Twin of unit/deps/test_pycrdt.py and unit/deps/test_python_socketio.py.
 """
 
 from __future__ import annotations
@@ -35,9 +43,11 @@ import brotli
 import httpx
 import pycrdt
 import pytest
+import socketio
 
 from harness import raw_provider
 from harness import upstream as reply
+from harness.actors import create_user
 from harness.chat import ask
 from harness.instance import resolve_backend
 from harness.raw_provider import RAW_MODEL_ID, chunk, sse
@@ -258,3 +268,33 @@ def test_an_update_sent_twice_is_applied_once(make_user):
         typist.call("ydoc:document:update", edit)
         with _document_tab(account, document_id) as (_, states):
             assert _a_state_reads(states, "hi"), "the repeated update was applied again"
+
+
+@pytest.fixture(scope="module")
+def long_polling(instance_with):
+    """An instance with websockets switched off, as behind a proxy that cannot pass them."""
+    return instance_with({"ENABLE_WEBSOCKET_SUPPORT": "false"})
+
+
+@pytest.mark.slow
+def test_with_websockets_off_a_socket_gets_its_chat_events_over_long_polling(long_polling):
+    account = create_user(long_polling)
+    long_polling.upstream.queue(reply.text("over long polling"))
+
+    with connected(account, transports=("polling",)) as socket, account.client() as client:
+        joined = socket.client.call("user-join", {"auth": {"token": account.token}}, timeout=30)
+        turn, _ = ask(client, "hello?")
+        socket.wait_for(turn.chat_id, "chat:completion", done=True)
+        pushed = json.dumps(socket.events_of(turn.chat_id))
+        transport = socket.client.transport()
+
+    assert joined == {"id": account.id, "name": account.name}
+    assert transport == "polling"
+    assert "over long polling" in pushed, "the streamed reply never reached the socket"
+
+
+@pytest.mark.slow
+def test_with_websockets_off_a_websocket_is_refused(long_polling):
+    with pytest.raises(socketio.exceptions.ConnectionError):
+        with connected(create_user(long_polling)):
+            pass

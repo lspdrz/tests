@@ -13,7 +13,10 @@ FLAC recording, which the engine may take, reaches it as it came. The engine is 
 stand-in of `harness/audio_engine.py`, saved into the shared instance's audio settings for each
 test. Local Whisper runs a tiny model built on disk (`harness/local_whisper.py`), and
 faster-whisper decodes each recording with PyAV (av) before it hears it, so a recording av
-cannot decode is refused.
+cannot decode is refused. Local text-to-speech (the "transformers" engine) runs a tiny SpeechT5
+from a Hugging Face cache built on disk (`harness/local_speech.py`) and soundfile writes what it
+says with `sf.write(path, audio, samplerate=)`, as MP3 because the file is named so; PyAV reads
+the result back.
 
 Discriminates: passes on dev ac00d40e3; in a backend copy, `strict_match_mime_type` taking the
 first supported type without `mimeparse.best_match` lets the text upload through, skipping the
@@ -26,9 +29,10 @@ and the transcription info read as `lang` for `language`; `WhisperModel` given `
 on PATH), one copy that ignores the PCM rate, skips the 16 kHz mono downmix, never converts, drops
 the parameter check after `mimeparse.best_match`, drops the language and never transcribes an
 uploaded file fails exactly the rate-given, codec, over-20-MB, language, two parameter and document
-tests; a default PCM rate of 16 kHz fails the default-rate case. Twin of unit/deps/test_aiofiles.py,
-unit/deps/test_av.py, unit/deps/test_faster_whisper.py, unit/deps/test_pydub.py and
-unit/deps/test_python_mimeparse.py.
+tests; a default PCM rate of 16 kHz fails the default-rate case. A `soundfile.write` that writes
+8 kHz whatever it is given (patched in at import) fails the local speech test. Twin of
+unit/deps/test_aiofiles.py, unit/deps/test_av.py, unit/deps/test_faster_whisper.py,
+unit/deps/test_pydub.py, unit/deps/test_python_mimeparse.py and unit/deps/test_soundfile.py.
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ import numpy
 import pytest
 import soundfile
 
+from harness.actors import admin_of, create_user
 from harness.audio_engine import (
     AUDIO_CONFIG,
     SPEECH,
@@ -54,6 +59,7 @@ from harness.audio_engine import (
     serve_audio_engine,
     using_audio_engine,
 )
+from harness.local_speech import SAMPLE_RATE, SPEAKER, save_tiny_speecht5
 from harness.local_whisper import WORDS, save_tiny_whisper, using_local_whisper
 
 pytestmark = [pytest.mark.depcheck, pytest.mark.api, pytest.mark.requires_source]
@@ -382,3 +388,36 @@ def test_a_recording_local_whisper_cannot_decode_is_refused(speaker, local_whisp
 
     assert refused.status_code >= 400, refused.text
     assert "text" not in refused.json()
+
+
+# ---------------------------------------------------------------- local text-to-speech
+
+
+@pytest.fixture(scope="module")
+def local_speech(instance_with, tmp_path_factory):
+    """An instance speaking with the tiny SpeechT5 of `harness.local_speech`."""
+    home = save_tiny_speecht5(tmp_path_factory.mktemp("hf-home"))
+    launched = instance_with({"HF_HOME": str(home)})
+    with admin_of(launched).client() as client:
+        current = client.get(AUDIO_CONFIG[0]).json()
+        local = {**current["tts"], "ENGINE": "transformers", "MODEL": SPEAKER}
+        # saving local Whisper would load its model, which this offline instance cannot
+        not_whisper = {**current["stt"], "ENGINE": "openai"}
+        saved = client.post(AUDIO_CONFIG[1], json={"tts": local, "stt": not_whisper})
+    assert saved.status_code == 200, saved.text
+    return launched
+
+
+@pytest.mark.slow
+def test_local_speech_is_written_as_16_khz_mp3(local_speech):
+    with create_user(local_speech).client() as client:
+        spoken = client.post("/api/v1/audio/speech", json={"input": "the harbour", "voice": ""})
+
+    assert spoken.status_code == 200, spoken.text
+    assert spoken.headers["content-type"] == "audio/mpeg"
+    with av.open(io.BytesIO(spoken.content)) as container:
+        [stream] = container.streams.audio
+        samples = sum(frame.samples for frame in container.decode(stream))
+    assert stream.codec_context.name.startswith("mp3")
+    assert stream.sample_rate == SAMPLE_RATE
+    assert samples > 0

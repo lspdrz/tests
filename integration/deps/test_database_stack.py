@@ -12,21 +12,38 @@ it to psycopg2 and psycopg as libpq's `sslmode`, which neither would take in the
 pgvector's use of psycopg2 is driven in test_vector_stores.py, Alembic's migrations in
 integration/migrations. Twin of unit/deps/test_psycopg.py and unit/deps/test_psycopg2_binary.py.
 
+SQLAlchemy builds every one of those queries. A chat is stored whole in a native `JSON` column,
+through the engine's JSON codec, and a model preset's settings in a `JSONField` (a
+`TypeDecorator` over text); both must come back exactly, nulls and nesting included. The admin's
+user search is an `ilike` over name and email, counted with `func.count` over the filtered
+statement and cut into pages of 30 with `order_by`, `offset` and `limit`. On SQLite a `connect`
+event hook on the sync and the async engine sets each new connection's PRAGMAs, among them the
+journal mode `DATABASE_ENABLE_SQLITE_WAL` chooses, which the database file keeps.
+
 Discriminates: passes on dev ef67cc3fa; in a backend copy with `aiosqlite.Connection.commit`
 made a no-op every write is lost, down to the admin account the boot signs up, so both SQLite
 cases fail. With `psycopg.AsyncConnection.commit` made a no-op both Postgres cases fail, and
-with the bare `ssl` key passed on untranslated the Postgres instance no longer boots.
+with the bare `ssl` key passed on untranslated the Postgres instance no longer boots. A
+`JSONField` handing back the stored text undecoded fails the model preset test (an engine JSON
+codec that loses nulls stops the first sign-up, so the chat test cannot be singled out), the
+user search without its `offset`
+(every page the first) fails the search test, each on both databases, `like` in place of `ilike`
+fails it on Postgres (Open WebUI's own SQLite `like` folds case anyway), and the connect hooks
+left unregistered fail the WAL case.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import sqlite3
 import uuid
 
 import pytest
 
 from harness import backends
-from harness.actors import Actor, create_user
+from harness.actors import Actor, admin_of, create_user
+from harness.instance import LaunchedInstance
+from harness.upstream import MOCK_MODEL_ID
 
 pytestmark = [pytest.mark.depcheck, pytest.mark.api, pytest.mark.requires_source]
 
@@ -57,15 +74,21 @@ def postgres_url():
 
 
 @pytest.fixture(params=["sqlite", "postgres"])
-def author(request, instance_with) -> Actor:
-    """A fresh account on an instance keeping its data in the parametrised database."""
+def on_database(request, instance_with) -> LaunchedInstance:
+    """An instance keeping its data in the parametrised database."""
     if request.param == "sqlite":
         if backends.DATABASE == "postgres":
             pytest.skip("this run keeps every instance on Postgres")
-        return create_user(request.getfixturevalue("instance"))
+        return request.getfixturevalue("instance")
     url = request.getfixturevalue("postgres_url")
     separator = "&" if "?" in url else "?"
-    return create_user(instance_with({"DATABASE_URL": f"{url}{separator}ssl=disable"}))
+    return instance_with({"DATABASE_URL": f"{url}{separator}ssl=disable"})
+
+
+@pytest.fixture
+def author(on_database) -> Actor:
+    """A fresh account on that instance."""
+    return create_user(on_database)
 
 
 def test_a_note_reads_back_changed_and_deleted_as_written(author):
@@ -96,3 +119,87 @@ def test_notes_written_at_once_all_land(author):
     assert listed.status_code == 200, listed.text
     assert {note["title"] for note in listed.json()} == set(titles)
     assert len({note["id"] for note in created}) == PARALLEL_WRITES
+
+
+# nested objects and lists, null, a float, a boolean and text beyond ASCII
+NESTED_CHAT = {
+    "title": "Tide table",
+    "models": ["mock-model"],
+    "params": {"temperature": 0.25, "stop": None, "seed": 7},
+    "messages": [
+        {"id": "m1", "role": "user", "content": AWKWARD_TEXT, "files": []},
+        {"id": "m2", "role": "assistant", "content": "Hochwasser um 4:25", "done": True},
+    ],
+    "tags": [],
+    "meta": {"nested": {"deeper": [1, [2, {"three": None}]]}},
+}
+
+
+def test_a_chat_keeps_its_nested_json_exactly(author):
+    with author.client() as client:
+        created = client.post("/api/v1/chats/new", json={"chat": NESTED_CHAT})
+        assert created.status_code == 200, created.text
+        stored = client.get(f"/api/v1/chats/{created.json()['id']}")
+
+    assert stored.status_code == 200, stored.text
+    assert {key: stored.json()["chat"].get(key) for key in NESTED_CHAT} == NESTED_CHAT
+
+
+def test_a_model_presets_json_settings_read_back_exactly(on_database):
+    model_id = f"tides-{uuid.uuid4().hex[:8]}"
+    meta = {"description": AWKWARD_TEXT, "tags": [{"name": "tides"}], "chart": NESTED_CHAT["meta"]}
+    params = {"temperature": 0.25, "stop": ["\n\n"], "seed": None}
+    with admin_of(on_database).client() as client:
+        created = client.post(
+            "/api/v1/models/create",
+            json={
+                "id": model_id,
+                "base_model_id": MOCK_MODEL_ID,
+                "name": "Tides",
+                "meta": meta,
+                "params": params,
+            },
+        )
+        assert created.status_code == 200, created.text
+        stored = client.get("/api/v1/models/model", params={"id": model_id})
+        client.post("/api/v1/models/model/delete", json={"id": model_id})
+
+    assert stored.status_code == 200, stored.text
+    assert {key: stored.json()["meta"].get(key) for key in meta} == meta
+    assert stored.json()["params"] == params
+
+
+def test_a_user_search_is_counted_ordered_and_paged(on_database):
+    token = uuid.uuid4().hex[:10]
+    names = [f"Pier {token} {index:02d}" for index in range(35)]
+    for name in reversed(names):
+        create_user(on_database, name=name)
+
+    def page(number: int) -> dict:
+        found = client.get(
+            "/api/v1/users/",
+            params={"query": token.upper(), "order_by": "name", "direction": "asc", "page": number},
+        )
+        assert found.status_code == 200, found.text
+        return found.json()
+
+    with admin_of(on_database).client() as client:
+        first, second = page(1), page(2)
+
+    assert first["total"] == second["total"] == 35
+    assert [user["name"] for user in first["users"] + second["users"]] == names
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("wal", [True, False], ids=["wal", "rollback-journal"])
+def test_every_sqlite_connection_gets_the_configured_journal_mode(instance_with, wal):
+    if backends.DATABASE == "postgres":
+        pytest.skip("this run keeps every instance on Postgres")
+    launched = instance_with({"DATABASE_ENABLE_SQLITE_WAL": "true" if wal else "false"})
+    with admin_of(launched).client() as client:
+        _create_note(client, "journal", "written")
+
+    with sqlite3.connect(launched.data_dir / "webui.db") as database:
+        [(mode,)] = database.execute("PRAGMA journal_mode").fetchall()
+
+    assert mode == ("wal" if wal else "delete")

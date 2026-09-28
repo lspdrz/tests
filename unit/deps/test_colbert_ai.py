@@ -16,7 +16,7 @@ This module pins exactly that surface so a colbert-ai bump that renamed/moved
 ``ColBERTConfig`` / ``Checkpoint`` or changed the ``Checkpoint`` constructor or
 the ``docFromText`` / ``queryFromText`` signatures fails loudly here instead of
 as a runtime ``ImportError`` / ``TypeError`` the moment the ColBERT reranker is
-enabled. Two layers, mirroring test_requests.py: import + symbol/signature
+enabled. Two layers, following unit/deps/README.md: import + symbol/signature
 checks, plus the ONE behavioural contract that is safe offline —
 ``ColBERTConfig(model_name=name)`` (a lightweight config dataclass; it does NOT
 download any model). We deliberately do NOT construct a ``Checkpoint`` or call

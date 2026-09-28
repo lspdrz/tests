@@ -8,7 +8,7 @@ which checks the search goes out under a browser's User-Agent.
 Kept as a unit contract: the rest of the public surface (the ``FakeUserAgent`` alias, the
 constructor's filters and fallback, the per-browser accessors, the error type) and the promise
 that the bundled data is read without the network, none of which a request reaches. Pattern
-mirrors test_requests.py. Uses ``depcheck`` from conftest.py.
+follows unit/deps/README.md. Uses ``depcheck`` from conftest.py.
 """
 
 from __future__ import annotations

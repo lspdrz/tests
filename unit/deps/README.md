@@ -29,7 +29,7 @@ other suites can't see, because they run against whatever is already installed.
 3. **Behavioural contracts** — exercise the *actual* usage offline (sign+verify a
    token, `chardet.detect()` a known byte string, a MockTransport HTTP roundtrip).
 
-`test_requests.py` is the reference exemplar.
+`test_cryptography.py` is a reference exemplar.
 
 ## `depcheck` API
 
@@ -47,7 +47,7 @@ other suites can't see, because they run against whatever is already installed.
 
 ```bash
 pytest unit/deps/                    # all dependency contracts
-pytest unit/deps/test_redis.py       # one dependency
+pytest unit/deps/test_fastapi.py     # one dependency
 pytest -m depcheck                   # the whole class, anywhere
 ```
 
@@ -72,8 +72,8 @@ OPEN_WEBUI_SOURCE_DIR=../open-webui/backend pytest -m depcheck unit/deps integra
 | langchain-core | `integration/deps/test_tool_specs.py` (a workspace tool's spec) |
 | Pillow | `integration/deps/test_image_validation.py` (model backgrounds, linked images, image edits) |
 | bcrypt, argon2-cffi, PyJWT, pytz, authlib, itsdangerous, cryptography | `integration/deps/test_auth_stack.py` (and the back-channel logout token in `integration/auth/test_sso_account_sync.py`) |
-| starlette-compress, Brotli, zstandard, Markdown, beautifulsoup4, brotlicffi, python-socketio, pycrdt | `integration/deps/test_transport_stack.py` |
-| python-mimeparse, aiofiles, pydub, av, faster-whisper (local Whisper on a tiny model) | `integration/deps/test_audio_stack.py`, `e2e/audio/test_local_whisper_dictation.py` |
+| starlette-compress, Brotli, zstandard, Markdown, beautifulsoup4, brotlicffi, python-socketio (websocket and long polling), pycrdt | `integration/deps/test_transport_stack.py`, `e2e/chat/test_long_polling_chat.py` (python-socketio's event calls, disconnects and rooms also in `integration/chat/test_socket_runtime.py` and `integration/security/test_revoked_access_leaves_live_rooms.py`) |
+| python-mimeparse, aiofiles, pydub, av, faster-whisper (local Whisper on a tiny model), soundfile (local SpeechT5 speech) | `integration/deps/test_audio_stack.py`, `e2e/audio/test_local_whisper_dictation.py` |
 | pydantic, python-multipart | `integration/deps/test_request_bodies.py` |
 | mcp, httpx, validators, black, beautifulsoup4, opentelemetry, requests, googleapis-common-protos | `integration/deps/test_outbound_stack.py` |
 | opentelemetry (traces, metrics, logs over OTLP/HTTP and gRPC), psutil | `integration/deps/test_telemetry_export.py` |
@@ -89,13 +89,14 @@ OPEN_WEBUI_SOURCE_DIR=../open-webui/backend pytest -m depcheck unit/deps integra
 | elasticsearch | `integration/deps/test_elasticsearch_store.py` |
 | ddgs, fake-useragent | `integration/deps/test_web_search_stack.py`, `e2e/retrieval/test_duckduckgo_web_search.py` |
 | fastapi | `integration/deps/test_web_framework.py` and every instance boot and request |
-| redis | `integration/security/test_signin_session_expiry_and_revocation_fallback.py` (a signed-out token is refused) |
+| redis (with python-socketio's Redis manager) | `integration/deps/test_redis_stack.py` (two instances on one Redis, readiness, TLS), `integration/chat/test_redis_task_commands.py` (pub/sub, restart, Cluster), `integration/chat/test_socket_cleanup_locks.py`, `integration/resilience/test_redis_sentinel_failover.py` |
 | aiocache | `integration/security/test_cache_key_builder.py` (a repeat model listing never reaches the provider) and `integration/deps/test_connection_stack.py` (until the TTL runs out) |
 | aiohttp, aiodns | `integration/deps/test_connection_stack.py` (the model list timeout, a provider reached by name through c-ares) |
 | aiosqlite, psycopg, psycopg2 | `integration/deps/test_database_stack.py` |
 | alembic | `integration/migrations/test_lifecycle.py` |
-| requests (Tika) | `integration/retrieval/test_v0114_source_text_and_docling.py` (a binary upload is extracted by Tika) |
-| sqlalchemy, uvicorn, httpx | every instance boot and request |
+| requests | `integration/retrieval/test_web_loaders.py` (a linked document fetched through the SSRF-guarded session), `integration/security/test_remote_file_download_limits.py` (streamed under the size limit), `integration/retrieval/test_v0114_source_text_and_docling.py` (Tika) |
+| sqlalchemy | `integration/deps/test_database_stack.py` (JSON columns, search, counts and pages, SQLite PRAGMAs) and every request |
+| uvicorn, httpx | every instance boot and request |
 
 The .rst, .epub and .odt uploads skip without a `pandoc` binary (the test of
 the missing-pandoc message skips with one), the pydub tests skip without

@@ -9,7 +9,7 @@ integration/deps/test_outbound_stack.py.
 Kept as a unit contract: the other messages (``Status``, the ``Code`` enum, ``HttpRule``,
 ``Operation``, ``LatLng``), which Open WebUI never uses, so no request reaches them. The package
 adds to the implicit ``google`` namespace, so the contract is submodule imports plus in-memory
-protobuf round-trips. Pattern mirrors test_requests.py. Uses ``depcheck`` from conftest.py.
+protobuf round-trips. Pattern follows unit/deps/README.md. Uses ``depcheck`` from conftest.py.
 """
 
 from __future__ import annotations

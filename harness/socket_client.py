@@ -1,11 +1,12 @@
 """A Socket.IO connection signed in as one account: what a browser tab receives and can send.
 
-`connected(actor)` joins the account's `user:{id}` room the way the web client does, records
-every `events` message the server pushes to it, and `call(event, data)` sends an event and
-returns once the server's handler has finished. `join_note` and `edit_note` do what the note
-editor does with a note's live Yjs document; `note_edit(text)` is the raw update it sends after
-typing `text` into an empty note (built with pycrdt, which the backend depends on) and
-`note_text(state)` reads back a document state the server sent.
+`connected(actor)` joins the account's `user:{id}` room the way the web client does (over a
+websocket, or the `transports` given), records every `events` message the server pushes to it,
+and `call(event, data)` sends an event and returns once the server's handler has finished.
+`join_note` and `edit_note` do what the note editor does with a note's live Yjs document;
+`note_edit(text)` is the raw update it sends after typing `text` into an empty note (built with
+pycrdt, which the backend depends on) and `note_text(state)` reads back a document state the
+server sent.
 """
 
 from __future__ import annotations
@@ -69,7 +70,9 @@ class SocketSession:
 
 
 @contextmanager
-def connected(actor: Actor) -> Iterator[SocketSession]:
+def connected(
+    actor: Actor, transports: tuple[str, ...] = ("websocket",)
+) -> Iterator[SocketSession]:
     session = SocketSession(socketio.Client(reconnection=False))
     session.client.on("events", session.events.append)
     session.client.on("ydoc:document:state", session.document_states.append)
@@ -78,7 +81,7 @@ def connected(actor: Actor) -> Iterator[SocketSession]:
         actor.base_url,
         socketio_path="/ws/socket.io",
         auth={"token": actor.token},
-        transports=["websocket"],
+        transports=list(transports),
         wait_timeout=30,
     )
     try:

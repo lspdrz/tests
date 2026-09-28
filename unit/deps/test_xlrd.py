@@ -20,7 +20,7 @@ hierarchy. Behavioural contracts use only pure functions and in-memory byte
 buffers (no real workbook file is needed to prove the error paths and the
 helpers) — deterministic, no network.
 
-Pattern mirrors test_requests.py. Uses the ``depcheck`` fixture from
+Pattern follows unit/deps/README.md. Uses the ``depcheck`` fixture from
 unit/deps/conftest.py.
 """
 

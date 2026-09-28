@@ -24,7 +24,7 @@ silently. This module pins those symbols + the keyword arguments main.py
 passes, and exercises the store read/write/remove contract offline via
 the in-memory store (and constructs RedisStore without connecting).
 
-Pattern mirrors test_requests.py. Uses ``depcheck`` from conftest.py.
+Pattern follows unit/deps/README.md. Uses ``depcheck`` from conftest.py.
 """
 
 from __future__ import annotations

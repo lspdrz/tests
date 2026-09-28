@@ -22,7 +22,7 @@ without any network or key validation) but never used to issue a request, and
 the exception/type checks are pure introspection. Nothing here touches the
 Anthropic API.
 
-Follows the `unit/deps/` exemplar (`test_requests.py` / `test_httpx.py`):
+Follows the `unit/deps/` pattern its README describes:
 symbol-existence checks for the API surface + offline behavioural contracts,
 all via the `depcheck` fixture from `unit/deps/conftest.py`. Skips cleanly if
 `anthropic` is not importable.

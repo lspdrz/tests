@@ -30,7 +30,7 @@ ever reaches YouTube. ``api.list()`` / ``transcript.fetch()`` are never
 called against the network; instead the same objects those would return are
 built by hand and their behaviour asserted.
 
-Pattern mirrors test_requests.py. Uses the ``depcheck`` fixture.
+Pattern follows unit/deps/README.md. Uses the ``depcheck`` fixture.
 """
 
 from __future__ import annotations

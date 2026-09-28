@@ -30,7 +30,7 @@ and we must not open a socket. A v4 bump that renamed any of these would
 break the integration; this fails loudly instead.
 
 NOTE: this DB integration is community-supported in the backend. Pattern
-mirrors test_requests.py. Uses the ``depcheck`` fixture.
+follows unit/deps/README.md. Uses the ``depcheck`` fixture.
 """
 
 from __future__ import annotations
