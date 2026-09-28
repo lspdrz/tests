@@ -4,24 +4,23 @@
   without importing `requests`, and `continue_on_failure` swallowed the NameError into an empty
   result. The Firecrawl path itself is pinned over HTTP; this audit holds every module under
   `retrieval/web/` to it.
-- The timeout setting reaches Firecrawl only as an integer, so the parsing of strings, invalid
-  and non-positive values is checked on the helpers directly.
-- A Firecrawl that refuses connections is retried with real backoff sleeps, too slow for HTTP.
+- The timeout helpers also read a decimal or non-numeric setting and take a fallback, but the
+  loader converts the setting to an integer first and nothing passes a fallback, so no route
+  reaches those cases.
 
-Request shapes, both search answer shapes (#23966 Bug 2), the header without a key, retries and
-`Retry-After` moved to integration/retrieval/test_firecrawl.py.
+Request shapes, both search answer shapes (#23966 Bug 2), the header without a key, retries,
+`Retry-After`, dropped connections, the reachable timeout settings and the client timeout moved
+to integration/retrieval/test_firecrawl.py.
 
 Discriminates: passes on dev bbfa876af; deleting `import requests` from firecrawl.py fails the
-audit, and dropping the connection-error retry fails the retry count.
+audit, and dropping the float parse or the fallback fails the helper cases.
 """
 
 from __future__ import annotations
 
 import ast
-from unittest.mock import patch
 
 import pytest
-import requests
 
 
 def module_level_names(tree: ast.Module) -> set[str]:
@@ -67,42 +66,13 @@ def test_every_web_module_calling_requests_imports_it(open_webui_backend):
 
 @pytest.mark.parametrize(
     ("value", "seconds"),
-    [
-        (30, 30.0),
-        ("30", 30.0),
-        ("45.5", 45.5),
-        (None, None),
-        ("", None),
-        ("soon", None),
-        (-5, None),
-    ],
+    [("45.5", 45.5), ("soon", None)],
 )
-def test_timeout_setting_parses_to_positive_seconds(firecrawl_module, value, seconds):
+def test_a_setting_the_loader_never_passes_still_parses(firecrawl_module, value, seconds):
     assert firecrawl_module.get_firecrawl_timeout_seconds(timeout=value) == seconds
 
 
-def test_client_timeout_outlasts_the_scrape_timeout(firecrawl_module):
-    assert firecrawl_module.get_firecrawl_client_timeout_seconds(timeout=30) == 40.0
+def test_the_client_timeout_falls_back_ten_seconds_past_the_default(firecrawl_module):
     assert (
         firecrawl_module.get_firecrawl_client_timeout_seconds(timeout=None, fallback=120) == 130.0
     )
-
-
-def test_a_refused_connection_is_retried_then_raised(firecrawl_module):
-    refused = requests.ConnectionError("connection refused")
-
-    with (
-        patch.object(requests, "request", side_effect=refused) as sent,
-        patch("time.sleep") as slept,
-    ):
-        with pytest.raises(requests.ConnectionError):
-            firecrawl_module.request_firecrawl_json(
-                method="POST",
-                url="http://127.0.0.1:9/v2/scrape",
-                headers={},
-                json={"url": "http://127.0.0.1:9/page"},
-                timeout=5,
-            )
-
-    assert sent.call_count == 3
-    assert slept.call_count == 2

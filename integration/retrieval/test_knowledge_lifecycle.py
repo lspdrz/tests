@@ -13,28 +13,40 @@
   caller owns now, unless `ENABLE_KNOWLEDGE_FILE_RETENTION` is set.
 - An empty embedding key still sent `Authorization: Bearer ` (97466deea1, PR #28684, #28683),
   which a password-protected embedding server rejects.
+- Processing-status streams pinned the connection pool (ba0c4b393, PR #28183): the file status
+  and knowledge pending-files streams took a request-scoped session, which FastAPI releases only
+  when the body ends, and these bodies run for hours while a file is stuck. With session sharing
+  on, a handful of watchers used up the pool and every other request failed. Here a file stays
+  stuck behind an embedding service that never answers, on an instance whose pool holds eleven
+  connections, and more watchers than that must leave the instance answering.
 
-Twin of unit/retrieval/test_knowledge_lifecycle.py, which keeps the audit that the file status
-stream holds no request-scoped database session (PR #28183): no route shows a pinned pool
-connection.
+Twin of unit/retrieval/test_knowledge_lifecycle.py.
 
 Discriminates: passes on dev bbfa876af; reverting the reindex drop or the `file-{id}` rebuild
 fails the reindex case, dropping the grant and folder checks fails both shared-chat cases,
 writing every provider block fails all three engines and required form fields fail the partial
 block, a reset that deletes no files fails the reset case and an unconditional bearer header
-fails both empty-key cases.
+fails both empty-key cases. On dev ef67cc3fa, taking `Depends(get_async_session)` in either
+stream handler again (ba0c4b393 reverted) fails its watcher case: the next request waits out
+the pool and fails.
 """
 
 from __future__ import annotations
 
+import contextlib
+import json
+import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
+import httpx
 import pytest
 
 from harness import upstream as reply
 from harness.actors import admin_of
 from harness.chat import ask
-from harness.listener import json_answer
+from harness.listener import json_answer, listening
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
 
@@ -285,6 +297,127 @@ def test_the_processing_status_is_read_for_its_owner_only(make_user):
     assert processing_status(owner, file_id).json() == {"status": "completed"}
     assert processing_status(stranger, file_id).status_code == 404
     assert processing_status(owner, str(uuid.uuid4())).status_code == 404
+
+
+# --- watching a stuck file does not hold the connection pool ----------------------------------
+
+POOL_OF_ELEVEN = {
+    "DATABASE_ENABLE_SESSION_SHARING": "true",
+    "DATABASE_POOL_SIZE": "1",
+    "DATABASE_POOL_MAX_OVERFLOW": "10",
+    "DATABASE_POOL_TIMEOUT": "3",
+}
+WATCHERS = 20
+STUCK_TEXT = "a file the embedder never finishes"
+
+
+@pytest.fixture(scope="module")
+def stalled_embedding():
+    """An embedding service that holds the stuck file's text until the test lets it go."""
+    released = threading.Event()
+
+    def held(request):
+        if STUCK_TEXT not in request.body.decode():
+            return four_dimensional(request)
+        released.wait(timeout=120)
+        return json_answer({"error": "released"}, status=500)
+
+    with listening() as service:
+        service.route("POST", "/embeddings", held)
+        yield service, released
+        released.set()
+
+
+def stuck_embeddings(service) -> list:
+    return [call for call in service.requests_to("/embeddings") if STUCK_TEXT in call.body.decode()]
+
+
+@pytest.fixture
+def stuck_file(instance_with, stalled_embedding):
+    """(instance, owner, file id, knowledge id): a file still processing into a knowledge base."""
+    service, released = stalled_embedding
+    released.clear()
+    small_pool = instance_with({**POOL_OF_ELEVEN, "RAG_OPENAI_API_BASE_URL": service.base_url})
+    owner = admin_of(small_pool)
+    knowledge_id = knowledge_base_with(owner)
+    stuck_before = len(stuck_embeddings(service))
+    with owner.client() as client:
+        uploaded = client.post(
+            "/api/v1/files/",
+            files={"file": ("stuck.txt", STUCK_TEXT.encode(), "text/plain")},
+            data={"metadata": json.dumps({"knowledge_id": knowledge_id})},
+        )
+    assert uploaded.status_code == 200, uploaded.text
+    deadline = time.monotonic() + 30
+    while len(stuck_embeddings(service)) == stuck_before:
+        assert time.monotonic() < deadline, "the upload never reached the embedding service"
+        time.sleep(0.2)
+    try:
+        yield small_pool, owner, uploaded.json()["id"], knowledge_id
+    finally:
+        released.set()
+
+
+def first_event(stream) -> object:
+    line = next(line for line in stream.iter_lines() if line.startswith("data: "))
+    return json.loads(line.removeprefix("data: "))
+
+
+@contextlib.contextmanager
+def watching(owner, path: str):
+    """More open status streams on `path` than the pool has connections, opened at once.
+
+    Yields the streams the instance answered.
+    """
+    with contextlib.ExitStack() as watchers, owner.client() as client:
+        lock = threading.Lock()
+
+        def watch():
+            stream = client.stream("GET", path, params={"stream": "true"}, timeout=15)
+            with contextlib.suppress(httpx.HTTPError):
+                response = stream.__enter__()
+                with lock:
+                    watchers.push(stream)
+                return response
+
+        with ThreadPoolExecutor(max_workers=WATCHERS) as pool:
+            opened = list(pool.map(lambda _: watch(), range(WATCHERS)))
+        yield [response for response in opened if response and response.status_code == 200]
+
+
+def still_answering(owner, file_id: str) -> httpx.Response:
+    with owner.client() as client:
+        return client.get(f"/api/v1/files/{file_id}", timeout=15)
+
+
+@pytest.mark.slow
+def test_watching_a_stuck_files_status_leaves_the_pool_free(stuck_file):
+    _, owner, file_id, _ = stuck_file
+    with watching(owner, f"/api/v1/files/{file_id}/process/status") as streams:
+        answered = still_answering(owner, file_id)
+        events = [first_event(stream) for stream in streams]
+
+    assert len(streams) == WATCHERS, (
+        f"only {len(streams)} of {WATCHERS} status watchers were answered: the ones before them "
+        "held the connection pool (PR #28183)"
+    )
+    assert events == [{"status": "pending"}] * WATCHERS
+    assert answered.status_code == 200, answered.text
+
+
+@pytest.mark.slow
+def test_watching_a_knowledge_bases_pending_files_leaves_the_pool_free(stuck_file):
+    _, owner, file_id, knowledge_id = stuck_file
+    with watching(owner, f"/api/v1/knowledge/{knowledge_id}/files/pending") as streams:
+        answered = still_answering(owner, file_id)
+        listed = [[entry["id"] for entry in first_event(stream)] for stream in streams]
+
+    assert len(streams) == WATCHERS, (
+        f"only {len(streams)} of {WATCHERS} pending-file watchers were answered: the ones before "
+        "them held the connection pool (PR #28183)"
+    )
+    assert listed == [[file_id]] * WATCHERS, "a watcher was told the stuck file had finished"
+    assert answered.status_code == 200, answered.text
 
 
 # --- attaching a shared chat -------------------------------------------------------------------

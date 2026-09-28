@@ -9,24 +9,33 @@ seen from outside.
   into "no results". Both shapes list their hits now.
 - An unset key sends no `Authorization` header: a self-hosted Firecrawl without auth rejects an
   empty `Bearer `.
-- 429 and 5xx answers are retried, after `Retry-After` when one is given.
+- 429 and 5xx answers are retried, after `Retry-After` when one is given, and a Firecrawl that
+  drops the connection is retried with a growing pause.
+- The scrape timeout is sent in bounded milliseconds, a setting that is not a positive number
+  sends none, and the instance waits longer than the scrape timeout it asked for.
 - A page Firecrawl returns blank, or cannot scrape in three attempts, is refused with a 400
   that names the link instead of attaching nothing (#31347, PR #31351). Those two tests pass
   on dev efe63bd34 and fail with 420b4a279 reverted.
 
 Twin of unit/retrieval/test_firecrawl.py, which keeps the audit that every web module calling
-`requests` imports it (#23966 Bug 1, broad) and the timeout parsing no route reaches.
+`requests` imports it (#23966 Bug 1, broad) and the timeout parsing no route reaches (a decimal
+setting never gets past the loader's integer conversion).
 
 Discriminates: passes on dev bbfa876af; reading only `data.web` fails the list shape, an
 unconditional `Bearer` header fails the keyless case, always appending `/v2` fails the `/v2`
 base URLs, no retries fail both retry cases, ignoring `Retry-After` fails the wait, sending the
 timeout in seconds fails the timeout cases and dropping the `[:count]` cut fails the result
-count.
+count. On dev ef67cc3fa, accepting a non-positive timeout fails the negative and zero settings,
+a client timeout equal to the scrape timeout fails the slow scrape and dropping the retry on a
+dropped connection fails both connection cases.
 """
 
 from __future__ import annotations
 
+import socket
+import threading
 import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -116,7 +125,10 @@ def test_no_key_sends_no_authorization_header(admin_client, listener):
     assert "Authorization" not in listener.requests_to("/v2/scrape")[0].headers
 
 
-@pytest.mark.parametrize(("setting", "sent"), [("30", 30000), ("1000", 300000), ("", None)])
+@pytest.mark.parametrize(
+    ("setting", "sent"),
+    [("30", 30000), ("1000", 300000), ("", None), ("-5", None), ("0", None), ("soon", None)],
+)
 def test_the_scrape_timeout_is_sent_in_bounded_milliseconds(admin_client, listener, setting, sent):
     listener.route("POST", "/v2/scrape", scraped("scraped"))
     use_firecrawl(admin_client, listener, FIRECRAWL_TIMEOUT=setting)
@@ -124,6 +136,20 @@ def test_the_scrape_timeout_is_sent_in_bounded_milliseconds(admin_client, listen
     read_page(admin_client, f"{listener.base_url}/article")
 
     assert listener.requests_to("/v2/scrape")[0].json().get("timeout") == sent
+
+
+def test_a_scrape_slower_than_one_second_still_arrives_under_a_one_second_timeout(
+    admin_client, listener
+):
+    def slow_scrape(request):
+        time.sleep(2)
+        return scraped("worth the wait")
+
+    listener.route("POST", "/v2/scrape", slow_scrape)
+    use_firecrawl(admin_client, listener, FIRECRAWL_TIMEOUT="1")
+
+    assert read_page(admin_client, f"{listener.base_url}/article") == "worth the wait"
+    assert len(listener.requests_to("/v2/scrape")) == 1, "the instance gave up and asked again"
 
 
 def test_blank_markdown_is_refused_naming_the_link(admin_client, listener):
@@ -159,6 +185,63 @@ def test_persistent_server_errors_give_up_after_three_attempts_naming_the_link(
     page = f"{listener.base_url}/article"
     assert page in refused_link(admin_client, page)
     assert len(listener.requests_to("/v2/scrape")) == 3
+
+
+@contextmanager
+def dropping_connections(answer_from: int):
+    """A Firecrawl that hangs up on every connection before `answer_from`, then scrapes.
+
+    Yields the arrival times of the connections it got.
+    """
+    server = socket.create_server(("127.0.0.1", 0))
+    arrivals: list[float] = []
+    body = b'{"success": true, "data": {"markdown": "after reconnecting"}}'
+    answer = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n"
+        + f"Content-Length: {len(body)}\r\n\r\n".encode()
+        + body
+    )
+
+    def serve():
+        while True:
+            try:
+                connection, _ = server.accept()
+            except OSError:
+                return
+            arrivals.append(time.monotonic())
+            with connection:
+                if len(arrivals) >= answer_from:
+                    connection.recv(65536)
+                    connection.sendall(answer)
+
+    threading.Thread(target=serve, daemon=True).start()
+    try:
+        yield server.getsockname()[1], arrivals
+    finally:
+        server.close()
+
+
+def test_a_dropped_connection_is_retried_with_a_growing_pause(admin_client, listener):
+    with dropping_connections(answer_from=3) as (port, arrivals):
+        use_firecrawl(admin_client, listener, FIRECRAWL_API_BASE_URL=f"http://127.0.0.1:{port}")
+
+        content = read_page(admin_client, f"{listener.base_url}/article")
+
+    assert content == "after reconnecting"
+    assert len(arrivals) == 3
+    pauses = [later - earlier for earlier, later in zip(arrivals, arrivals[1:])]
+    assert pauses[0] >= 0.9 and pauses[1] >= 1.9, f"no backoff between attempts: {pauses}"
+
+
+def test_a_firecrawl_that_keeps_hanging_up_is_given_up_after_three_attempts(admin_client, listener):
+    page = f"{listener.base_url}/article"
+    with dropping_connections(answer_from=99) as (port, arrivals):
+        use_firecrawl(admin_client, listener, FIRECRAWL_API_BASE_URL=f"http://127.0.0.1:{port}")
+
+        detail = refused_link(admin_client, page)
+
+    assert page in detail
+    assert len(arrivals) == 3
 
 
 def hit(url, **fields):

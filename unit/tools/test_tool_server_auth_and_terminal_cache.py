@@ -7,8 +7,11 @@ cached, hiding configured terminals; it now rebuilds unless no enabled connectio
 
 integration/tools/test_tool_server_auth_and_terminal_cache.py pins both through the API. What
 stays here cannot be seen from outside: the header audit covers the session, system OAuth and
-OAuth 2.1 branches no test can reach without a keyless credential, and the cache test holds the
-other half of `81b9afb73`, that an empty list is still a hit when no connection could serve.
+OAuth 2.1 branches no test can reach without a keyless credential (and every bearer header added
+to the module later), and the cache test holds the other half of `81b9afb73`, that an empty list
+is still a hit when no connection could serve. That is also the terminal half of `f1a64ccfc2`
+(issue 28568, an empty cached list taken for a miss). No request reaches it: a chat reads the list
+only for a saved, enabled terminal, and one without a url fails fetching its skills first.
 
 Discriminates: passes on dev bbfa876af; the audit fails with the bearer branch formatting
 `f'Bearer {key}'` into `headers['Authorization']` again, and the cache test fails when an empty

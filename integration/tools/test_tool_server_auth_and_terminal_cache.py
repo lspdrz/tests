@@ -13,11 +13,15 @@ Two fixes in `utils/tools.py`, open-webui 0.11.2:
 The terminal tests run on an instance of their own backed by a Redis stand-in the test can write
 to, which plays the other worker.
 
-Twin of unit/tools/test_tool_server_auth_and_terminal_cache.py.
+Twin of unit/tools/test_tool_server_auth_and_terminal_cache.py, which keeps the audit of every
+bearer branch and the empty cached list with no terminal able to serve. The system OAuth and
+session branches are also called here, with the credentials a request can give them.
 
 Discriminates: passes on dev bbfa876af; fails with the bearer branch formatting `Bearer {key}`
 again (both keyless calls carry the header) and with an empty cached terminal list trusted again
-(the chat on the terminal is refused as unavailable); the nearby tests pass on both.
+(the chat on the terminal is refused as unavailable); the nearby tests pass on both. On dev
+ef67cc3fa, formatting the system OAuth header without the token check fails the system OAuth
+case.
 """
 
 from __future__ import annotations
@@ -93,6 +97,18 @@ def test_a_keyless_bearer_connection_sends_no_authorization(call_tool_server, ke
 
 def test_a_keyed_bearer_connection_still_sends_its_key(call_tool_server):
     assert call_tool_server(key="server-key")["authorization"] == "Bearer server-key"
+
+
+def test_a_system_oauth_server_called_without_a_sign_in_token_gets_no_authorization(
+    call_tool_server,
+):
+    headers = call_tool_server(auth_type="system_oauth", key="")
+
+    assert "authorization" not in headers, headers["authorization"]
+
+
+def test_a_session_server_gets_the_callers_own_token(call_tool_server):
+    assert call_tool_server(auth_type="session", key="")["authorization"].startswith("Bearer ey")
 
 
 def test_custom_headers_survive_a_keyless_connection(call_tool_server):

@@ -8,27 +8,46 @@
 * PR 27757 (`fd7024f19`) and PR 27755 (`6b4131d1d`): an unreachable tool server or terminal
   server logged a full traceback per attempt, and the terminal proxy read the request body
   outside its `try`, so a client that hung up mid-body escaped the handler.
+* `f1a64ccfc2` (issue 28568): the tool and terminal server lists cached in Redis were decoded
+  unconditionally and rebuilt whenever the result was falsy. An absent key logged a decode
+  error, and an empty cached list was taken for a miss, so every request fetched every server's
+  spec again. These run on an instance of their own with a real Redis, whose MONITOR stream shows
+  each rebuild as the list being written back.
 
-Twin of unit/tools/test_tool_server_plumbing.py.
+Twin of unit/tools/test_tool_server_plumbing.py. The empty cached terminal list with no terminal
+able to serve stays in unit/tools/test_tool_server_auth_and_terminal_cache.py: a chat on a
+terminal without a url fails before the list is read.
 
 Discriminates: passes on dev `bbfa876af`; each narrow test fails with its fix reverted (the
 continuation parsing, the per-connection cookies, the connection-error arm of the spec fetch,
-the proxy's connection-error arm and the body read inside the `try`, one mutation each).
+the proxy's connection-error arm and the body read inside the `try`, one mutation each). On dev
+ef67cc3fa, with `f1a64ccfc2` reverted the empty-list and absent-key cases fail for both lists
+(the empty tool list is written back, the absent key logs a decode error); the populated and
+corrupt cases pass on both.
 """
 
 from __future__ import annotations
 
+import json
 import socket
 import time
 import uuid
 from urllib.parse import urlsplit
 
 import pytest
+import redis
 
+from harness import backends
 from harness import upstream as reply
+from harness.actors import admin_of
 from harness.chat import ask
 from harness.listener import json_answer
-from harness.terminal_server import TERMINAL_SERVERS_CONFIG, configure_terminals
+from harness.redis_monitor import recording
+from harness.terminal_server import (
+    TERMINAL_SERVERS_CONFIG,
+    configure_terminals,
+    serving_terminal,
+)
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
 
@@ -276,3 +295,130 @@ def test_an_unknown_terminal_is_still_refused(admin, dead_terminal):
         proxied = client.post("/api/v1/terminals/no-such-terminal/api/files", json={})
 
     assert proxied.status_code == 404
+
+
+# --- f1a64ccfc2: an empty cache is a hit, an absent one is no error ------------------------
+
+TOOL_CACHE_KEY = "open-webui:tool_servers"
+TERMINAL_CACHE_KEY = "open-webui:terminal_servers"
+SAVED_SERVERS = {TOOL_CACHE_KEY: 0, TERMINAL_CACHE_KEY: 1}
+DECODE_ERRORS = {
+    TOOL_CACHE_KEY: "Error fetching tool_servers from Redis",
+    TERMINAL_CACHE_KEY: "Error fetching terminal_servers from Redis",
+}
+
+
+@pytest.fixture(scope="module")
+def redis_url():
+    with backends.redis_server() as url:
+        yield url
+
+
+@pytest.fixture(scope="module")
+def cached_instance(instance_with, redis_url):
+    return instance_with({"REDIS_URL": redis_url})
+
+
+@pytest.fixture
+def cache(cached_instance, redis_url, preserve):
+    """The instance's Redis, with no tool server and one terminal saved; yields (store, id)."""
+    preserve(TOOL_SERVERS_CONFIG, TERMINAL_SERVERS_CONFIG, on=cached_instance)
+    with serving_terminal() as terminal:
+        terminal.route("GET", "/openapi.json", json_answer(_openapi("run_command")))
+        connection = terminal.connection()
+        with cached_instance.client() as client:
+            saved = client.post(TOOL_SERVERS_CONFIG[1], json={"TOOL_SERVER_CONNECTIONS": []})
+            assert saved.status_code == 200, saved.text
+            configure_terminals(client, connection)
+        with redis.Redis.from_url(redis_url, decode_responses=True) as store:
+            yield store, connection["id"]
+
+
+def list_tools(instance) -> list[str]:
+    with instance.client() as client:
+        listed = client.get("/api/v1/tools/")
+    assert listed.status_code == 200, listed.text
+    return [tool["id"] for tool in listed.json()]
+
+
+def chat_on_terminal(instance, terminal_id: str) -> None:
+    instance.upstream.queue(reply.text("files listed"))
+    with admin_of(instance).client() as client:
+        _, message = ask(client, "list my files", terminal_id=terminal_id)
+    assert message["content"] == "files listed", f"the chat on the terminal failed: {message}"
+
+
+def load(instance, redis_url, key: str, terminal_id: str) -> tuple[int, list[str]]:
+    """Read the list behind `key` the way a request does; (times it was written back, errors)."""
+    offset = instance.log_size()
+    with recording(redis_url) as commands:
+        if key == TOOL_CACHE_KEY:
+            list_tools(instance)
+        else:
+            chat_on_terminal(instance, terminal_id)
+    return len(commands.sent("SET", key)), _log_lines(instance, offset, DECODE_ERRORS[key])
+
+
+@pytest.mark.slow
+def test_an_empty_cached_tool_list_is_not_rebuilt(cached_instance, redis_url, cache):
+    store, terminal_id = cache
+    store.set(TOOL_CACHE_KEY, "[]")
+
+    rebuilds, _ = load(cached_instance, redis_url, TOOL_CACHE_KEY, terminal_id)
+
+    assert rebuilds == 0, "an empty tool server list was taken for a miss and rebuilt (#28568)"
+    assert store.get(TOOL_CACHE_KEY) == "[]"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("key", [TOOL_CACHE_KEY, TERMINAL_CACHE_KEY], ids=["tools", "terminals"])
+def test_an_absent_cache_key_is_rebuilt_without_an_error(cached_instance, redis_url, cache, key):
+    store, terminal_id = cache
+    store.delete(key)
+
+    rebuilds, errors = load(cached_instance, redis_url, key, terminal_id)
+
+    assert rebuilds == 1
+    assert errors == [], f"an absent {key} key logged a decode error (#28568): {errors}"
+    assert len(json.loads(store.get(key))) == SAVED_SERVERS[key]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("key", [TOOL_CACHE_KEY, TERMINAL_CACHE_KEY], ids=["tools", "terminals"])
+def test_a_corrupt_cache_is_logged_and_rebuilt(cached_instance, redis_url, cache, key):
+    store, terminal_id = cache
+    store.set(key, "{not json")
+
+    rebuilds, errors = load(cached_instance, redis_url, key, terminal_id)
+
+    assert rebuilds == 1
+    assert errors, "a broken cache value is worth an error line"
+    assert len(json.loads(store.get(key))) == SAVED_SERVERS[key]
+
+
+@pytest.mark.slow
+def test_a_cached_tool_server_is_listed_without_fetching_its_spec(
+    cached_instance, redis_url, cache, listener
+):
+    store, terminal_id = cache
+    listener.route("GET", "/cached-srv/openapi.json", json_answer(_openapi("cached_lookup")))
+    connection = {
+        "url": f"{listener.base_url}/cached-srv",
+        "path": "openapi.json",
+        "auth_type": "none",
+        "key": "",
+        "config": {"enable": True},
+        "info": {"id": "cached-srv", "name": "Cached"},
+    }
+    with cached_instance.client() as client:
+        saved = client.post(TOOL_SERVERS_CONFIG[1], json={"TOOL_SERVER_CONNECTIONS": [connection]})
+    assert saved.status_code == 200, saved.text
+    cached = json.loads(store.get(TOOL_CACHE_KEY))
+    assert [server["id"] for server in cached] == ["cached-srv"]
+    fetches_before = len(listener.requests_to("/cached-srv/openapi.json"))
+
+    rebuilds, _ = load(cached_instance, redis_url, TOOL_CACHE_KEY, terminal_id)
+
+    assert "server:cached-srv" in list_tools(cached_instance)
+    assert rebuilds == 0
+    assert len(listener.requests_to("/cached-srv/openapi.json")) == fetches_before

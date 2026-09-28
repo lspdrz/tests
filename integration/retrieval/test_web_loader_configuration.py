@@ -12,18 +12,31 @@
   first page of a search was reused for every later page, so an HTML page after a feed lost its
   entities and a feed after an HTML page lost its CDATA text.
 
-Twin of unit/retrieval/test_web_loader_configuration.py, which keeps the urllib3-future socket
-options (no route sets them) and the Playwright session cleanup (no browser in the unit lane).
+- Leaked Playwright pages (PR #27526, commit 94b1b7e6b, issue #25880): the Playwright loader
+  never closed a page, so every page of a web search stayed open, running its scripts, until
+  the whole batch ended. Here the instance runs its own headless Chromium, and the first search
+  result keeps asking the listener for `/ping` for as long as it is open, while the second
+  result takes two seconds to arrive: no ping may come in while the second page loads, whether
+  the first page loaded or timed out.
+
+Twin of unit/retrieval/test_web_loader_configuration.py, which keeps the Playwright cleanup cases
+no request reaches (a failure raised out of the loader, which every caller tolerates, and a search
+abandoned half way, which every caller reads to the end). The urllib3-future socket
+options are driven in integration/retrieval/test_web_loaders.py.
 
 Discriminates: passes on dev bbfa876af; dispatching on the env `WEB_LOADER_ENGINE` fails the three
 engine cases, dropping `loader_config` at the search call site fails the search engine case,
 pacing the search at a fixed 10 pages a second fails the pacing case, logging the vector write
 failure fails the embedding case and keeping the first page's parser fails both batch orders.
+On dev ef67cc3fa, opening each Playwright page outside its `async with` block (94b1b7e6b
+reverted for the search path) fails both page cases: the first page keeps pinging.
 """
 
 from __future__ import annotations
 
+import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -217,3 +230,104 @@ def test_each_search_result_is_parsed_as_its_own_type(fetching_admin, listener, 
     }
     assert "feed payload" in text_by_page["feed.xml"], "the feed was not parsed as XML"
     assert "café au lait" in text_by_page["page.html"], "the page was not parsed as HTML"
+
+
+# --- 94b1b7e6b: each Playwright page is closed once its result is read ----------------------
+
+PINGING_PAGE = """<html><body><p>first result</p>
+<script>setInterval(() => fetch("/ping").catch(() => {}), 100);</script>{extra}</body></html>"""
+# each frame arrives within the fetch budget, the whole chain well past the page timeout
+FRAME_CHAIN = '<iframe src="/frame?depth=1"></iframe>'
+
+
+def chromium_installed() -> bool:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        return Path(playwright.chromium.executable_path).exists()
+
+
+class PageWatch:
+    """The listener as two search results: a first page that pings, a second that is slow."""
+
+    def __init__(self, listener, first_page_extra: str = "") -> None:
+        self.pings: list[float] = []
+        self.second_requested: list[float] = []
+        self.lock = threading.Lock()
+        first = PINGING_PAGE.replace("{extra}", first_page_extra)
+        listener.route("GET", "/first", text_answer(first))
+        listener.route("GET", "/second", self._slow_second)
+        listener.route("GET", "/ping", self._ping)
+        listener.route("GET", "/frame", self._frame)
+        self.pages = [f"{listener.base_url}/first", f"{listener.base_url}/second"]
+
+    def _ping(self, _request):
+        with self.lock:
+            self.pings.append(time.monotonic())
+        return text_answer("pong", content_type="text/plain")
+
+    def _slow_second(self, _request):
+        with self.lock:
+            self.second_requested.append(time.monotonic())
+        time.sleep(2)
+        return text_answer("<p>second result</p>")
+
+    def _frame(self, request):
+        depth = int(request.path.split("depth=")[1])
+        time.sleep(1.5)
+        return text_answer(f'<iframe src="/frame?depth={depth + 1}"></iframe>')
+
+    def pings_while_the_second_page_loaded(self) -> list[float]:
+        with self.lock:
+            # the first ping after the switch may already be in flight
+            started = self.second_requested[0] + 0.5
+            return [moment for moment in self.pings if started <= moment <= started + 1.5]
+
+
+@pytest.fixture
+def playwright_search(fetching_admin, listener):
+    """`search(first_page_extra)` runs a Playwright web search over a `PageWatch`'s two pages."""
+    if not chromium_installed():
+        pytest.skip(
+            "no Chromium for the instance's Playwright loader (playwright install chromium)"
+        )
+
+    def search(first_page_extra: str = "", timeout_ms: int = 10000) -> tuple[PageWatch, dict]:
+        watch = PageWatch(listener, first_page_extra)
+        save_web_settings(
+            fetching_admin,
+            **serve_search_results(listener, watch.pages),
+            WEB_LOADER_ENGINE="playwright",
+            PLAYWRIGHT_WS_URL="",
+            PLAYWRIGHT_TIMEOUT=timeout_ms,
+            BYPASS_WEB_SEARCH_WEB_LOADER=False,
+            BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL=True,
+        )
+        response = fetching_admin.post(WEB_SEARCH, json={"queries": ["pages"]})
+        assert response.status_code == 200, response.text
+        return watch, response.json()
+
+    return search
+
+
+@pytest.mark.requires_browser
+def test_a_loaded_search_result_page_is_closed_before_the_next_one(playwright_search):
+    watch, result = playwright_search()
+
+    assert [doc["metadata"]["source"] for doc in result["docs"]] == watch.pages
+    assert watch.pings, "the first page never ran its script"
+    assert watch.pings_while_the_second_page_loaded() == [], (
+        "the first result's page stayed open while the next one loaded (#25880)"
+    )
+
+
+@pytest.mark.requires_browser
+def test_a_timed_out_search_result_page_is_closed_too(playwright_search):
+    # the second page's two seconds stay inside the budget; the frame chain never ends
+    watch, result = playwright_search(first_page_extra=FRAME_CHAIN, timeout_ms=3000)
+
+    assert [doc["metadata"]["source"] for doc in result["docs"]] == watch.pages[1:]
+    assert watch.pings, "the first page never ran its script"
+    assert watch.pings_while_the_second_page_loaded() == [], (
+        "the page that timed out stayed open while the next one loaded (#25880)"
+    )

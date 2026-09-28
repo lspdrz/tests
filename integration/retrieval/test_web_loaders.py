@@ -18,14 +18,28 @@
   object itself into `HTTPException.detail`, which does not serialise, so a failed search was a
   500 with an empty body.
 
-Twin of unit/retrieval/test_web_loaders.py, which keeps the Tavily loader construction (its API
-base URL is environment-only, so no local stand-in can be named at boot), the construction of
-every engine and the YouTube transcript errors (the transcript API talks to YouTube).
+- Tavily web loader (PR #27636, commit 104a0f2f1): `SafeTavilyLoader` required an
+  `api_base_url` that `get_web_loader` never passed, so choosing Tavily raised before any
+  request. Tavily's API base URL is environment-only, so the instance boots pointed at a local
+  stand-in. The external loader and an unknown engine are read the same way.
+
+- urllib3-future socket options (PR #26796, commit 7ef0530b2, issue #26791): the connect-time
+  SSRF guard passed every socket option straight to `setsockopt()`, which takes three arguments.
+  urllib3-future, which shadows urllib3 once a tool or function installs it, declares its
+  defaults in a four-element per-protocol form, so every synchronous fetch failed on connect and
+  a linked document was no longer recognised as one. A function installed by the admin sets
+  those defaults here, the way installing urllib3-future does.
+
+Twin of unit/retrieval/test_web_loaders.py and of the socket option part of
+unit/retrieval/test_web_loader_configuration.py; the YouTube transcript errors are in
+integration/retrieval/test_youtube_transcripts.py.
 
 Discriminates: passes on dev bbfa876af; dropping the top-level `content` fails the attached page,
 one `try` for fetch and save fails the unreadable link, a Web IQ constructor without
 `api_base_url` fails the Web IQ page, substring sniffing fails every Office type and passing the
-exception as the detail fails the failed search.
+exception as the detail fails the failed search. On dev ef67cc3fa, a required `api_base_url`
+on the Tavily loader fails the Tavily page, and passing every socket option to `setsockopt` whole
+fails the document link under urllib3-future's defaults.
 """
 
 from __future__ import annotations
@@ -35,9 +49,10 @@ import zipfile
 
 import pytest
 
-from harness.actors import create_user
+from harness.actors import admin_of, create_user
 from harness.instance import free_port
-from harness.listener import json_answer, text_answer
+from harness.listener import json_answer, listening, text_answer
+from harness.plugins import installed_function
 from harness.web_retrieval import LOCAL_WEB_FETCH, save_web_settings, web_settings_restored
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
@@ -84,8 +99,15 @@ def word_document() -> bytes:
 
 
 @pytest.fixture(scope="module")
-def fetching_instance(instance_with):
-    return instance_with(LOCAL_WEB_FETCH)
+def tavily_api():
+    """A stand-in for Tavily's extract endpoint, named at boot (its base URL is env-only)."""
+    with listening() as service:
+        yield service
+
+
+@pytest.fixture(scope="module")
+def fetching_instance(instance_with, tavily_api):
+    return instance_with({**LOCAL_WEB_FETCH, "TAVILY_API_BASE_URL": tavily_api.base_url})
 
 
 @pytest.fixture
@@ -174,6 +196,52 @@ def test_a_page_is_read_through_microsoft_web_iq(web_admin, listener, page):
     assert listener.requests_to("/v3/browse")[0].headers["x-apikey"] == "web-iq-key"
 
 
+def test_a_page_is_read_through_tavily(web_admin, tavily_api, page):
+    extracted = {"results": [{"url": page, "raw_content": "read by tavily"}]}
+    tavily_api.route("POST", "/extract", json_answer(extracted))
+    save_web_settings(
+        web_admin,
+        WEB_LOADER_ENGINE="tavily",
+        TAVILY_API_KEY="tvly-key",
+        TAVILY_EXTRACT_DEPTH="advanced",
+    )
+
+    previewed = attach(web_admin, page, preview=True)
+
+    assert previewed.status_code == 200, previewed.text
+    assert previewed.json()["content"] == "read by tavily", "the Tavily loader was never built"
+    extract = tavily_api.requests_to("/extract")[-1]
+    assert (extract.json()["urls"], extract.json()["extract_depth"]) == (page, "advanced")
+    assert extract.headers["Authorization"] == "Bearer tvly-key"
+
+
+def test_a_page_is_read_through_the_external_loader(web_admin, listener, page):
+    listener.route(
+        "POST", "/loader", json_answer([{"page_content": "read by the external loader"}])
+    )
+    save_web_settings(
+        web_admin,
+        WEB_LOADER_ENGINE="external",
+        EXTERNAL_WEB_LOADER_URL=f"{listener.base_url}/loader",
+        EXTERNAL_WEB_LOADER_API_KEY="loader-key",
+    )
+
+    previewed = attach(web_admin, page, preview=True)
+
+    assert previewed.status_code == 200, previewed.text
+    assert previewed.json()["content"] == "read by the external loader"
+    assert listener.requests_to("/loader")[0].json()["urls"] == [page]
+
+
+def test_an_unknown_loader_engine_is_refused(web_admin, page):
+    save_web_settings(web_admin, WEB_LOADER_ENGINE="not-an-engine")
+
+    refused = attach(web_admin, page, preview=True)
+
+    assert refused.status_code == 400, refused.text
+    assert page in refused.json()["detail"]
+
+
 @pytest.mark.parametrize("content_type", OFFICE_TYPES)
 def test_an_office_document_link_is_extracted_not_read_as_html(web_admin, listener, content_type):
     listener.route("GET", "/report.docx", (200, {"Content-Type": content_type}, word_document()))
@@ -183,6 +251,58 @@ def test_an_office_document_link_is_extracted_not_read_as_html(web_admin, listen
     assert previewed.status_code == 200, previewed.text
     assert WORD_TEXT in previewed.json()["content"], (
         f"a {content_type} link went through the HTML loader instead of the extractor"
+    )
+
+
+URLLIB3_FUTURE_DEFAULTS = """
+import socket
+from urllib3.connection import HTTPConnection
+
+# urllib3-future's per-protocol defaults, in place so every new connection takes them
+HTTPConnection.default_socket_options[:] = [
+    (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1, "tcp"),
+    (socket.IPPROTO_UDP, 1, 1, "udp"),
+]
+
+
+class Filter:
+    pass
+"""
+STOCK_URLLIB3_DEFAULTS = """
+import socket
+from urllib3.connection import HTTPConnection
+
+HTTPConnection.default_socket_options[:] = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
+
+
+class Filter:
+    pass
+"""
+
+
+@pytest.fixture
+def urllib3_future_defaults(fetching_instance):
+    """The instance's urllib3 set to urllib3-future's socket options, put back afterwards."""
+    owner = admin_of(fetching_instance)
+    with installed_function(owner, URLLIB3_FUTURE_DEFAULTS, active=False):
+        pass
+    try:
+        yield
+    finally:
+        with installed_function(owner, STOCK_URLLIB3_DEFAULTS, active=False):
+            pass
+
+
+def test_a_document_link_is_extracted_under_urllib3_futures_socket_options(
+    web_admin, listener, urllib3_future_defaults
+):
+    listener.route("GET", "/report.docx", (200, {"Content-Type": OFFICE_TYPES[0]}, word_document()))
+
+    previewed = attach(web_admin, f"{listener.base_url}/report.docx", preview=True)
+
+    assert previewed.status_code == 200, previewed.text
+    assert WORD_TEXT in previewed.json()["content"], (
+        "the document was not recognised: the fetch that reads its type failed on connect (#26791)"
     )
 
 
