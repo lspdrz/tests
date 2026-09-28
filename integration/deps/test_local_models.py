@@ -50,6 +50,8 @@ def models(tmp_path_factory) -> dict[str, str]:
         "ENABLE_RAG_HYBRID_SEARCH": "true",
         "RAG_RERANKING_MODEL": str(reranker),
         "RAG_RERANKING_MODEL_TRUST_REMOTE_CODE": "true",
+        # where transformers copies the reranker's model code, kept out of the user's cache
+        "HF_MODULES_CACHE": str(tmp_path_factory.mktemp("hf-modules")),
     }
 
 
