@@ -1,4 +1,4 @@
-"""Chats that are never saved are not offered the task-list tools.
+"""Chats that are never saved are not offered the task-list tools, and a reply reloads mid-stream.
 
 0.11.0 `d484a2a`, `d2936c8`, `b45c020` and `71c4da8` (issue #27432): call sites open-coded
 `startswith(('local:', 'channel:'))` and never learned the `temporary:` prefix the web client
@@ -7,10 +7,17 @@ now gives temporary chats. `get_builtin_tools` therefore offered `create_tasks` 
 `utils/chat_id.is_saved_chat_id` is now the single answer, and only a saved chat gets them; a
 model answering in a channel does not either.
 
+0.11.0 `aadab2f`: `create_task` minted its own task id, while the reply streamed its progress
+under the id `chat_completion` had stamped into the turn. A chat opened while its reply was
+still streaming looks its running tasks up by the registered id, so it found no progress and
+showed an empty reply until the end. `create_task` now registers the caller's id.
+
 Twin of unit/chat/test_socket_and_redis_runtime.py.
 
-Discriminates: passes on dev bbfa876af; with the task-list gate keyed on the `local:` and
-`channel:` prefixes again, the `temporary:` chat is offered both tools.
+Discriminates: passes on dev bbfa876af and ef67cc3fa; with the task-list gate keyed on the `local:`
+and `channel:` prefixes again, the `temporary:` chat is offered both tools; with `create_task`
+ignoring the id it is handed, or `chat_completion` not handing it over, the reloaded chat shows no
+progress while the reply streams.
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ import pytest
 
 from harness import channel_chat
 from harness.chat import send_message, wait_for_reply
+from harness.inflight import start_slow_reply
 from harness.upstream import MOCK_MODEL_ID
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
@@ -72,3 +80,22 @@ def test_a_channel_turn_is_not_offered_the_task_list_tools(admin, upstream, pres
     offered = _offered_tools(_first_provider_request(upstream))
     assert offered, "no builtin tools were offered at all; the check below would prove nothing"
     assert not offered & TASK_LIST_TOOLS
+
+
+def test_a_chat_opened_while_its_reply_streams_shows_the_reply_so_far(make_user, upstream):
+    with make_user().client() as client:
+        turn = start_slow_reply(client, upstream, chunk_delay=0.2)
+        seen_mid_stream = ""
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            stored = client.get(f"/api/v1/chats/{turn.chat_id}").json()
+            message = stored["chat"]["history"]["messages"][turn.assistant_message_id]
+            if message.get("done"):
+                break
+            seen_mid_stream = message.get("content") or seen_mid_stream
+            time.sleep(0.2)
+        wait_for_reply(client, turn)
+
+    assert seen_mid_stream.startswith("part-0"), (
+        "a chat opened while its reply streamed showed none of the reply so far"
+    )

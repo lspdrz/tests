@@ -18,18 +18,30 @@ Nine 0.11.1 fixes land on the request body that reaches the provider:
 * #27603 (`5093a99389`): compaction ran on the configured task model, not the chat's own.
 * #28240 (`c4b3e6840f`): the stored model of a reply was dropped on reload, so a previous
   model's provider-bound reasoning was replayed to whatever model came next.
+* `3258330729`: the reasoning format of a replayed reply was keyed on a `provider` field Ollama
+  models never carry. Each provider now gets stored reasoning in its own field: `thinking` for
+  Ollama (pinned in integration/chat/test_ollama_chat.py), `reasoning_content` for llama.cpp
+  and none for a strict OpenAI-style provider.
+* #28292 (`ff74bfa6a1`): memories sharing a timestamp came back from search in row order; every
+  memory sort now breaks ties on the memory id. One update call stamps all its memories with the
+  same second, which is how the ties are made.
+* PR #27661 (`fcc130c9b`): the usage capability is read before the custom-model fallback
+  (`ENABLE_CUSTOM_MODEL_FALLBACK`, an instance of its own) swaps in the default model, so a
+  custom model on the fallback still gets token counts by its own capability.
 
 Stored history is created through the chats API and continued the way the web client
 continues a chat, so the server rebuilds the payload from what it stored.
 
 Twin of unit/chat/test_provider_payload_assembly.py.
 
-Discriminates: passes on dev bbfa876af. The narrow tests fail with memory sections in row order,
-`custom_params` splatted, the include_usage block removed, only `output` stripped from replayed
-messages, the thinking-signature filter removed, the other-model reasoning strip removed,
+Discriminates: passes on dev bbfa876af and ef67cc3fa. The narrow tests fail with memory sections in
+row order, `custom_params` splatted, the include_usage block removed, only `output` stripped from
+replayed messages, the thinking-signature filter removed, the other-model reasoning strip removed,
 provider-nested reasoning details ignored, chat attachments filtered by url, `cache_n` added to
-`prompt_tokens`, and compaction sent to the task model; dropping `model` from the replay keys
-fails the two same-model replay cases.
+`prompt_tokens`, and compaction sent to the task model; dropping `model` from the replay keys fails
+the two same-model replay cases. `think_tags` as the default reasoning format fails the llama.cpp
+and strict-provider tests, `memory.id` dropped from the sort keys fails both tie tests, and the
+capability read moved below the fallback swap fails the fallback usage test.
 """
 
 from __future__ import annotations
@@ -439,4 +451,151 @@ def test_compaction_summarises_with_the_chats_own_model(
     assert summaries, "the chat was never compacted"
     assert summaries[0]["model"] == summarised_by, (
         f"compaction ran on {summaries[0]['model']!r} instead of {summarised_by!r} (#27603)"
+    )
+
+
+# --- 3258330729: each provider gets stored reasoning back in its own field ------------------
+
+LLAMA_MODEL = "llama-reasoner"
+
+
+def _plain_reasoning_reply(model: str) -> dict:
+    summary = [{"type": "output_text", "text": "step one"}]
+    answer = {"type": "message", "content": [{"type": "output_text", "text": "answer"}]}
+    output = [{"type": "reasoning", "summary": summary}, answer]
+    return {"role": "assistant", "content": "answer", "model": model, "output": output}
+
+
+def test_llama_cpp_gets_the_reasoning_back_as_reasoning_content(admin, listener, preserve):
+    preserve(second_provider.OPENAI_CONFIG)
+    with admin.client() as client:
+        second_provider.attach(client, listener, LLAMA_MODEL, provider="llama.cpp")
+        listener.route("POST", "/v1/chat/completions", second_provider.sse({"content": "ok"}))
+        chat_id, last_id = _store_chat(
+            client, [{"role": "user", "content": "think"}, _plain_reasoning_reply(LLAMA_MODEL)]
+        )
+        _continue(client, chat_id, last_id, model=LLAMA_MODEL)
+
+    sent = listener.requests_to("/v1/chat/completions")[-1].json()["messages"]
+    replayed = next(entry for entry in sent if entry["role"] == "assistant")
+    assert replayed.get("reasoning_content") == "step one", replayed
+    assert replayed["content"] == "answer"
+    assert "thinking" not in replayed
+
+
+def test_a_strict_provider_gets_no_reasoning_field(make_user, upstream):
+    with make_user().client() as client:
+        chat_id, last_id = _store_chat(
+            client, [{"role": "user", "content": "think"}, _plain_reasoning_reply(MOCK_MODEL_ID)]
+        )
+        _continue(client, chat_id, last_id)
+
+    replayed = _replayed_assistant(upstream)
+    assert not {"thinking", "reasoning_content"} & set(replayed), replayed
+    assert replayed["content"] == "answer", "the reasoning was pasted into the content"
+
+
+# --- #28292: memories sharing a timestamp come out in one order ------------------------------
+
+TIED_PATH = "work/tied"
+
+
+def _add_in_one_batch(client, contents: list[str]) -> list[dict]:
+    """Memories added by one update call, which stamps them all with the same second."""
+    operations = [
+        {"action": "add", "content": content, "type": "user", "path": TIED_PATH}
+        for content in contents
+    ]
+    applied = client.post("/api/v1/memories/update", json={"operations": operations})
+    assert applied.status_code == 200, applied.text
+    return [result["memory"] for result in applied.json()]
+
+
+@pytest.fixture
+def tied_memories(make_user):
+    """A client and six memories on one path, all updated in the same second."""
+    with make_user().client() as client:
+        added = _add_in_one_batch(client, [f"tied note {index}" for index in range(6)])
+        assert len({memory["updated_at"] for memory in added}) == 1, added
+        yield client, added
+
+
+def _by_id(memories: list[dict]) -> list[str]:
+    return sorted(memory["id"] for memory in memories)
+
+
+def test_memory_search_breaks_timestamp_ties_on_the_memory_id(tied_memories):
+    client, added = tied_memories
+
+    found = client.post("/api/v1/memories/search", json={"path": TIED_PATH})
+
+    assert found.status_code == 200, found.text
+    assert [memory["id"] for memory in found.json()] == _by_id(added), (
+        "memories sharing a timestamp came back in row order, not by id (#28292)"
+    )
+
+
+def test_reading_a_memory_path_breaks_timestamp_ties_on_the_memory_id(tied_memories):
+    client, added = tied_memories
+
+    read = client.post("/api/v1/memories/path", json={"path": TIED_PATH})
+
+    assert read.status_code == 200, read.text
+    assert [memory["id"] for memory in read.json()["memories"]] == _by_id(added), (
+        "memories sharing a timestamp came back in row order, not by id (#28292)"
+    )
+
+
+# --- PR #27661: a fallen-back custom model keeps its own usage capability ----------------
+
+FALLBACK_ENV = {"ENABLE_CUSTOM_MODEL_FALLBACK": "true", "DEFAULT_MODELS": MOCK_MODEL_ID}
+
+
+@pytest.fixture(scope="module")
+def fallback_instance(instance_with):
+    """An instance where a custom model whose base model is gone falls back to the default."""
+    return instance_with(FALLBACK_ENV)
+
+
+def _orphaned_model(instance, usage: bool) -> str:
+    """A custom model on a base model that no connection serves, with the usage capability."""
+    model_id = f"orphaned-{uuid.uuid4().hex[:8]}"
+    form = {
+        "id": model_id,
+        "name": "Orphaned preset",
+        "base_model_id": "retired-base-model",
+        "meta": {"capabilities": {"usage": usage}},
+        "params": {},
+    }
+    with instance.client() as client:
+        created = client.post("/api/v1/models/create", json=form)
+        assert created.status_code == 200, created.text
+        client.get("/api/models").raise_for_status()
+    return model_id
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("usage", [True, False], ids=["usage-model", "plain-model"])
+def test_a_model_on_the_fallback_is_asked_for_token_counts_by_its_own_capability(
+    fallback_instance, usage
+):
+    model_id = _orphaned_model(fallback_instance, usage)
+    fallback_instance.upstream.reset()
+    with fallback_instance.client() as client:
+        answered = client.post(
+            "/api/chat/completions",
+            json={
+                "model": model_id,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
+
+    assert answered.status_code == 200, answered.text
+    sent = fallback_instance.upstream.chat_requests()[-1]
+    assert sent["model"] == MOCK_MODEL_ID, "the request did not fall back to the default model"
+    asked = (sent.get("stream_options") or {}).get("include_usage") is True
+    assert asked is usage, (
+        "the fallback model's capability decided whether token counts were requested, not the "
+        "custom model's own (PR #27661)"
     )

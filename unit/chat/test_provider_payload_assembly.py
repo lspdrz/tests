@@ -1,23 +1,12 @@
-"""The parts of the 0.11.1 provider-payload fixes that no HTTP request can reach.
+"""Every memory sort key breaks timestamp ties on the memory id, including ones added later.
 
-The request bodies themselves are pinned by the integration twin,
-integration/chat/test_provider_payload_assembly.py. Three pieces stay here:
+`ff74bfa6a1` (#28292): every memory `sort_key` gained `memory.id` as the final tiebreak, so rows
+sharing a timestamp come out in one order. The integration twin,
+integration/chat/test_provider_payload_assembly.py, shows today's two sort keys doing so through
+the memory search and path routes. This sweep stays because it also holds a sort key upstream
+adds to `utils/memory.py` later, which no request of today reaches.
 
-- `3258330729`: `get_reasoning_format` keyed Ollama on `provider`, a key Ollama models never
-  carry (they are tagged by `owned_by`), and pasted reasoning into content as `<think>` tags.
-  Ollama now gets its native `thinking` field. The scripted provider is OpenAI-shaped, so no
-  Ollama model exists on the test instance.
-- `ff74bfa6a1` (#28292): every memory `sort_key` gained `memory.id` as the final tiebreak, so
-  rows sharing a timestamp come out in one order. Ties within a second cannot be staged over
-  HTTP without racing the clock, so the tiebreak is audited in the source.
-- `fcc130c9b` (PR #27661): `chat_completion` reads the model's `usage` capability before the
-  custom-model fallback rebinds `model`, so the fallback's capability is not used instead. The
-  fallback needs `ENABLE_CUSTOM_MODEL_FALLBACK`, an environment-only switch, so the order is
-  audited.
-
-Discriminates: passes on bbfa876af; fails with `get_reasoning_format` keyed on `provider` again
-(Ollama reasoning becomes `<think>` content), with `memory.id` dropped from a `sort_key`, and
-with the capability read moved below the fallback rebind.
+Discriminates: passes on bbfa876af; fails with `memory.id` dropped from a `sort_key`.
 """
 
 from __future__ import annotations
@@ -28,48 +17,6 @@ from pathlib import Path
 import pytest
 
 pytestmark = pytest.mark.regression
-
-REASONING_REPLY = {
-    "role": "assistant",
-    "output": [
-        {"type": "reasoning", "summary": [{"type": "output_text", "text": "step one"}]},
-        {"type": "message", "content": [{"type": "output_text", "text": "answer"}]},
-    ],
-}
-
-
-@pytest.fixture(scope="session")
-def middleware_module(owui_module):
-    return owui_module("open_webui.utils.middleware")
-
-
-def _replayed(middleware_module, model: dict) -> dict:
-    """The stored reply as the payload replays it to `model`."""
-    [message] = middleware_module.process_messages_with_output(
-        messages=[REASONING_REPLY],
-        reasoning_format=middleware_module.get_reasoning_format(model),
-    )
-    return message
-
-
-def test_ollama_reasoning_is_replayed_in_the_native_thinking_field(middleware_module):
-    message = _replayed(middleware_module, {"id": "llama3", "owned_by": "ollama"})
-
-    assert message.get("thinking") == "step one", message
-    assert message["content"] == "answer", "reasoning was pasted into the content as <think> tags"
-
-
-@pytest.mark.parametrize(
-    ("model", "field"),
-    [({"provider": "llama.cpp"}, "reasoning_content"), ({"owned_by": "openai"}, None)],
-    ids=["llama-cpp", "strict-provider"],
-)
-def test_other_providers_keep_their_reasoning_format(middleware_module, model, field):
-    message = _replayed(middleware_module, model)
-
-    reasoning_fields = {"thinking", "reasoning_content"} & set(message)
-    assert reasoning_fields == ({field} if field else set()), message
-    assert message["content"] == "answer"
 
 
 def _functions(path: Path, name: str) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
@@ -97,28 +44,3 @@ def test_every_memory_sort_key_breaks_ties_on_the_memory_id(open_webui_backend):
                 f"line {returned.lineno}: `{ast.unparse(returned)}` has no id tiebreak, so rows "
                 "sharing a timestamp come out in arrival order (#28292)"
             )
-
-
-def _first_line_assigning(function: ast.AST, target: str, value: str | None = None) -> int:
-    lines = [
-        node.lineno
-        for node in ast.walk(function)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(name, ast.Name) and name.id == target for name in node.targets)
-        and (value is None or ast.unparse(node.value) == value)
-    ]
-    assert lines, f"chat_completion no longer assigns `{target}`; retarget this audit"
-    return min(lines)
-
-
-def test_the_usage_capability_is_read_before_the_fallback_rebinds_the_model(
-    open_webui_backend,
-):
-    [chat_completion] = _functions(open_webui_backend / "open_webui" / "main.py", "chat_completion")
-
-    read_at = _first_line_assigning(chat_completion, "model_capabilities")
-    rebound_at = _first_line_assigning(chat_completion, "model", "fallback_model")
-    assert read_at < rebound_at, (
-        "the usage capability is read after the custom-model fallback rebinds `model`, so the "
-        "fallback's capability decides whether token counts are requested (PR #27661)"
-    )

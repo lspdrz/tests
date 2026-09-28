@@ -10,18 +10,24 @@ Two 0.11.4 fixes to the model registry an instance keeps in Redis with `WEBSOCKE
 * `649c012e`: Ollama reports a moving `expires_at` for a model it holds in memory, and the
   registry's fingerprint covered it, so every model refresh rewrote the whole pool. The
   registry copy now drops it; the API response keeps it.
+* `6330350a40` (#28777): the signature that lets a worker skip rewriting an unchanged pool lived
+  in the worker's memory, so a worker whose own last write matched skipped the write that would
+  repair a pool another worker had changed. It now lives in Redis next to the pool.
 
 The instance runs on `HashRedis`, which records every command it is sent and lets the test
 change the pool as another worker would. `delete_many`'s signature handling has no caller on
 the pool and is not pinned.
 
-Twin of unit/models/test_shared_model_pool_cache.py.
+Twin of unit/models/test_shared_model_pool_cache.py, and of unit/chat/test_socket_runtime.py
+for #28777.
 
 Discriminates: passes on dev bbfa876af; with the pool back on a plain `RedisDict` a chat request
 reads the pool six times (five HGET, one HEXISTS) and every refresh rewrites it; with the cache
 refetching only when empty, or trusting a cleared signature, another worker's change is not
-seen; with any signature suppressing a write the pool is never repaired; and with `expires_at`
-kept in the registry copy a refresh in which only the countdown moved rewrites the pool.
+seen; with any signature suppressing a write the pool is never repaired, and with the signature
+kept in the worker's memory the pool another worker changed (signature cleared) is not repaired;
+and with `expires_at` kept in the registry copy a refresh in which only the countdown moved
+rewrites the pool.
 """
 
 from __future__ import annotations
