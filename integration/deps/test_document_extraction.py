@@ -1,17 +1,24 @@
 """Dependency smoke: every document format Open WebUI reads, uploaded through the API.
 
-An upload with `process=true` runs through `retrieval/loaders/main.py`, which hands each format
-to a third-party library: .pdf to pypdf, .docx to docx2txt, .pptx, .xlsx, .xls, .xml, .rst, .epub
-and .odt to unstructured's partitioners (python-pptx; pandas on openpyxl or xlrd behind a
-msoffcrypto encryption check; pypandoc and the pandoc binary), .html to BeautifulSoup, plain text
-through chardet's encoding hint, and every result through ftfy, which repairs mojibake and drops
-control characters. With `PDF_EXTRACT_IMAGES` on, a PDF's images are opened by Pillow and read by
-rapidocr on onnxruntime and OpenCV. A dependency bump that breaks one of those paths fails the
-upload or loses the text, which `GET /api/v1/files/{id}/data/content` shows. With the Azure
-Document Intelligence engine a PDF goes to azure-ai-documentintelligence instead, here against a
-local stand-in of the analyze API: the key header, the markdown output format and the polled
-result are what it relies on (twin of unit/deps/test_azure_ai_documentintelligence.py). The
-library contracts are in unit/deps/.
+An upload with `process=true` runs through `retrieval/loaders/main.py`, which hands each format to a
+third-party library: .pdf to pypdf, .docx to docx2txt, .pptx, .xlsx, .xls, .xml, .rst, .epub and
+.odt to unstructured's partitioners (python-pptx; pandas on openpyxl or xlrd behind a msoffcrypto
+encryption check; pypandoc and the pandoc binary), .html to BeautifulSoup, plain text through
+chardet's encoding hint, and every result through ftfy, which repairs mojibake and drops control
+characters. With `PDF_EXTRACT_IMAGES` on, a PDF's images are opened by Pillow (or, kept as raw
+pixels Pillow cannot open, turned into a picture by pypdf first) and read by rapidocr on onnxruntime
+and OpenCV. A dependency bump that breaks one of those paths fails the upload or loses the text,
+which `GET /api/v1/files/{id}/data/content` shows. With the Azure Document Intelligence engine a PDF
+goes to azure-ai-documentintelligence instead, here against a local stand-in of the analyze API: the
+key header, the markdown output format and the polled result are what it relies on (twin of
+unit/deps/test_azure_ai_documentintelligence.py). The library contracts are in unit/deps/.
+
+A workbook is read sheet by sheet in order, numbers included: unstructured's `partition_xlsx`
+hands it to pandas' `read_excel` on openpyxl. `pip install open-webui` leaves `unstructured` out,
+and an instance booted that way (`harness.missing_packages`) reads spreadsheets with pandas
+itself (`ExcelFile`, `read_excel` per sheet on openpyxl or xlrd, `to_string` without the row
+index) and slides with python-pptx (twin of unit/deps/test_pandas.py and
+unit/deps/test_openpyxl.py).
 
 Windows-1251 Cyrillic is decoded with the codec chardet names, which ftfy could not repair
 after a latin-1 fallback.
@@ -27,27 +34,33 @@ backend copy broke pypdf's `extract_text`, `docx2txt.process`, the xlsx, rst and
 BeautifulSoup's `get_text` and `ftfy.fix_text`. Each copy turned exactly its own formats red and
 left the others green. Mapping cp949 in a third copy makes the EUC-KR case pass. A fourth copy
 whose `chardet.detect` names no encoding fails the Big5, EUC-KR, Shift-JIS and Windows-1251 cases.
-On dev ef67cc3fa, dropping `output_content_format='markdown'` from the Document Intelligence
-loader fails its test; msoffcrypto's `OfficeFile` answering "not encrypted" (patched in at import)
-fails the password-protected workbook test, one that accepts any bytes fails the test of a file
-that only claims to be a workbook, and OpenCV's `minAreaRect` answering an empty box or
-onnxruntime refusing to build a session fails the PDF image test. A docx2txt result cut to its
-first paragraph or to ASCII fails the Word paragraphs test, `ftfy.fix_text` left out fails the
-mojibake, smart quote and control character tests, `fix_text` without `unescape_html=False` fails
-the literal entity test and one that fails on empty text fails the blank page test (and the empty
-Word document one).
+On dev ef67cc3fa, dropping `output_content_format='markdown'` from the Document Intelligence loader
+fails its test; msoffcrypto's `OfficeFile` answering "not encrypted" (patched in at import) fails
+the password-protected workbook test, one that accepts any bytes fails the test of a file that only
+claims to be a workbook, and OpenCV's `minAreaRect` answering an empty box or onnxruntime refusing
+to build a session fails the PDF image test. A docx2txt result cut to its first paragraph or to
+ASCII fails the Word paragraphs test, `ftfy.fix_text` left out fails the mojibake, smart quote and
+control character tests, `fix_text` without `unescape_html=False` fails the literal entity test and
+one that fails on empty text fails the blank page test (and the empty Word document one). An
+openpyxl whose `load_workbook` raises fails both workbook uploads; the pandas loader printing the
+row index or reading only the first sheet fails the pandas test, a python-pptx loader that skips
+text frames fails the slides test, and a PDF loader that no longer hands an image Pillow cannot open
+(`UnidentifiedImageError`) to pypdf fails the raw-pixel OCR case while the JPEG case passes.
 """
 
 from __future__ import annotations
 
 import io
 import zipfile
+import zlib
 from pathlib import Path
 
 import httpx
 import pytest
 
+from harness.actors import create_user
 from harness.listener import json_answer
+from harness.missing_packages import without_packages_env
 
 pytestmark = [pytest.mark.depcheck, pytest.mark.api, pytest.mark.requires_source]
 
@@ -101,15 +114,21 @@ def _text_pdf(blank_first_page: bool = False) -> bytes:
     """One page carrying the sentence in Helvetica, the smallest PDF pypdf reads text from."""
     stream = f"BT /F1 12 Tf 72 720 Td ({SENTENCE}) Tj ET".encode()
     pages = b"[6 0 R 3 0 R] /Count 2" if blank_first_page else b"[3 0 R] /Count 1"
-    objects = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids %s >>" % pages,
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
-        b"/Resources << /Font << /F1 5 0 R >> >> >>",
-        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
-    ]
+    return _assembled_pdf(
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids %s >>" % pages,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+            b"/Resources << /Font << /F1 5 0 R >> >> >>",
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ]
+    )
+
+
+def _assembled_pdf(objects: list[bytes]) -> bytes:
+    """A PDF of the numbered objects, the first the catalog, with its cross-reference table."""
     pdf = bytearray(b"%PDF-1.4\n")
     offsets = []
     for number, body in enumerate(objects, start=1):
@@ -123,16 +142,37 @@ def _text_pdf(blank_first_page: bool = False) -> bytes:
     return bytes(pdf)
 
 
-def _image_pdf(word: str) -> bytes:
-    """A scan: the word drawn into an image, saved as a PDF with no text layer."""
+def _drawn(word: str):
     from PIL import Image, ImageDraw, ImageFont
 
-    image = Image.new("RGB", (900, 200), "white")
-    font = ImageFont.load_default(size=64)
-    ImageDraw.Draw(image).text((30, 60), word, fill="black", font=font)
+    image = Image.new("L", (900, 200), 255)
+    ImageDraw.Draw(image).text((30, 60), word, fill=0, font=ImageFont.load_default(size=64))
+    return image
+
+
+def _image_pdf(word: str) -> bytes:
+    """A scan: the word drawn into an image, saved by Pillow as a PDF (a JPEG, no text layer)."""
     buffer = io.BytesIO()
-    image.save(buffer, format="PDF")
+    _drawn(word).save(buffer, format="PDF")
     return buffer.getvalue()
+
+
+def _raw_image_pdf(word: str) -> bytes:
+    """The same scan kept as compressed raw pixels, which Pillow cannot open without pypdf."""
+    pixels = zlib.compress(_drawn(word).tobytes())
+    stream = b"q 900 0 0 200 0 0 cm /Scan Do Q"
+    return _assembled_pdf(
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 900 200] /Contents 4 0 R "
+            b"/Resources << /XObject << /Scan 5 0 R >> >> >>",
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+            b"<< /Type /XObject /Subtype /Image /Width 900 /Height 200 /ColorSpace /DeviceGray "
+            b"/BitsPerComponent 8 /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream"
+            % (len(pixels), pixels),
+        ]
+    )
 
 
 def _docx() -> bytes:
@@ -159,6 +199,21 @@ def _xlsx() -> bytes:
     workbook = openpyxl.Workbook()
     workbook.active.append(["item", "note"])
     workbook.active.append(["lighthouse", MARKER])
+    return _saved(workbook)
+
+
+def _workbook() -> bytes:
+    """Two sheets, the first with a whole and a fractional number."""
+    import openpyxl
+
+    workbook = openpyxl.Workbook()
+    budget = workbook.active
+    budget.title = "Budget"
+    for row in (["item", "amount"], ["lighthouse", 1250], ["ferry", 80.5]):
+        budget.append(row)
+    crew = workbook.create_sheet("Crew")
+    for row in (["name", "role"], ["Mara", "keeper"]):
+        crew.append(row)
     return _saved(workbook)
 
 
@@ -290,6 +345,58 @@ def test_a_document_pandoc_converts_is_read_as_text(make_user, filename, build, 
         content = _upload_and_read(client, filename, build(), content_type)
 
     assert MARKER in content, f"{filename} was read as {content!r}"
+
+
+def test_every_sheet_of_a_workbook_is_read_in_order(make_user):
+    with make_user().client() as client:
+        content = _upload_and_read(client, "budget.xlsx", _workbook(), XLSX_TYPE)
+
+    for row in ("lighthouse 1250", "ferry 80.5", "Mara keeper"):
+        assert row in content, f"{row!r} is missing from {content!r}"
+    assert content.index("lighthouse") < content.index("Mara")
+
+
+# ---------------------------------------------------------------- without unstructured
+
+
+@pytest.fixture(scope="module")
+def without_unstructured(instance_with, tmp_path_factory):
+    """An instance installed without the optional `unstructured` extra."""
+    directory = tmp_path_factory.mktemp("without-unstructured")
+    return instance_with(without_packages_env(directory, ["unstructured"]))
+
+
+@pytest.mark.slow
+def test_without_unstructured_every_sheet_is_read_by_pandas(without_unstructured):
+    with create_user(without_unstructured).client() as client:
+        content = _upload_and_read(client, "budget.xlsx", _workbook(), XLSX_TYPE)
+
+    sheets = content.split("\n\n")
+    assert [sheet.splitlines()[0] for sheet in sheets] == ["Sheet: Budget", "Sheet: Crew"]
+    budget_rows = [line.split() for line in sheets[0].splitlines()[1:]]
+    # no row index column: each row starts with its first cell
+    assert budget_rows == [["item", "amount"], ["lighthouse", "1250.0"], ["ferry", "80.5"]]
+    assert [line.split() for line in sheets[1].splitlines()[1:]] == [
+        ["name", "role"],
+        ["Mara", "keeper"],
+    ]
+
+
+@pytest.mark.slow
+def test_without_unstructured_an_xls_is_read_by_pandas_on_xlrd(without_unstructured):
+    with create_user(without_unstructured).client() as client:
+        content = _upload_and_read(client, "budget.xls", _xls(), "application/vnd.ms-excel")
+
+    assert content.startswith("Sheet: Budget\n"), content
+    assert MARKER in content
+
+
+@pytest.mark.slow
+def test_without_unstructured_slides_are_read_by_python_pptx(without_unstructured):
+    with create_user(without_unstructured).client() as client:
+        content = _upload_and_read(client, "slides.pptx", _pptx(), PPTX_TYPE)
+
+    assert content == f"Slide 1:\nHarbour review\n{SENTENCE}", content
 
 
 # ---------------------------------------------------------------- text encodings
@@ -428,10 +535,12 @@ def retrieval_settings(preserve, admin):
     client.close()
 
 
-def test_the_text_in_a_pdf_image_is_read(retrieval_settings, make_user):
+@pytest.mark.parametrize("build", [_image_pdf, _raw_image_pdf], ids=["jpeg-image", "raw-pixels"])
+def test_the_text_in_a_pdf_image_is_read(retrieval_settings, make_user, build):
     retrieval_settings(PDF_EXTRACT_IMAGES=True)
+    scan = build(OCR_WORD)
     with make_user().client() as client:
-        content = _upload_and_read(client, "scan.pdf", _image_pdf(OCR_WORD), "application/pdf")
+        content = _upload_and_read(client, "scan.pdf", scan, "application/pdf")
 
     assert OCR_WORD in content, f"OCR read {content!r}"
 
