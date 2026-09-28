@@ -1,17 +1,24 @@
-"""The model's knowledge-base search lists only knowledge bases the asker can open.
+"""The model's knowledge-base search lists only knowledge bases the asker can open, on every store.
 
 The builtin `query_knowledge_bases` tool searches the knowledge-base embeddings with
 `filter={'knowledge_base_id': {'$in': [...]}}`, the knowledge bases the caller may read, and
-reports each hit's name and description. Commit 1d6d4e6e6 (v0.11.1) fixed eleven vector backends
-that dropped that filter. The default Chroma store always applied it, so this test cannot see that
-fix; it guards the other half, the tool sending the filter. The backends stay covered by the unit
-test.
+reports each hit's name and description. Before commit 1d6d4e6e6 (v0.11.1) eleven bundled vector
+backends took that filter and dropped it, so the store answered with every neighbour, forbidden
+knowledge bases included: Qdrant sent no `query_filter` in either storage mode and Elasticsearch
+only the collection term. The default Chroma store always applied it.
 
-Twin of unit/security/test_knowledge_search_collection_acl.py.
+The same search runs on the shared instance (Chroma) and on instances booted on the local Qdrant
+stand-in, in both storage modes, and on the Elasticsearch stand-in, each of which applies the
+filter it is sent. Pinecone stays a unit test: its client only reaches an index over TLS against
+the certificates it ships with, so no local stand-in can answer it.
 
-Discriminates: passes on bbfa876af with or without 1d6d4e6e6 (Chroma applies the filter), fails with
-the `filter` argument removed from the search in `query_knowledge_bases` (the reader is shown the
-admin's private knowledge base).
+Twin of unit/security/test_knowledge_search_collection_acl.py, which keeps the audit that no
+vector backend ignores a `filter` argument and the Pinecone case.
+
+Discriminates: passes on ef67cc3fa; with the filter dropped from `search` in the Qdrant, Qdrant
+multitenancy or Elasticsearch backend the reader is shown the admin's private knowledge base on
+that store, and with the `filter` argument removed from the search in `query_knowledge_bases`
+on every store.
 """
 
 from __future__ import annotations
@@ -23,17 +30,48 @@ import httpx
 import pytest
 
 from harness import upstream as reply
-from harness.actors import Actor
+from harness.actors import Actor, admin_of, create_user
 from harness.chat import ask
+from harness.elasticsearch_server import elasticsearch_env, serving_elasticsearch
+from harness.qdrant_server import qdrant_env, serving_qdrant
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
+
+# the stand-in stores each boot an instance of their own
+STORES = [
+    "chroma",
+    pytest.param("qdrant-multitenancy", marks=pytest.mark.slow),
+    pytest.param("qdrant-collections", marks=pytest.mark.slow),
+    pytest.param("elasticsearch", marks=pytest.mark.slow),
+]
 
 
 @dataclass
 class KnowledgeBases:
     readable_id: str
     private_id: str
+    owner: Actor = field(repr=False)
     reader: Actor = field(repr=False)
+    upstream: object = field(repr=False)
+
+
+@pytest.fixture(scope="module")
+def outside_stores(instance_with):
+    """Instances on the Qdrant and Elasticsearch stand-ins, booted when a test first asks."""
+    with serving_qdrant() as qdrant, serving_elasticsearch() as elasticsearch:
+        envs = {
+            "qdrant-multitenancy": qdrant_env(qdrant, multitenancy=True),
+            "qdrant-collections": qdrant_env(qdrant, multitenancy=False),
+            "elasticsearch": elasticsearch_env(elasticsearch),
+        }
+        yield lambda store: instance_with(envs[store])
+
+
+@pytest.fixture(params=STORES)
+def store(request):
+    if request.param == "chroma":
+        return request.getfixturevalue("instance")
+    return request.getfixturevalue("outside_stores")(request.param)
 
 
 def create_knowledge_base(client: httpx.Client, name: str, access_grants: list[dict]) -> str:
@@ -46,14 +84,16 @@ def create_knowledge_base(client: httpx.Client, name: str, access_grants: list[d
 
 
 @pytest.fixture
-def knowledge_bases(admin: Actor, make_user) -> KnowledgeBases:
+def knowledge_bases(store) -> KnowledgeBases:
     """Two of the admin's knowledge bases, one shared with a reader and one private."""
-    reader = make_user()
+    owner = admin_of(store)
+    reader = create_user(store)
     read_grant = {"principal_type": "user", "principal_id": reader.id, "permission": "read"}
-    with admin.client() as client:
+    with owner.client() as client:
         readable_id = create_knowledge_base(client, "Handbook", [read_grant])
         private_id = create_knowledge_base(client, "Salary reviews", [])
-    return KnowledgeBases(readable_id, private_id, reader)
+    store.upstream.reset()
+    return KnowledgeBases(readable_id, private_id, owner, reader, store.upstream)
 
 
 def knowledge_bases_found_by_the_model(actor: Actor, upstream) -> set[str]:
@@ -72,14 +112,14 @@ def knowledge_bases_found_by_the_model(actor: Actor, upstream) -> set[str]:
     return {entry["id"] for entry in listed}
 
 
-def test_the_search_tool_hides_knowledge_bases_the_reader_cannot_open(knowledge_bases, upstream):
-    found = knowledge_bases_found_by_the_model(knowledge_bases.reader, upstream)
+def test_the_search_tool_hides_knowledge_bases_the_reader_cannot_open(knowledge_bases):
+    found = knowledge_bases_found_by_the_model(knowledge_bases.reader, knowledge_bases.upstream)
     assert knowledge_bases.private_id not in found, (
         "query_knowledge_bases listed a knowledge base the caller cannot open"
     )
     assert knowledge_bases.readable_id in found
 
 
-def test_the_search_tool_finds_both_for_their_owner(admin, knowledge_bases, upstream):
-    found = knowledge_bases_found_by_the_model(admin, upstream)
+def test_the_search_tool_finds_both_for_their_owner(knowledge_bases):
+    found = knowledge_bases_found_by_the_model(knowledge_bases.owner, knowledge_bases.upstream)
     assert {knowledge_bases.readable_id, knowledge_bases.private_id} <= found

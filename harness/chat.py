@@ -39,11 +39,13 @@ def send_message(
     parent_id: str | None = None,
     history: list[dict] | None = None,
     files: list[dict] | None = None,
+    chat_files: list[dict] | None = None,
     **extra,
 ) -> ChatTurn:
     """Start a chat (no `chat_id`) or continue one after the assistant message `parent_id`.
 
     `files` are attached to the user message, as the client stores an upload on it.
+    `chat_files` go on the request as well, as the client sends the files the chat holds.
     """
     user_message_id, assistant_message_id = str(uuid.uuid4()), str(uuid.uuid4())
     user_message = {
@@ -68,6 +70,9 @@ def send_message(
         "background_tasks": NO_BACKGROUND_TASKS,
         **extra,
     }
+    if chat_files:
+        user_message["files"] = chat_files
+        payload["files"] = chat_files
     if chat_id:
         payload["chat_id"] = chat_id
     accepted = client.post("/api/chat/completions", json=payload)

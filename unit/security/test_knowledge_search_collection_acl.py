@@ -3,16 +3,15 @@
 `query_knowledge_bases` hands the vector store `filter={'knowledge_base_id': {'$in': [...]}}`,
 the knowledge bases the caller may read. Before commit 1d6d4e6e6 (v0.11.1) eleven bundled
 backends took that `filter` argument of `search()` and dropped it, so the store answered with
-every neighbour, forbidden knowledge bases included. Qdrant sent no `query_filter`, pinecone
-only the collection name and elasticsearch only the collection term.
+every neighbour, forbidden knowledge bases included.
 
-This needs a real store, which the integration suite does not have, so it stays a unit test.
-Qdrant runs for real in its local in-memory mode; pinecone and elasticsearch get specced clients
-that apply the filter they are sent, so a dropped filter shows as the forbidden row coming back.
-Every store is filled through the backend's own `insert`. The default Chroma store always applied
-the filter; integration/security/test_knowledge_search_collection_acl.py guards the caller side.
+integration/security/test_knowledge_search_collection_acl.py runs the search over HTTP on Chroma,
+on Qdrant in both storage modes and on Elasticsearch. What stays here: Pinecone, whose client only
+reaches an index over TLS against the certificates it ships with, so no local stand-in can answer
+an instance; it gets a specced client that applies the filter it is sent. And the audit over every
+bundled backend, which also covers the ones added after this fix.
 
-Discriminates: passes on bbfa876af, fails with 1d6d4e6e6 reverted (every `search` test returns
+Discriminates: passes on ef67cc3fa, fails with 1d6d4e6e6 reverted (the Pinecone search returns
 the forbidden knowledge base, the audit lists the eleven backends whose `search` ignores `filter`).
 """
 
@@ -23,9 +22,6 @@ import uuid
 from unittest.mock import create_autospec
 
 import pytest
-import qdrant_client
-from elasticsearch import Elasticsearch
-from elasticsearch.client import IndicesClient
 from pinecone.core.openapi.db_data.models import QueryResponse, ScoredVector
 from pinecone.grpc import GRPCIndex, PineconeGRPC
 
@@ -43,12 +39,6 @@ STORED_ROWS = [
     (KB_COLLECTION, FORBIDDEN_KB, FORBIDDEN_KB),
     (OTHER_COLLECTION, OTHER_ROW, ALLOWED_KB),
 ]
-
-
-def qdrant_store(module, monkeypatch):
-    monkeypatch.setattr(module, "QDRANT_URI", "http://qdrant.invalid:6333")
-    monkeypatch.setattr(module, "Qclient", lambda **_: qdrant_client.QdrantClient(":memory:"))
-    return module.QdrantClient()
 
 
 def pinecone_accepts(metadata: dict, conditions: dict) -> bool:
@@ -86,41 +76,7 @@ def pinecone_store(module, monkeypatch):
     return module.PineconeClient()
 
 
-def elasticsearch_accepts(clause: dict, source: dict) -> bool:
-    ((kind, condition),) = clause.items()
-    ((path, expected),) = condition.items()
-    value = source
-    for part in path.split("."):
-        value = (value or {}).get(part)
-    return value in {"term": [expected], "terms": expected}[kind]
-
-
-def elasticsearch_store(module, monkeypatch):
-    documents: list[dict] = []
-
-    def search(index=None, body=None, **_):
-        clauses = body["query"]["script_score"]["query"]["bool"]["filter"]
-        hits = [
-            {"_id": document["_id"], "_score": 1.0, "_source": document["_source"]}
-            for document in documents
-            if all(elasticsearch_accepts(clause, document["_source"]) for clause in clauses)
-        ]
-        return {"hits": {"hits": hits[: body["size"]]}}
-
-    client_class = create_autospec(Elasticsearch)
-    client_class.return_value.search.side_effect = search
-    client_class.return_value.indices = create_autospec(IndicesClient, instance=True)
-    monkeypatch.setattr(module, "Elasticsearch", client_class)
-    monkeypatch.setattr(module, "bulk", lambda client, actions, **_: documents.extend(actions))
-    return module.ElasticsearchClient()
-
-
-STORE_BUILDERS = {
-    "qdrant": qdrant_store,
-    "qdrant_multitenancy": qdrant_store,
-    "pinecone": pinecone_store,
-    "elasticsearch": elasticsearch_store,
-}
+STORE_BUILDERS = {"pinecone": pinecone_store}
 
 
 @pytest.fixture(params=list(STORE_BUILDERS))
@@ -150,7 +106,6 @@ def test_search_without_a_filter_returns_the_whole_collection(store):
     assert sorted(result.ids[0]) == sorted([ALLOWED_KB, FORBIDDEN_KB])
 
 
-@pytest.mark.parametrize("store", ["qdrant", "qdrant_multitenancy", "pinecone"], indirect=True)
 def test_query_by_metadata_still_filters(store):
     result = store.query(collection_name=KB_COLLECTION, filter={"knowledge_base_id": ALLOWED_KB})
     assert result.ids == [[ALLOWED_KB]]
