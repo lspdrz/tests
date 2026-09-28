@@ -101,13 +101,15 @@ def open_sidebar(page: Page) -> Locator:
     return sidebar
 
 
-def visit_folder_and_return(page: Page) -> None:
+def visit_folder_and_return(page: Page, last_reply: str) -> None:
     """Click the folder's name, then go back to the chat with the browser's Back button."""
     open_sidebar(page).get_by_role("button", name=FOLDER, exact=True).click()
     expect(page).to_have_url(re.compile(r"/folders/"))
     page.wait_for_timeout(1000)  # a person's glance at the folder; the draft saves after 500 ms
     page.go_back()
     expect(page).to_have_url(re.compile(r"/c/"))
+    # the URL changes before the chat replaces the folder page, whose input would start a new chat
+    expect_reply(page, last_reply)
     expect(chat_input(page)).to_be_visible()
 
 
@@ -133,7 +135,7 @@ def test_an_open_chat_keeps_its_own_tools_after_a_folder_click(
     page.goto(f"/c/{chat_id}")
     expect(page.get_by_text("hi there")).to_be_visible()
 
-    visit_folder_and_return(page)
+    visit_folder_and_return(page, "hi there")
     upstream.queue(reply.text("still here", match=reply.answering("and now?")))
     payload = sent_payload(page, "and now?")
 
@@ -149,7 +151,7 @@ def test_a_chat_started_on_the_home_page_keeps_its_tools(page_for, owner, upstre
     expect_reply(page, "first answer")
     expect(page).to_have_url(re.compile(r"/c/"))
 
-    visit_folder_and_return(page)
+    visit_folder_and_return(page, "first answer")
     upstream.queue(reply.text("second answer", match=reply.answering("second question")))
     payload = sent_payload(page, "second question")
 
