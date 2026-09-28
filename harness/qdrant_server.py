@@ -6,7 +6,11 @@ cosine scores worked out in Python. Set `max_query_limit` to act like strict mod
 query asking for more points than that is refused with Qdrant's "Limit exceeded" error. A
 collection whose name contains one of `unavailable` answers every vector query with a 503, as a
 shard that is down does.
-`qdrant_env(fake, multitenancy)` is the environment of an instance that stores its vectors there.
+The same store also answers Qdrant's gRPC API on `grpc_port`, for a client that prefers gRPC:
+each call is turned into the REST body above with qdrant-client's own conversions and back,
+and counted in `grpc_calls`.
+`qdrant_env(fake, multitenancy, grpc)` is the environment of an instance that stores its
+vectors there.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ import json
 import math
 import re
 import threading
+from concurrent import futures
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Iterator
@@ -26,6 +31,8 @@ OK = "ok"
 @dataclass
 class FakeQdrant:
     base_url: str = ""
+    grpc_port: int = 0
+    grpc_calls: int = 0
     collections: dict[str, dict[Any, dict]] = field(default_factory=dict)
     max_query_limit: int | None = None
     refused_limits: list[int] = field(default_factory=list)
@@ -33,11 +40,12 @@ class FakeQdrant:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-def qdrant_env(fake: FakeQdrant, multitenancy: bool = True) -> dict[str, str]:
+def qdrant_env(fake: FakeQdrant, multitenancy: bool = True, grpc: bool = False) -> dict[str, str]:
     return {
         "VECTOR_DB": "qdrant",
         "QDRANT_URI": fake.base_url,
-        "QDRANT_PREFER_GRPC": "false",
+        "QDRANT_PREFER_GRPC": "true" if grpc else "false",
+        "QDRANT_GRPC_PORT": str(fake.grpc_port),
         "ENABLE_QDRANT_MULTITENANCY_MODE": "true" if multitenancy else "false",
     }
 
@@ -130,6 +138,8 @@ class _Api:
                 return 200, True
             if action == "" and method == "DELETE":
                 return 200, fake.collections.pop(name, None) is not None
+            if name not in fake.collections:
+                return 404, f"Not found: Collection `{name}` doesn't exist!"
             if action == "/index":
                 return 200, {"operation_id": 0, "status": "completed"}
             if action == "/points" and method == "PUT":
@@ -192,6 +202,134 @@ class _Api:
         }
 
 
+def _grpc_server(api: _Api):
+    """The gRPC face of the store: every call becomes the REST request `api` answers."""
+    import grpc
+    from qdrant_client import grpc as qdrant_grpc
+    from qdrant_client.conversions.conversion import GrpcToRest, RestToGrpc
+
+    refusals = {404: grpc.StatusCode.NOT_FOUND, 503: grpc.StatusCode.UNAVAILABLE}
+
+    def answer(context, method: str, path: str, body: dict | None = None) -> Any:
+        api.fake.grpc_calls += 1
+        status, result = api.handle(method, path, body or {})
+        if status != 200:
+            context.abort(refusals.get(status, grpc.StatusCode.INVALID_ARGUMENT), str(result))
+        return result
+
+    def filter_of(request) -> dict | None:
+        if not request.HasField("filter"):
+            return None
+        return GrpcToRest.convert_filter(request.filter).model_dump(exclude_none=True)
+
+    def point_id(rest_id):
+        return RestToGrpc.convert_extended_point_id(rest_id)
+
+    def done():
+        completed = qdrant_grpc.UpdateResult(
+            operation_id=0, status=qdrant_grpc.UpdateStatus.Completed
+        )
+        return qdrant_grpc.PointsOperationResponse(result=completed, time=0.0)
+
+    class Health(qdrant_grpc.QdrantServicer):
+        def HealthCheck(self, request, context):
+            return qdrant_grpc.HealthCheckReply(title="qdrant", version="1.18.0")
+
+    class Collections(qdrant_grpc.CollectionsServicer):
+        def CollectionExists(self, request, context):
+            found = answer(context, "GET", f"/collections/{request.collection_name}/exists")
+            exists = qdrant_grpc.CollectionExists(exists=found["exists"])
+            return qdrant_grpc.CollectionExistsResponse(result=exists, time=0.0)
+
+        def Create(self, request, context):
+            answer(context, "PUT", f"/collections/{request.collection_name}")
+            return qdrant_grpc.CollectionOperationResponse(result=True, time=0.0)
+
+        def Delete(self, request, context):
+            dropped = answer(context, "DELETE", f"/collections/{request.collection_name}")
+            return qdrant_grpc.CollectionOperationResponse(result=dropped, time=0.0)
+
+        def List(self, request, context):
+            listed = answer(context, "GET", "/collections")["collections"]
+            descriptions = [qdrant_grpc.CollectionDescription(name=c["name"]) for c in listed]
+            return qdrant_grpc.ListCollectionsResponse(collections=descriptions, time=0.0)
+
+    class Points(qdrant_grpc.PointsServicer):
+        def CreateFieldIndex(self, request, context):
+            answer(context, "PUT", f"/collections/{request.collection_name}/index")
+            return done()
+
+        def Upsert(self, request, context):
+            points = [GrpcToRest.convert_point_struct(p).model_dump() for p in request.points]
+            answer(
+                context, "PUT", f"/collections/{request.collection_name}/points", {"points": points}
+            )
+            return done()
+
+        def Delete(self, request, context):
+            selector = request.points
+            if selector.HasField("points"):
+                body = {"points": [GrpcToRest.convert_point_id(i) for i in selector.points.ids]}
+            else:
+                body = {"filter": filter_of(selector)}
+            answer(context, "POST", f"/collections/{request.collection_name}/points/delete", body)
+            return done()
+
+        def Count(self, request, context):
+            path = f"/collections/{request.collection_name}/points/count"
+            counted = answer(context, "POST", path, {"filter": filter_of(request)})
+            result = qdrant_grpc.CountResult(count=counted["count"])
+            return qdrant_grpc.CountResponse(result=result, time=0.0)
+
+        def Scroll(self, request, context):
+            body = {
+                "filter": filter_of(request),
+                "limit": request.limit if request.HasField("limit") else 10,
+            }
+            if request.HasField("offset"):
+                body["offset"] = GrpcToRest.convert_point_id(request.offset)
+            path = f"/collections/{request.collection_name}/points/scroll"
+            page = answer(context, "POST", path, body)
+            records = [
+                qdrant_grpc.RetrievedPoint(
+                    id=point_id(p["id"]), payload=RestToGrpc.convert_payload(p["payload"])
+                )
+                for p in page["points"]
+            ]
+            following = page["next_page_offset"]
+            if following is None:
+                return qdrant_grpc.ScrollResponse(result=records, time=0.0)
+            return qdrant_grpc.ScrollResponse(
+                result=records, next_page_offset=point_id(following), time=0.0
+            )
+
+        def Query(self, request, context):
+            body = {
+                "query": list(request.query.nearest.dense.data),
+                "limit": request.limit if request.HasField("limit") else 10,
+                "filter": filter_of(request),
+            }
+            path = f"/collections/{request.collection_name}/points/query"
+            found = answer(context, "POST", path, body)["points"]
+            scored = [
+                qdrant_grpc.ScoredPoint(
+                    id=point_id(p["id"]),
+                    payload=RestToGrpc.convert_payload(p["payload"]),
+                    score=p["score"],
+                    version=0,
+                )
+                for p in found
+            ]
+            return qdrant_grpc.QueryResponse(result=scored, time=0.0)
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+    qdrant_grpc.add_QdrantServicer_to_server(Health(), server)
+    qdrant_grpc.add_CollectionsServicer_to_server(Collections(), server)
+    qdrant_grpc.add_PointsServicer_to_server(Points(), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    return server, port
+
+
 @contextlib.contextmanager
 def serving_qdrant() -> Iterator[FakeQdrant]:
     fake = FakeQdrant()
@@ -226,8 +364,11 @@ def serving_qdrant() -> Iterator[FakeQdrant]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), RequestHandler)
     fake.base_url = f"http://127.0.0.1:{server.server_port}"
     threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
+    grpc_server, fake.grpc_port = _grpc_server(api)
+    grpc_server.start()
     try:
         yield fake
     finally:
+        grpc_server.stop(grace=None)
         server.shutdown()
         server.server_close()

@@ -82,7 +82,10 @@ OPEN_WEBUI_SOURCE_DIR=../open-webui/backend pytest -m depcheck unit/deps integra
 | ldap3 | `integration/auth/test_ldap_sign_in.py` (LDAP and LDAPS sign-in) |
 | boto3 (S3), azure-storage-blob, azure-identity, google-cloud-storage | `integration/deps/test_object_storage.py` (uploads kept in a bucket or container) |
 | azure-identity, azure-search-documents | `integration/deps/test_azure_services.py` (Entra ID sign-in to Azure OpenAI, Azure AI Search) |
-| chromadb (embedded and server), pgvector with psycopg2, opensearch-py, pinecone, pymilvus (both layouts), boto3 (S3 Vectors) | `integration/deps/test_vector_stores.py` |
+| chromadb (embedded and server), pgvector with psycopg2, opensearch-py, pinecone, pymilvus (both layouts), qdrant-client (REST and gRPC, both storage modes), boto3 (S3 Vectors) | `integration/deps/test_vector_stores.py` |
+| sentence-transformers (local embedding, tokenizer and `CrossEncoder` reranking) | `integration/deps/test_local_models.py` |
+| sentencepiece | `integration/deps/test_chunking_and_search.py` (the transformers splitter on a `spiece.model`) |
+| pyxlsb | `integration/deps/test_document_extraction.py` (a binary workbook) |
 | elasticsearch | `integration/deps/test_elasticsearch_store.py` |
 | ddgs, fake-useragent | `integration/deps/test_web_search_stack.py`, `e2e/retrieval/test_duckduckgo_web_search.py` |
 | fastapi | `integration/deps/test_web_framework.py` and every instance boot and request |

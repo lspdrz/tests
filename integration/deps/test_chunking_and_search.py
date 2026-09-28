@@ -3,20 +3,28 @@
 `save_docs_to_vector_db` in `routers/retrieval.py` cuts every processed file with a
 langchain-text-splitters splitter chosen by the admin's `TEXT_SPLITTER`: the recursive character
 splitter (""), the tiktoken-measured `TokenTextSplitter` ("token") and, before either, the
-`MarkdownHeaderTextSplitter` when `ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER` is on. With
+`MarkdownHeaderTextSplitter` when `ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER` is on. The
+"token_transformers" splitter measures with the tokenizer `RAG_TOKENIZER_MODEL` names, here a
+SentencePiece `spiece.model` whose pieces transformers reads through sentencepiece's model
+proto. With
 `ENABLE_RAG_HYBRID_SEARCH`, `/api/v1/retrieval/query/doc` ranks the chunks with rank_bm25's
 `BM25Okapi` inside langchain-classic's ensemble and compression retrievers: the ensemble fuses the
 keyword and the vector retriever (a langchain-core retriever answering asynchronously) and drops
 a chunk both found twice, and the compressor scores what is left against the query's embedding.
 A bump that breaks a splitter leaves a file as one chunk; one that breaks BM25 fails or misranks
-the query. The provider embeds every text as the same vector, so only the keyword ranking can
-pick a chunk, and every chunk scores a cosine of 1 against the query.
+the query: a word every chunk shares counts for next to nothing next to a rare one, and a chunk
+holding more of the query's rare words ranks above one holding fewer. The provider embeds every
+text as the same vector, so only the keyword ranking can pick a chunk, and every chunk scores a
+cosine of 1 against the query.
 
 Discriminates: passes on dev bbfa876af. A backend copy without the character splitter's
 `split_documents` fails only the character test; one without the token splitter's
 `split_documents`, the markdown `split_text` and `BM25Okapi` fails only the other four. On dev
 ef67cc3fa, an ensemble that keeps both copies of a chunk (patched in at import) fails the fusion
-test, and so does a compressor that keeps no score.
+test, and so does a compressor that keeps no score. A `BM25Okapi` that weighs every word alike
+(its IDF set to one, patched in at import) ranks the chunk that repeats "harbour" first and fails
+the rare term test. Measuring the transformers splitter's chunks by characters, or a
+sentencepiece model proto that reads nothing (patched in at import), fails the SentencePiece test.
 """
 
 from __future__ import annotations
@@ -25,6 +33,9 @@ import os
 
 import httpx
 import pytest
+
+from harness.knowledge_bases import add_text_file, knowledge_base
+from harness.local_embedding import save_sentencepiece_tokenizer
 
 pytestmark = [pytest.mark.depcheck, pytest.mark.api, pytest.mark.requires_source]
 
@@ -130,6 +141,27 @@ def test_the_token_splitter_cuts_by_tokens(retrieval_settings, make_user):
     assert max(map(len, chunks)) > 60, [len(chunk) for chunk in chunks]
 
 
+def test_the_transformers_splitter_counts_sentencepiece_pieces(
+    retrieval_settings, make_user, tmp_path
+):
+    words = ["harbour", "lighthouse", "keeper", "ferry", "tides", "dawn"]
+    tokenizer = save_sentencepiece_tokenizer(tmp_path / "sentencepiece", words)
+    retrieval_settings(
+        TEXT_SPLITTER="token_transformers",
+        RAG_TOKENIZER_MODEL=str(tokenizer),
+        ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER=False,
+        CHUNK_MIN_SIZE_TARGET=0,
+        CHUNK_SIZE=10,
+        CHUNK_OVERLAP=0,
+    )
+    with make_user().client() as client:
+        chunks = _all_chunks(client, _upload(client, "log.txt", " ".join(words * 9)))
+
+    # a word is one piece; the splitter measures each word and space alone, each with a closing
+    # piece, so three words and their two spaces fill ten
+    assert [len(chunk.split()) for chunk in chunks] == [3] * 18, chunks
+
+
 def test_the_markdown_splitter_cuts_at_headers(retrieval_settings, make_user):
     retrieval_settings(
         TEXT_SPLITTER="",
@@ -199,3 +231,41 @@ def test_the_ensemble_fuses_both_retrievers_once_per_chunk(retrieval_settings, m
     assert len(documents) == len(set(documents)) == stored, documents
     assert any("zephyrquartz" in document for document in documents)
     assert distances == pytest.approx([1.0] * stored), distances
+
+
+# every line says "harbour"; one says nothing else, two carry the rare words
+HARBOUR_LINES = [
+    "Gulls circle the harbour at dawn",
+    "Nets dry on the harbour wall",
+    "harbour harbour harbour harbour",
+    "One grey zephyrquartz glints in the harbour sand below the old pier wall",
+    "Crabs hide in the harbour mud",
+    "An obsidianwharf and a zephyrquartz wash up in the harbour after storms",
+]
+
+
+def test_bm25_weighs_a_rare_term_above_a_common_one(retrieval_settings, admin):
+    retrieval_settings(ENABLE_RAG_HYBRID_SEARCH=True)
+    with admin.client() as client, knowledge_base(client) as knowledge_id:
+        for index, line in enumerate(HARBOUR_LINES):
+            add_text_file(client, knowledge_id, f"line-{index}.txt", line)
+
+        def best_two(query: str) -> list[str]:
+            answered = client.post(
+                "/api/v1/retrieval/query/collection",
+                json={
+                    "collection_names": [knowledge_id],
+                    "query": query,
+                    "k": 2,
+                    "k_reranker": 2,
+                    "hybrid_bm25_weight": 1,
+                },
+            )
+            assert answered.status_code == 200, answered.text
+            return [chunk.strip() for chunk in answered.json()["documents"][0]]
+
+        rare_over_common = best_two("harbour zephyrquartz")
+        both_rare_words = best_two("zephyrquartz obsidianwharf")
+
+    assert sorted(rare_over_common) == sorted([HARBOUR_LINES[3], HARBOUR_LINES[5]])
+    assert both_rare_words == [HARBOUR_LINES[5], HARBOUR_LINES[3]]

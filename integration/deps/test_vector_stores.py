@@ -41,6 +41,14 @@ dimension, JSON data and metadata, the HNSW index the admin configured), `insert
 `search`, `query_iterator` for filtered reads, `delete` by id and by filter, `drop_collection`
 and `list_collections` on a reset, and the token and database name travel with every call.
 
+With `VECTOR_DB=qdrant` they go through qdrant-client to a local Qdrant (`harness.qdrant_server`),
+once with a collection per knowledge base, once in the default multitenancy mode (one shared
+collection, points told apart by a tenant filter) and once in that mode over gRPC:
+`create_collection` and `create_payload_index` on first write, `upload_points` and `upsert`,
+`scroll` with a filter for the hash lookup, `query_points` whose cosine score (-1 to 1) becomes a
+score from 0 to 1, `delete` by filter or ids, `delete_collection`, and `get_collections` when the
+admin resets the store.
+
 With `VECTOR_DB=s3vector` the same features go through boto3's `s3vectors` client to a local
 fake (`harness.s3_vectors`): `create_index` on first write, `put_vectors`, `query_vectors`,
 `list_vectors` for filtered reads, `delete_vectors` and `delete_index`, and `list_indexes` when
@@ -64,6 +72,10 @@ On ef67cc3fa, a Milvus store passing raw scores, dropping no collection and buil
 filtered read, the reset listing and the token fails the removed-file, duplicate, reset and
 settings tests; in the shared collections, no delete, no filtered read and no reset fail the
 removed-file, deleted-base, memory, duplicate and reset tests. Twin of unit/deps/test_pymilvus.py.
+Where Qdrant's score is passed on raw, the hash lookup filters on a key no chunk has, a filtered
+delete returns early, point ids are fresh on every write, `delete_collection` does nothing and
+the reset lists no collection, each Qdrant test fails in all three modes; ignoring
+`QDRANT_PREFER_GRPC` fails the gRPC check of the ranking test.
 """
 
 from __future__ import annotations
@@ -87,6 +99,7 @@ from harness.knowledge_bases import add_text_file, knowledge_base
 from harness.listener import listening
 from harness.opensearch_server import PASSWORD, USERNAME, opensearch_env, serving_opensearch
 from harness.pinecone_server import API_KEY, INDEX_NAME, REGION, pinecone_env, serving_pinecone
+from harness.qdrant_server import FakeQdrant, qdrant_env, serving_qdrant
 from harness.s3_vectors import s3_vectors_env, serving_s3_vectors
 
 pytestmark = [pytest.mark.depcheck, pytest.mark.api, pytest.mark.requires_source, pytest.mark.slow]
@@ -166,6 +179,29 @@ def _milvus_rows_of(fake, knowledge_id: str) -> list[dict]:
     ]
 
 
+@pytest.fixture(scope="module")
+def qdrant():
+    with serving_qdrant() as fake:
+        yield fake
+
+
+QDRANT_MODES = {
+    "qdrant": {"multitenancy": False},
+    "qdrant-multitenancy": {"multitenancy": True},
+    "qdrant-grpc": {"multitenancy": True, "grpc": True},
+}
+
+
+def _qdrant_holds(fake: FakeQdrant, knowledge_id: str) -> bool:
+    """Whether Qdrant keeps a collection or a tenant's point for the knowledge base."""
+    with fake.lock:
+        return any(
+            knowledge_id in name
+            or any(point["payload"].get("tenant_id") == knowledge_id for point in points.values())
+            for name, points in fake.collections.items()
+        )
+
+
 @pytest.fixture(
     params=[
         "embedded",
@@ -175,6 +211,9 @@ def _milvus_rows_of(fake, knowledge_id: str) -> list[dict]:
         "pinecone",
         "milvus",
         "milvus-multitenant",
+        "qdrant",
+        "qdrant-multitenancy",
+        "qdrant-grpc",
     ]
 )
 def store(request, instance_with, embeddings) -> tuple[str, LaunchedInstance]:
@@ -191,6 +230,8 @@ def store(request, instance_with, embeddings) -> tuple[str, LaunchedInstance]:
     if request.param.startswith("milvus"):
         fake = request.getfixturevalue("milvus")
         env.update(_milvus_env(fake, multitenancy=request.param == "milvus-multitenant"))
+    if request.param.startswith("qdrant"):
+        env.update(qdrant_env(request.getfixturevalue("qdrant"), **QDRANT_MODES[request.param]))
     return request.param, instance_with(env)
 
 
@@ -207,7 +248,7 @@ def _documents(client: httpx.Client, collection_name: str, query: str) -> list[s
     return [text.strip() for text in _query(client, collection_name, query)["documents"][0]]
 
 
-def test_a_query_ranks_the_nearest_chunk_first_and_scores_it_near_one(store):
+def test_a_query_ranks_the_nearest_chunk_first_and_scores_it_near_one(store, request):
     which, instance = store
     with admin_of(instance).client() as client, knowledge_base(client) as knowledge_id:
         for name, text in (
@@ -227,6 +268,8 @@ def test_a_query_ranks_the_nearest_chunk_first_and_scores_it_near_one(store):
     # Milvus collection passes Milvus's own cosine similarity on, 0 at a right angle
     assert scores[1] == pytest.approx(0.0 if which == "milvus-multitenant" else 0.5, abs=0.01)
     assert found["metadatas"][0][0]["name"] == "lighthouse.txt"
+    if which == "qdrant-grpc":
+        assert request.getfixturevalue("qdrant").grpc_calls, "the instance never spoke gRPC"
 
 
 def test_the_same_content_twice_in_a_knowledge_base_is_refused(store):
@@ -267,6 +310,8 @@ def test_a_deleted_knowledge_base_takes_its_collection_along(store, request):
         add_text_file(client, knowledge_id, "ferry.txt", FERRY)
         if which == "server":
             assert knowledge_id in collection_names(request.getfixturevalue("chroma_server"))
+        if which.startswith("qdrant"):
+            assert _qdrant_holds(request.getfixturevalue("qdrant"), knowledge_id)
 
         deleted = client.delete(f"/api/v1/knowledge/{knowledge_id}/delete")
         assert deleted.status_code == 200, deleted.text
@@ -275,8 +320,9 @@ def test_a_deleted_knowledge_base_takes_its_collection_along(store, request):
             json={"collection_name": knowledge_id, "query": "ferry"},
         )
 
-    # Milvus refuses a search of a collection it no longer has; the others find nothing in it
-    assert gone.status_code == (400 if which == "milvus" else 200), gone.text
+    # Milvus and Qdrant refuse a search of a collection they no longer have; the others find
+    # nothing in it
+    assert gone.status_code == (400 if which in ("milvus", "qdrant") else 200), gone.text
     documents = (gone.json() or {}).get("documents") or []
     assert not any(documents), "the deleted knowledge base still answers"
     if which == "server":
@@ -285,6 +331,8 @@ def test_a_deleted_knowledge_base_takes_its_collection_along(store, request):
         assert f"open_webui_{knowledge_id}" not in request.getfixturevalue("opensearch").indices
     if which.startswith("milvus"):
         assert _milvus_rows_of(request.getfixturevalue("milvus"), knowledge_id) == []
+    if which.startswith("qdrant"):
+        assert not _qdrant_holds(request.getfixturevalue("qdrant"), knowledge_id)
 
 
 def _remember(client: httpx.Client, content: str) -> str:
@@ -564,3 +612,20 @@ def test_resetting_the_vector_store_empties_milvus(instance_with, embeddings, mi
 
     assert reset.status_code == 200, reset.text
     assert _milvus_rows_of(milvus, knowledge_id) == []
+
+
+@pytest.mark.parametrize("mode", list(QDRANT_MODES))
+def test_resetting_the_vector_store_drops_every_qdrant_collection(
+    instance_with, embeddings, qdrant, mode
+):
+    instance = instance_with(
+        {**keyword_embedding_env(embeddings), **qdrant_env(qdrant, **QDRANT_MODES[mode])}
+    )
+    with admin_of(instance).client() as client, knowledge_base(client) as knowledge_id:
+        add_text_file(client, knowledge_id, "ferry.txt", FERRY)
+        assert _qdrant_holds(qdrant, knowledge_id)
+
+        reset = client.post("/api/v1/retrieval/reset/db")
+
+    assert reset.status_code == 200, reset.text
+    assert qdrant.collections == {}

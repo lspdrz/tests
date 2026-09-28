@@ -3,15 +3,18 @@
 An upload with `process=true` runs through `retrieval/loaders/main.py`, which hands each format to a
 third-party library: .pdf to pypdf, .docx to docx2txt, .pptx, .xlsx, .xls, .xml, .rst, .epub and
 .odt to unstructured's partitioners (python-pptx; pandas on openpyxl or xlrd behind a msoffcrypto
-encryption check; pypandoc and the pandoc binary), .html to BeautifulSoup, plain text through
-chardet's encoding hint, and every result through ftfy, which repairs mojibake and drops control
-characters. With `PDF_EXTRACT_IMAGES` on, a PDF's images are opened by Pillow (or, kept as raw
-pixels Pillow cannot open, turned into a picture by pypdf first) and read by rapidocr on onnxruntime
-and OpenCV. A dependency bump that breaks one of those paths fails the upload or loses the text,
-which `GET /api/v1/files/{id}/data/content` shows. With the Azure Document Intelligence engine a PDF
-goes to azure-ai-documentintelligence instead, here against a local stand-in of the analyze API: the
-key header, the markdown output format and the polled result are what it relies on (twin of
-unit/deps/test_azure_ai_documentintelligence.py). The library contracts are in unit/deps/.
+encryption check, or on pyxlsb for a binary .xlsb workbook sent as an Excel file; pypandoc and the
+pandoc binary), .html to BeautifulSoup, plain text through chardet's encoding hint, and every result
+through ftfy, which repairs mojibake and drops control characters. With `PDF_EXTRACT_IMAGES` on, a
+PDF's images are opened by Pillow (or, kept as raw pixels Pillow cannot open, turned into a picture
+by pypdf first) and read by rapidocr on onnxruntime and OpenCV, built from the models its wheel
+carries (that instance has every download refused); an image without text adds nothing, so a blank
+scan is reported as empty. A dependency bump that breaks one of those paths fails the upload or
+loses the text, which `GET /api/v1/files/{id}/data/content` shows. With the Azure Document
+Intelligence engine a PDF goes to azure-ai-documentintelligence instead, here against a local
+stand-in of the analyze API: the key header, the markdown output format and the polled result are
+what it relies on (twin of unit/deps/test_azure_ai_documentintelligence.py). The library contracts
+are in unit/deps/.
 
 A workbook is read sheet by sheet in order, numbers included: unstructured's `partition_xlsx`
 hands it to pandas' `read_excel` on openpyxl. `pip install open-webui` leaves `unstructured` out,
@@ -45,7 +48,10 @@ On dev ef67cc3fa, dropping `output_content_format='markdown'` from the Document 
 fails its test; msoffcrypto's `OfficeFile` answering "not encrypted" (patched in at import) fails
 the password-protected workbook test, one that accepts any bytes fails the test of a file that only
 claims to be a workbook, and OpenCV's `minAreaRect` answering an empty box or onnxruntime refusing
-to build a session fails the PDF image test. A docx2txt result cut to its first paragraph or to
+to build a session fails the PDF image test; `RapidOCR` answering every image with the same text
+fails both OCR tests, as does one that fetches its models before building. pyxlsb reading every
+number as zero fails the binary workbook numbers test, and its strings read as empty fail the .xlsb
+upload. A docx2txt result cut to its first paragraph or to
 ASCII fails the Word paragraphs test, `ftfy.fix_text` left out fails the mojibake, smart quote and
 control character tests, `fix_text` without `unescape_html=False` fails the literal entity test and
 one that fails on empty text fails the blank page test (and the empty Word document one). An
@@ -64,6 +70,7 @@ whether or not pypdf raises, so that test only shows the refusal.
 from __future__ import annotations
 
 import io
+import struct
 import zipfile
 import zlib
 from pathlib import Path
@@ -71,7 +78,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from harness.actors import create_user
+from harness.actors import admin_of, create_user
 from harness.listener import json_answer
 from harness.missing_packages import without_packages_env
 
@@ -258,6 +265,64 @@ def _xls() -> bytes:
     return (FIXTURES / "budget.xls").read_bytes()
 
 
+def _biff12_record(record_id: int, payload: bytes = b"") -> bytes:
+    """One record of a binary workbook part: its id, a 7-bit length and the payload."""
+    # an id keeps the high bit of each of its bytes, as the format numbers them
+    head = bytes([record_id]) if record_id < 0x80 else struct.pack("<H", record_id)
+    size, length = len(payload), bytearray()
+    while True:
+        length.append((size & 0x7F) | (0x80 if size > 0x7F else 0))
+        size >>= 7
+        if not size:
+            break
+    return head + bytes(length) + payload
+
+
+def _wide_string(text: str) -> bytes:
+    return struct.pack("<I", len(text)) + text.encode("utf-16-le")
+
+
+def _xlsb(rows: list[list[str | float]]) -> bytes:
+    """A binary workbook (.xlsb) of one sheet, which Excel writes and pyxlsb only reads."""
+    record = _biff12_record
+    strings = sorted({value for row in rows for value in row if isinstance(value, str)})
+    cells = b""
+    for row_number, row in enumerate(rows):
+        cells += record(0x0000, struct.pack("<I", row_number))
+        for column, value in enumerate(row):
+            if isinstance(value, str):
+                cells += record(0x0007, struct.pack("<III", column, 0, strings.index(value)))
+            else:
+                cells += record(0x0005, struct.pack("<IId", column, 0, value))
+    extent = struct.pack("<IIII", 0, len(rows) - 1, 0, max(map(len, rows)) - 1)
+    sheet = record(0x0181) + record(0x0194, extent) + record(0x0191) + cells + record(0x0192)
+    listing = record(0x019C, struct.pack("<II", 0, 1) + _wide_string("rId1") + _wide_string("Log"))
+    workbook = record(0x0183) + record(0x018F) + listing + record(0x0190) + record(0x0184)
+    shared = record(0x019F, struct.pack("<II", len(strings), len(strings)))
+    shared += b"".join(record(0x0013, b"\x00" + _wide_string(text)) for text in strings)
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="bin"'
+        ' ContentType="application/vnd.ms-excel.sheet.binary.macroEnabled.main"/>'
+        "</Types>"
+    )
+    relationships = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Target="worksheets/sheet1.bin" Type="http://schemas.openxmlformats.org'
+        '/officeDocument/2006/relationships/worksheet"/></Relationships>'
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("xl/workbook.bin", workbook)
+        archive.writestr("xl/_rels/workbook.bin.rels", relationships)
+        archive.writestr("xl/worksheets/sheet1.bin", sheet + record(0x0182))
+        archive.writestr("xl/sharedStrings.bin", shared + record(0x01A0))
+    return buffer.getvalue()
+
+
 def _xml() -> bytes:
     return f"<?xml version='1.0'?><notes><note>{SENTENCE}</note></notes>".encode()
 
@@ -355,6 +420,12 @@ def _require_pandoc() -> None:
         pytest.param("slides.pptx", _pptx, PPTX_TYPE, id="pptx"),
         pytest.param("budget.xlsx", _xlsx, XLSX_TYPE, id="xlsx"),
         pytest.param("budget.xls", _xls, "application/vnd.ms-excel", id="xls"),
+        pytest.param(
+            "budget.xlsb",
+            lambda: _xlsb([["item", "note"], ["lighthouse", MARKER]]),
+            "application/vnd.ms-excel",
+            id="xlsb",
+        ),
         pytest.param("notes.xml", _xml, "application/xml", id="xml"),
         pytest.param("notes.html", _html, "text/html", id="html"),
     ],
@@ -433,6 +504,14 @@ def test_without_unstructured_slides_are_read_by_python_pptx(without_unstructure
         content = _upload_and_read(client, "slides.pptx", _pptx(), PPTX_TYPE)
 
     assert content == f"Slide 1:\nHarbour review\n{SENTENCE}", content
+
+
+def test_a_binary_workbook_keeps_its_numbers(make_user):
+    rows = [["harbour", "high water"], ["Northgate", 4.25], ["Southpier", 17.5]]
+    with make_user().client() as client:
+        content = _upload_and_read(client, "tides.xlsb", _xlsb(rows), "application/vnd.ms-excel")
+
+    assert "Northgate 4.25" in content and "Southpier 17.5" in content, content
 
 
 # ---------------------------------------------------------------- text encodings
@@ -571,14 +650,41 @@ def retrieval_settings(preserve, admin):
     client.close()
 
 
+DEAD_PROXY = "http://127.0.0.1:9"
+# every download refused, as on a machine without internet
+OFFLINE_OCR_ENV = {
+    "PDF_EXTRACT_IMAGES": "true",
+    **{name: DEAD_PROXY for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")},
+    **{name: "127.0.0.1,localhost" for name in ("NO_PROXY", "no_proxy")},
+}
+
+
+@pytest.fixture
+def offline_ocr(instance_with):
+    """An instance reading PDF images with rapidocr and no way out to the internet."""
+    return admin_of(instance_with(OFFLINE_OCR_ENV))
+
+
+@pytest.mark.slow
 @pytest.mark.parametrize("build", [_image_pdf, _raw_image_pdf], ids=["jpeg-image", "raw-pixels"])
-def test_the_text_in_a_pdf_image_is_read(retrieval_settings, make_user, build):
-    retrieval_settings(PDF_EXTRACT_IMAGES=True)
+def test_the_text_in_a_pdf_image_is_read_without_downloading_anything(offline_ocr, build):
     scan = build(OCR_WORD)
-    with make_user().client() as client:
+    with offline_ocr.client() as client:
         content = _upload_and_read(client, "scan.pdf", scan, "application/pdf")
 
     assert OCR_WORD in content, f"OCR read {content!r}"
+
+
+@pytest.mark.slow
+def test_a_pdf_image_without_text_adds_nothing(offline_ocr):
+    with offline_ocr.client() as client:
+        file_id = _upload(client, "blank-scan.pdf", _image_pdf(""), "application/pdf")
+        stored = client.get(f"/api/v1/files/{file_id}").json()
+        read = client.get(f"/api/v1/files/{file_id}/data/content")
+
+    assert read.json()["content"] == ""
+    assert stored["data"]["status"] == "failed"
+    assert "content provided is empty" in stored["data"]["error"]
 
 
 def test_without_image_extraction_a_scan_yields_no_text(retrieval_settings, make_user):
