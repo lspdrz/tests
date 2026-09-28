@@ -15,8 +15,8 @@ exception logged as `result` or `data` is counted too and has to be recorded, an
 an unlisted name is not seen; each entry says where it is and what it renders, so the real leaks
 are the ones marked as such. Calls under an `isEnabledFor` check, under
 `if __name__ == "__main__"`, generic `.log(level, ...)` calls (`utils/audit.py`, `events.py`) and
-the one-shot scripts under `migrations/` are out of scope. The behavioural half, a poisoned body
-through the filter error path, lives in `test_filter_error_path_ignores_body.py`.
+the one-shot scripts under `migrations/` are out of scope. The behavioural half lives in
+`integration/footprint/`: a failed request and a failing filter logged without their body.
 
 Unpinned and unmarked: the recorded leaks have no fix ref, and the ratchet is what pins them.
 Discriminates: a new `log.info("%s", payload)` or f-string of `messages` in a copy of dev

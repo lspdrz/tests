@@ -3,9 +3,9 @@
 Same contract as `unit/footprint/test_eager_payload_logging.py`, checked on a running instance
 at its default log level: the prompt carries a canary string, the mock provider fails the
 request, and the server log written since the request began must not contain the canary. The
-filter error path stays with its unit form (`test_filter_error_path_ignores_body.py`): its only
-render site is at DEBUG, which the default level never writes. The recorded URL leak in
-`get_web_loader` is only reachable through web search results, which need a search engine.
+filter error path has a module of its own (`test_filter_error_path_ignores_body.py`), on an
+instance logging at DEBUG. The recorded URL leak in `get_web_loader` is only reachable through
+web search results, which need a search engine.
 
 Unpinned: read on upstream dev at 4948842be (2026-09-09), where it passes. Unmarked: nothing to
 pin.

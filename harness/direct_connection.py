@@ -7,7 +7,8 @@ provider's stream on the channel it was given and ends with `{"done": true}`, or
 non-streamed request with the whole result, as `src/routes/+layout.svelte` does.
 
 `answering(actor)` connects such a tab. `tab.stream(*lines)`, `tab.complete(body)` and
-`tab.refuse(error)` line up its next answers; `tab.requests` is every completion request the
+`tab.refuse(error)` line up its next answers, and `tab.hold(release)` keeps the next request
+unanswered until the event is set; `tab.requests` is every completion request the
 server made of it (`form_data`, `model`, `channel`). `direct_model(model_id)` is the
 `model_item` the web client sends for a model of a direct connection.
 """
@@ -15,6 +16,7 @@ server made of it (`form_data`, `model`, `channel`). `direct_model(model_id)` is
 from __future__ import annotations
 
 import json
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
@@ -59,6 +61,9 @@ class DirectTab:
     def refuse(self, error: dict) -> None:
         self.answers.append(("refuse", error))
 
+    def hold(self, release: threading.Event) -> None:
+        self.answers.append(("hold", release))
+
     def handle(self, event: dict) -> dict | None:
         self.session.events.append(event)
         data = event.get("data") or {}
@@ -68,6 +73,9 @@ class DirectTab:
         self.requests.append(request)
         kind, answer = self.answers.pop(0) if self.answers else ("stream", ())
         channel = request["channel"]
+        if kind == "hold":
+            answer.wait(timeout=60)
+            return {"error": "the tab was held and let go"}
         try:
             if kind == "stream":
                 for line in answer:

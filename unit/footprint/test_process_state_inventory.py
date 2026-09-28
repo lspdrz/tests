@@ -17,7 +17,8 @@ recorded without their file, so moving a container to another module is not a ne
 
 Unpinned: bounds as read on upstream dev at v0.11.3 (a253bf0c3), updated for #29983. The task
 registry, the warned-URL set and the plugin source caches have behavioural tests in
-`test_unbounded_process_state.py` and `integration/footprint/`; the two lock maps do not.
+`integration/footprint/`, which also finds the per-chat lock map growing (red); the timer lock
+map has none.
 Discriminates: a module-level `{}` or a new lazily created `app.state` cache added to a copy of
 dev bbfa876af fails; deleting a recorded container from the copy passes.
 """
@@ -34,7 +35,7 @@ EMPTY_CALLS = {"dict", "list", "set"}
 
 # name -> where it lives and what bounds it
 KNOWN = {
-    "_parent_locks": "utils/subagents.py, unbounded: one Lock per chat id that ran a subagent",
+    "_parent_locks": "utils/subagents.py, unbounded: one Lock per chat id that got a reply",
     "_timer_locks": "utils/timers.py, unbounded: one Lock per timer id ever executed",
     "item_tasks": "tasks.py, in-flight tasks per item (#29980 dropped the empty id)",
     "tasks": "tasks.py, in-flight tasks, popped by cleanup_task",
