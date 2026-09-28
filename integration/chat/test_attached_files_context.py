@@ -121,7 +121,7 @@ def compact_with_a_new_upload(client: httpx.Client, upstream) -> ChatTurn:
     history = turns(3, files={1: [attachment("a")], 2: [attachment("b")]})
     chat_id, last_id = seed_chat(client, history)
     turn, _ = ask(
-        client, "question 4", chat_id=chat_id, parent_id=last_id, files=[attachment("new")]
+        client, "question 4", chat_id=chat_id, parent_id=last_id, message_files=[attachment("new")]
     )
     return turn
 
@@ -150,7 +150,7 @@ def test_the_turn_after_the_checkpoint_keeps_every_upload_in_place(
             "question 5",
             chat_id=turn.chat_id,
             parent_id=turn.assistant_message_id,
-            files=[attachment("five")],
+            message_files=[attachment("five")],
         )
 
     assert listed_files(last_chat_call(upstream)) == {
@@ -170,7 +170,7 @@ def test_uploads_are_still_listed_after_a_tool_approval(chat_settings, make_user
             "question 2",
             chat_id=chat_id,
             parent_id=last_id,
-            files=[attachment("b")],
+            message_files=[attachment("b")],
             params={"tool_approval_mode": "ask"},
         )
         message = approve_every_call(client, turn)
@@ -191,7 +191,7 @@ def test_a_first_message_upload_survives_a_tool_approval(chat_settings, make_use
         turn = send_message(
             client,
             "question 1",
-            files=[attachment("only")],
+            message_files=[attachment("only")],
             params={"tool_approval_mode": "ask"},
         )
         approve_every_call(client, turn)
@@ -216,7 +216,7 @@ def test_every_message_keeps_its_uploads_after_compaction_and_approval(
             "question 4",
             chat_id=chat_id,
             parent_id=last_id,
-            files=[attachment("new")],
+            message_files=[attachment("new")],
             params={"tool_approval_mode": "ask"},
         )
         approve_every_call(client, turn)
@@ -233,7 +233,13 @@ def test_an_uncompacted_chat_lists_each_upload_on_its_message(make_user, upstrea
     with make_user().client() as client:
         history = turns(2, files={1: [attachment("a")], 2: [attachment("b")]})
         chat_id, last_id = seed_chat(client, history)
-        ask(client, "question 3", chat_id=chat_id, parent_id=last_id, files=[attachment("c")])
+        ask(
+            client,
+            "question 3",
+            chat_id=chat_id,
+            parent_id=last_id,
+            message_files=[attachment("c")],
+        )
 
     assert listed_files(last_chat_call(upstream)) == {
         "question 1": ["file-a"],
@@ -246,7 +252,7 @@ def test_several_uploads_on_one_message_are_listed_in_order(make_user, upstream)
     upstream.queue(reply.text("answer 1"))
     uploads = [attachment("first"), attachment("second"), attachment("third")]
     with make_user().client() as client:
-        ask(client, "question 1", files=uploads)
+        ask(client, "question 1", message_files=uploads)
 
     assert listed_files(last_chat_call(upstream)) == {
         "question 1": ["file-first", "file-second", "file-third"]
@@ -260,6 +266,6 @@ def test_a_caller_sending_its_own_tools_gets_no_upload_list(make_user, upstream)
     }
     upstream.queue(reply.text("answer 1"))
     with make_user().client() as client:
-        ask(client, "question 1", files=[attachment("a")], tools=[own_tool])
+        ask(client, "question 1", message_files=[attachment("a")], tools=[own_tool])
 
     assert listed_files(last_chat_call(upstream)) == {"question 1": []}

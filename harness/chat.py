@@ -38,13 +38,14 @@ def send_message(
     chat_id: str | None = None,
     parent_id: str | None = None,
     history: list[dict] | None = None,
-    files: list[dict] | None = None,
+    message_files: list[dict] | None = None,
     chat_files: list[dict] | None = None,
     **extra,
 ) -> ChatTurn:
     """Start a chat (no `chat_id`) or continue one after the assistant message `parent_id`.
 
-    `files` are attached to the user message, as the client stores an upload on it.
+    `message_files` are attached to the user message only, as the client stores an upload on it;
+    `files` in `extra` go on the request, as the client sends attached knowledge.
     `chat_files` go on the request as well, as the client sends the files the chat holds.
     """
     user_message_id, assistant_message_id = str(uuid.uuid4()), str(uuid.uuid4())
@@ -57,8 +58,8 @@ def send_message(
         "models": [model],
         "timestamp": int(time.time()),
     }
-    if files:
-        user_message["files"] = files
+    if message_files:
+        user_message["files"] = message_files
     payload = {
         "model": model,
         "messages": [*(history or []), {"role": "user", "content": content}],
