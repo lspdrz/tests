@@ -33,6 +33,14 @@ index host, reached over gRPC and TLS, and chunks are upserted with the collecti
 metadata, queried with a metadata filter and deleted by filter or id, every call carrying the API
 key. A reset deletes every vector.
 
+With `VECTOR_DB=milvus` the same knowledge and memory tests run through pymilvus's
+`MilvusClient` against a local gRPC stand-in (`harness.milvus_server`), with a collection per
+knowledge base and with the shared collections of multitenancy mode: `create_schema` and
+`prepare_index_params` build the collection (a VARCHAR primary id, the vector at the embedding's
+dimension, JSON data and metadata, the HNSW index the admin configured), `insert`, `upsert`,
+`search`, `query_iterator` for filtered reads, `delete` by id and by filter, `drop_collection`
+and `list_collections` on a reset, and the token and database name travel with every call.
+
 With `VECTOR_DB=s3vector` the same features go through boto3's `s3vectors` client to a local
 fake (`harness.s3_vectors`): `create_index` on first write, `put_vectors`, `query_vectors`,
 `list_vectors` for filtered reads, `delete_vectors` and `delete_index`, and `list_indexes` when
@@ -51,6 +59,11 @@ sends its bulk fails its memory case and a skipped `delete_by_query` its removed
 `vector` dropped from SQLAlchemy's reflected Postgres types the restarted instance no longer
 boots; an OpenSearch client without `http_auth` or a reset that lists no index fails the
 OpenSearch test, and an index created in another region fails the Pinecone test.
+On ef67cc3fa, a Milvus store passing raw scores, dropping no collection and building HNSW without
+`M` fails the ranking, deleted-base and settings tests; one without the filtered delete, the
+filtered read, the reset listing and the token fails the removed-file, duplicate, reset and
+settings tests; in the shared collections, no delete, no filtered read and no reset fail the
+removed-file, deleted-base, memory, duplicate and reset tests. Twin of unit/deps/test_pymilvus.py.
 """
 
 from __future__ import annotations
@@ -127,7 +140,43 @@ def on_pinecone_env(pinecone, tmp_path_factory) -> dict[str, str]:
     return pinecone_env(pinecone, directory, dimension=len(KEYWORDS) + 1)
 
 
-@pytest.fixture(params=["embedded", "server", "pgvector", "opensearch", "pinecone"])
+@pytest.fixture(scope="module")
+def milvus():
+    pytest.importorskip("pymilvus", reason="pymilvus not installed in this env")
+    from harness.milvus_server import serving_milvus
+
+    with serving_milvus() as fake:
+        yield fake
+
+
+def _milvus_env(fake, multitenancy: bool) -> dict[str, str]:
+    from harness.milvus_server import milvus_env
+
+    return milvus_env(fake, multitenancy=multitenancy)
+
+
+def _milvus_rows_of(fake, knowledge_id: str) -> list[dict]:
+    """The rows Milvus keeps for a knowledge base, in its own collection or a shared one."""
+    suffix = knowledge_id.replace("-", "_")
+    return [
+        row
+        for name, collection in fake.collections.items()
+        for row in collection.rows.values()
+        if name.endswith(suffix) or row.get("resource_id") == knowledge_id
+    ]
+
+
+@pytest.fixture(
+    params=[
+        "embedded",
+        "server",
+        "pgvector",
+        "opensearch",
+        "pinecone",
+        "milvus",
+        "milvus-multitenant",
+    ]
+)
 def store(request, instance_with, embeddings) -> tuple[str, LaunchedInstance]:
     """(which store, an instance embedding by keyword and keeping its vectors there)."""
     env = keyword_embedding_env(embeddings)
@@ -139,6 +188,9 @@ def store(request, instance_with, embeddings) -> tuple[str, LaunchedInstance]:
         env.update(opensearch_env(request.getfixturevalue("opensearch")))
     if request.param == "pinecone":
         env.update(request.getfixturevalue("on_pinecone_env"))
+    if request.param.startswith("milvus"):
+        fake = request.getfixturevalue("milvus")
+        env.update(_milvus_env(fake, multitenancy=request.param == "milvus-multitenant"))
     return request.param, instance_with(env)
 
 
@@ -156,7 +208,7 @@ def _documents(client: httpx.Client, collection_name: str, query: str) -> list[s
 
 
 def test_a_query_ranks_the_nearest_chunk_first_and_scores_it_near_one(store):
-    _, instance = store
+    which, instance = store
     with admin_of(instance).client() as client, knowledge_base(client) as knowledge_id:
         for name, text in (
             ("ferry.txt", FERRY),
@@ -171,8 +223,9 @@ def test_a_query_ranks_the_nearest_chunk_first_and_scores_it_near_one(store):
     assert len(documents) == 2, documents
     assert documents[0].strip() == LIGHTHOUSE
     assert scores[0] == pytest.approx(1.0, abs=1e-3)
-    # a chunk sharing no keyword sits at a right angle: distance 1, score one half
-    assert scores[1] == pytest.approx(0.5, abs=0.01)
+    # a chunk sharing no keyword sits at a right angle: distance 1, score one half; the shared
+    # Milvus collection passes Milvus's own cosine similarity on, 0 at a right angle
+    assert scores[1] == pytest.approx(0.0 if which == "milvus-multitenant" else 0.5, abs=0.01)
     assert found["metadatas"][0][0]["name"] == "lighthouse.txt"
 
 
@@ -222,13 +275,16 @@ def test_a_deleted_knowledge_base_takes_its_collection_along(store, request):
             json={"collection_name": knowledge_id, "query": "ferry"},
         )
 
-    assert gone.status_code == 200, gone.text
+    # Milvus refuses a search of a collection it no longer has; the others find nothing in it
+    assert gone.status_code == (400 if which == "milvus" else 200), gone.text
     documents = (gone.json() or {}).get("documents") or []
     assert not any(documents), "the deleted knowledge base still answers"
     if which == "server":
         assert knowledge_id not in collection_names(request.getfixturevalue("chroma_server"))
     if which == "opensearch":
         assert f"open_webui_{knowledge_id}" not in request.getfixturevalue("opensearch").indices
+    if which.startswith("milvus"):
+        assert _milvus_rows_of(request.getfixturevalue("milvus"), knowledge_id) == []
 
 
 def _remember(client: httpx.Client, content: str) -> str:
@@ -445,3 +501,66 @@ def test_resetting_the_vector_store_deletes_every_s3_vectors_index(on_s3_vectors
 
     assert reset.status_code == 200, reset.text
     assert s3_vectors.indexes == {}
+
+
+# ---------------------------------------------------------------- Milvus settings
+
+MILVUS_TOKEN = "harbour:master-key"
+MILVUS_SETTINGS = {
+    "MILVUS_TOKEN": MILVUS_TOKEN,
+    "MILVUS_DB": "harbour",
+    "MILVUS_INDEX_TYPE": "HNSW",
+    "MILVUS_METRIC_TYPE": "COSINE",
+    "MILVUS_HNSW_M": "8",
+    "MILVUS_HNSW_EFCONSTRUCTION": "64",
+}
+
+
+def test_milvus_gets_the_token_database_and_index_the_admin_configured(
+    instance_with, embeddings, milvus
+):
+    from pymilvus.grpc_gen import schema_pb2
+
+    env = {**keyword_embedding_env(embeddings), **_milvus_env(milvus, False), **MILVUS_SETTINGS}
+    instance = instance_with(env)
+    milvus.call_metadata.clear()
+    with admin_of(instance).client() as client, knowledge_base(client) as knowledge_id:
+        add_text_file(client, knowledge_id, "ferry.txt", FERRY)
+        assert _documents(client, knowledge_id, "ferry") == [FERRY]
+        [collection] = [
+            name for name in milvus.collections if name.endswith(knowledge_id.replace("-", "_"))
+        ]
+        fields = {field.name: field for field in milvus.collections[collection].schema.fields}
+
+    types = {name: schema_pb2.DataType.Name(field.data_type) for name, field in fields.items()}
+    assert types == {"id": "VarChar", "vector": "FloatVector", "data": "JSON", "metadata": "JSON"}
+    assert fields["id"].is_primary_key
+    dimension = {pair.key: pair.value for pair in fields["vector"].type_params}["dim"]
+    assert int(dimension) == len(KEYWORDS) + 1
+    settings = milvus.index_settings[(collection, "vector")]
+    assert (settings["index_type"], settings["metric_type"]) == ("HNSW", "COSINE")
+    assert settings == {
+        "index_type": "HNSW",
+        "metric_type": "COSINE",
+        "M": "8",
+        "efConstruction": "64",
+    }
+    credentials = base64.b64encode(MILVUS_TOKEN.encode()).decode()
+    assert milvus.call_metadata, "the instance never reached Milvus"
+    assert all(metadata.get("authorization") == credentials for metadata in milvus.call_metadata)
+    assert all(metadata.get("dbname") == "harbour" for metadata in milvus.call_metadata)
+
+
+@pytest.mark.parametrize("multitenancy", [False, True], ids=["milvus", "milvus-multitenant"])
+def test_resetting_the_vector_store_empties_milvus(instance_with, embeddings, milvus, multitenancy):
+    instance = instance_with(
+        {**keyword_embedding_env(embeddings), **_milvus_env(milvus, multitenancy)}
+    )
+    with admin_of(instance).client() as client, knowledge_base(client) as knowledge_id:
+        add_text_file(client, knowledge_id, "ferry.txt", FERRY)
+        assert _milvus_rows_of(milvus, knowledge_id)
+
+        reset = client.post("/api/v1/retrieval/reset/db")
+
+    assert reset.status_code == 200, reset.text
+    assert _milvus_rows_of(milvus, knowledge_id) == []

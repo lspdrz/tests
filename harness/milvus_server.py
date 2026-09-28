@@ -8,7 +8,10 @@ expressions are the conjunctions Open WebUI writes: `field == value`, `field in 
 `metadata['key'] == value`, joined by `and`.
 
 `index_requests` lists every `(collection, field, index type)` the server was asked to build;
-an empty type is a request that leaves the choice to the server. Setting
+an empty type is a request that leaves the choice to the server. `index_settings` holds the
+parameters of the last index asked for on each `(collection, field)` (`index_type`,
+`metric_type` and the JSON `params`), and `call_metadata` the gRPC metadata of every call, where
+the client's credentials (`authorization`) and database (`dbname`) travel. Setting
 `refuse_untyped_scalar_index` makes the server refuse a scalar index without a type, the way a
 Milvus Lite or an older standalone server does. `milvus_env(fake, multitenancy)` is the
 environment of an instance that stores its vectors there.
@@ -179,6 +182,8 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
     def __init__(self) -> None:
         self.collections: dict[str, Collection] = {}
         self.index_requests: list[tuple[str, str, str]] = []
+        self.index_settings: dict[tuple[str, str], dict[str, str]] = {}
+        self.call_metadata: list[dict[str, str]] = []
         self.refuse_untyped_scalar_index = False
         self.address = ""
         self.lock = threading.Lock()
@@ -248,10 +253,12 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
     # --- indexes ---------------------------------------------------------------------------
 
     def CreateIndex(self, request, context):
-        index_type = _params(request.extra_params).get("index_type", "")
+        settings = _params(request.extra_params)
+        index_type = settings.get("index_type", "")
         with self.lock:
             collection = self.collections.get(request.collection_name)
             self.index_requests.append((request.collection_name, request.field_name, index_type))
+            self.index_settings[(request.collection_name, request.field_name)] = settings
         if collection is None:
             return _not_found(request.collection_name)
         is_scalar = collection.field_type(request.field_name) not in VECTOR_TYPES
@@ -388,10 +395,22 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
         )
 
 
+class _MetadataRecorder(grpc.ServerInterceptor):
+    def __init__(self, fake: FakeMilvus) -> None:
+        self.fake = fake
+
+    def intercept_service(self, continuation, handler_call_details):
+        with self.fake.lock:
+            self.fake.call_metadata.append(dict(handler_call_details.invocation_metadata))
+        return continuation(handler_call_details)
+
+
 @contextlib.contextmanager
 def serving_milvus() -> Iterator[FakeMilvus]:
     fake = FakeMilvus()
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=16), interceptors=[_MetadataRecorder(fake)]
+    )
     milvus_pb2_grpc.add_MilvusServiceServicer_to_server(fake, server)
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()

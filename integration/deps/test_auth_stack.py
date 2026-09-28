@@ -9,7 +9,10 @@ Switching `PASSWORD_HASH_ALGORITHM` only changes how new passwords are hashed: e
 hash names its algorithm, so accounts keep signing in across a switch in either direction. Two
 accounts with one password get different argon2 hashes (a salt each), and an argon2 hash that
 cannot be parsed refuses the sign-in like a wrong password.
-PyJWT signs and checks the session token, whose `iat` and `exp` come from pytz's UTC clock.
+PyJWT signs and checks the session token, whose `iat` and `exp` come from pytz's UTC clock: a
+token minted elsewhere with the server's key and HS256 is honoured, one in another HMAC, unsigned,
+signed with another key or not a JWT at all is refused. With user info forwarding and a JWT
+secret set, PyJWT also signs who is asking into the header the provider gets.
 authlib builds the SSO redirect and completes the code exchange, while itsdangerous signs the
 `owui-session` cookie that carries its state from one to the other. The completed SSO sign-in
 also verifies the provider's RS256 ID token and encrypts the stored OAuth session, which is
@@ -34,9 +37,13 @@ naive `datetime.now()` for `exp` stretches the lifetime by the zone's 5 h 45 min
 `InvalidHashError` left uncaught answers a hash of an unknown argon2 variant with a 500 and a
 callback error reported by its class name alone drops `invalid_grant` from the log. Storing the
 session tokens unencrypted fails the encrypted-at-rest test, a `_decrypt_token` that parses the
-stored text without decrypting it fails both stored-token tests and a Fernet that answers a
-token of another key with garbage in place of `InvalidToken` fails the undecryptable one; a
-Fernet that accepts a malformed key lets the instance with the unusable session key boot.
+stored text without decrypting it fails both stored-token tests and a Fernet that answers a token of
+another key with garbage in place of `InvalidToken` fails the undecryptable one; a Fernet that
+accepts a malformed key lets the instance with the unusable session key boot. Also on ef67cc3fa, a
+session check that takes HS512 too fails the other-HMAC case, one without the signature check fails
+every forged case, sessions signed HS384 fail the minted-elsewhere test and a forwarded token signed
+HS512 fails the forwarding test. Twin of the behaviour half of unit/deps/test_pyjwt.py, which keeps
+its sweep over the source.
 """
 
 from __future__ import annotations
@@ -51,6 +58,7 @@ import urllib.parse
 import uuid
 
 import httpx
+import jwt
 import pytest
 import sqlalchemy
 from cryptography.fernet import Fernet
@@ -68,6 +76,7 @@ from harness.oidc_provider import (
 )
 from harness.oidc_provider import sign_in as sso_sign_in
 from harness.prepared_data import RunningBackend, boot_until_settled, serving
+from harness.upstream import MOCK_MODEL_ID
 
 pytestmark = [
     pytest.mark.depcheck,
@@ -83,6 +92,11 @@ ARGON2_OFF_UTC = {"PASSWORD_HASH_ALGORITHM": "argon2", "TZ": "Asia/Kathmandu"}
 LONG_PASSWORD = "argon2-" + "x" * 72 + "!"
 FOUR_WEEKS = 4 * 7 * 24 * 3600
 ARGON2 = {"PASSWORD_HASH_ALGORITHM": "argon2"}
+FORWARDING_SECRET = "forwarding-secret-0123456789abcdef"
+FORWARDING_AS_JWT = {
+    "ENABLE_FORWARD_USER_INFO_HEADERS": "true",
+    "FORWARD_USER_INFO_HEADER_JWT_SECRET": FORWARDING_SECRET,
+}
 FIRST_PASSWORD = "bcrypt-first-password"
 # argon2 raises InvalidHashError for the unknown variant and VerificationError for the rest
 DAMAGED_ARGON2_HASHES = {
@@ -227,6 +241,56 @@ def test_a_session_token_with_a_flipped_signature_is_refused(instance, make_user
 
     assert _session_status(instance, account.token) == 200
     assert _session_status(instance, _with_flipped_signature(account.token)) == 401
+
+
+def test_a_session_token_signed_elsewhere_with_the_servers_key_is_honoured(instance, make_user):
+    account = make_user()
+    claims = {**_claims(account.token), "jti": str(uuid.uuid4())}
+    minted = jwt.encode(claims, WEBUI_SECRET_KEY, algorithm="HS256")
+
+    assert _session_status(instance, minted) == 200
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "key"),
+    [
+        pytest.param("HS512", WEBUI_SECRET_KEY, id="another-hmac"),
+        pytest.param("none", None, id="unsigned"),
+        pytest.param("HS256", "a-key-the-server-never-had-0123456789", id="another-key"),
+    ],
+)
+def test_a_session_token_not_signed_as_the_server_signs_is_refused(
+    instance, make_user, algorithm, key
+):
+    forged = jwt.encode(_claims(make_user().token), key, algorithm=algorithm)
+
+    assert _session_status(instance, forged) == 401
+
+
+def test_the_provider_is_told_who_asks_in_a_jwt_signed_with_the_forwarding_secret(
+    instance_with,
+):
+    forwarding = instance_with(FORWARDING_AS_JWT)
+    account = create_user(forwarding)
+    body = {"model": MOCK_MODEL_ID, "messages": [{"role": "user", "content": "hi"}]}
+    with account.client() as client:
+        answered = client.post("/api/chat/completions", json={**body, "stream": False})
+    assert answered.status_code == 200, answered.text
+
+    [sent] = forwarding.upstream.requests_to("/chat/completions")
+    headers = {name.lower(): value for name, value in sent.headers.items()}
+    token = headers["x-openwebui-user-jwt"]
+    claims = jwt.decode(token, FORWARDING_SECRET, algorithms=["HS256"], issuer="open-webui")
+    assert (claims["sub"], claims["email"], claims["role"]) == (account.id, account.email, "user")
+    assert claims["exp"] - claims["iat"] == 300
+    assert abs(claims["iat"] - time.time()) < 60
+    with pytest.raises(jwt.InvalidSignatureError):
+        jwt.decode(token, "not-the-forwarding-secret-0123456789", algorithms=["HS256"])
+
+
+@pytest.mark.parametrize("token", ["not-a-token", "not.a.token", "e30.e30."])
+def test_a_session_token_that_is_no_jwt_is_refused(instance, token):
+    assert _session_status(instance, token) == 401
 
 
 def test_a_session_token_stops_working_once_it_expires(instance, make_user, preserve):

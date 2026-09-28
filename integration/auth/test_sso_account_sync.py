@@ -11,18 +11,19 @@ names and `*`, and refuses a sign-in whose roles match none of them without crea
 
 The provider's back-channel logout ends the SSO sessions of the account whose `sub` it names and
 no one else's. A logout token that is unsigned by the provider, meant for another client, lacks
-the logout event, carries a nonce or names nobody is refused and ends nothing.
+the logout event, carries a nonce, names nobody or has expired is refused and ends nothing.
 
 Discriminates: in a backend copy, splitting a string groups claim on `,` instead of the
 configured separator turns the separated-string test red, dropping the name update on login
-turns the name test red, and decoding the logout token unverified turns the foreign-key and
-other-audience cases red.
+turns the name test red, decoding the logout token unverified turns the foreign-key and
+other-audience cases red and decoding it without the expiry check turns the expired case red.
 """
 
 from __future__ import annotations
 
 import base64
 import secrets
+import time
 
 import httpx
 import pytest
@@ -289,6 +290,7 @@ REFUSED_TOKENS = {
     "nonce": lambda idp, sub: idp.logout_token(sub, nonce="n-0"),
     "neither-sub-nor-sid": lambda idp, sub: idp.logout_token(None),
     "not-a-jwt": lambda idp, sub: "not.a.jwt",
+    "expired": lambda idp, sub: idp.logout_token(sub, exp=int(time.time()) - 60),
 }
 
 

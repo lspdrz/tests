@@ -64,16 +64,17 @@ OPEN_WEBUI_SOURCE_DIR=../open-webui/backend pytest -m depcheck unit/deps integra
 
 | Library | Feature smoke test |
 |---|---|
-| pypdf, docx2txt, unstructured with python-pptx, pandas, openpyxl, xlrd and msoffcrypto, pypandoc, beautifulsoup4, chardet, ftfy | `integration/deps/test_document_extraction.py` (one upload per format, and a password-protected workbook) |
+| pypdf, docx2txt, unstructured with python-pptx, pandas on pyarrow, openpyxl, xlrd and msoffcrypto, pypandoc, beautifulsoup4, chardet, ftfy | `integration/deps/test_document_extraction.py` (one upload per format, PDF pages, labels, metadata and locks, pandoc missing, and a password-protected workbook) and `e2e/retrieval/test_attached_document_warnings.py` |
 | azure-ai-documentintelligence | `integration/deps/test_document_extraction.py` (a PDF read by a local stand-in of the analyze API) |
 | rapidocr with onnxruntime, OpenCV and Pillow | `integration/deps/test_document_extraction.py` (PDF image OCR) |
 | pandas, openpyxl, xlrd and python-pptx without unstructured | `integration/deps/test_document_extraction.py` (an instance installed without the extra) |
 | langchain-text-splitters, langchain-core, langchain-classic, tiktoken, rank-bm25 | `integration/deps/test_chunking_and_search.py` |
 | langchain-core | `integration/deps/test_tool_specs.py` (a workspace tool's spec) |
 | Pillow | `integration/deps/test_image_validation.py` (model backgrounds, linked images, image edits) |
-| bcrypt, argon2-cffi, PyJWT, pytz, authlib, itsdangerous, cryptography | `integration/deps/test_auth_stack.py` |
+| bcrypt, argon2-cffi, PyJWT, pytz, authlib, itsdangerous, cryptography | `integration/deps/test_auth_stack.py` (and the back-channel logout token in `integration/auth/test_sso_account_sync.py`) |
 | starlette-compress, Brotli, zstandard, Markdown, beautifulsoup4, brotlicffi, python-socketio, pycrdt | `integration/deps/test_transport_stack.py` |
 | python-mimeparse, aiofiles, pydub, av, faster-whisper (local Whisper on a tiny model) | `integration/deps/test_audio_stack.py`, `e2e/audio/test_local_whisper_dictation.py` |
+| pydantic, python-multipart | `integration/deps/test_request_bodies.py` |
 | mcp, httpx, validators, black, beautifulsoup4, opentelemetry, requests, googleapis-common-protos | `integration/deps/test_outbound_stack.py` |
 | opentelemetry (traces, metrics, logs over OTLP/HTTP and gRPC), psutil | `integration/deps/test_telemetry_export.py` |
 | playwright (a remote browser server) | `integration/deps/test_browser_page_loader.py` |
@@ -81,7 +82,7 @@ OPEN_WEBUI_SOURCE_DIR=../open-webui/backend pytest -m depcheck unit/deps integra
 | ldap3 | `integration/auth/test_ldap_sign_in.py` (LDAP and LDAPS sign-in) |
 | boto3 (S3), azure-storage-blob, azure-identity, google-cloud-storage | `integration/deps/test_object_storage.py` (uploads kept in a bucket or container) |
 | azure-identity, azure-search-documents | `integration/deps/test_azure_services.py` (Entra ID sign-in to Azure OpenAI, Azure AI Search) |
-| chromadb (embedded and server), pgvector with psycopg2, opensearch-py, pinecone, boto3 (S3 Vectors) | `integration/deps/test_vector_stores.py` |
+| chromadb (embedded and server), pgvector with psycopg2, opensearch-py, pinecone, pymilvus (both layouts), boto3 (S3 Vectors) | `integration/deps/test_vector_stores.py` |
 | elasticsearch | `integration/deps/test_elasticsearch_store.py` |
 | ddgs, fake-useragent | `integration/deps/test_web_search_stack.py`, `e2e/retrieval/test_duckduckgo_web_search.py` |
 | fastapi | `integration/deps/test_web_framework.py` and every instance boot and request |
@@ -93,15 +94,20 @@ OPEN_WEBUI_SOURCE_DIR=../open-webui/backend pytest -m depcheck unit/deps integra
 | requests (Tika) | `integration/retrieval/test_v0114_source_text_and_docling.py` (a binary upload is extracted by Tika) |
 | sqlalchemy, uvicorn, httpx | every instance boot and request |
 
-The .rst, .epub and .odt uploads skip without a `pandoc` binary, pydub skips
-without ffmpeg, and the token splitter skips when its tiktoken BPE file is not
-cached, since none of them may be downloaded during a run. The local Whisper
-tests build their model with torch, transformers and CTranslate2 and skip
-without them. Libraries for services the integration suite has no local stand-
-in for (Milvus, Weaviate, Oracle) keep their unit contracts only, as do
-libraries no Open WebUI feature calls (accelerate, the anthropic SDK). The
-openai SDK is pinned but Open WebUI never calls it (every provider request is
-its own), so it has no contract. A contract kept next to its feature smoke
-test says in its docstring which part no request reaches. The Postgres cases
-need `pgserver`, whose vector extension predates pgvector's `halfvec` and
-whose server has no SSL, so those two paths keep a unit contract as well.
+The .rst, .epub and .odt uploads skip without a `pandoc` binary (the test of
+the missing-pandoc message skips with one), the pydub tests skip without
+ffmpeg (the conversion test also without ffprobe), and the token splitter
+skips when its tiktoken BPE file is not cached, since none of them may be
+downloaded during a run. The local Whisper tests build their model with torch,
+transformers and CTranslate2 and skip without them. Libraries for services the
+integration suite has no local stand-in for (Weaviate, Oracle) keep their unit
+contracts only, as do libraries no Open WebUI feature calls (accelerate, the
+anthropic SDK). The openai SDK is pinned but Open WebUI never calls it (every
+provider request is its own), so it has no contract; nor has PyMySQL, which
+nothing imports and whose MySQL URL the async database engine cannot use (Open
+WebUI supports SQLite and Postgres). pyarrow is reached through pandas, PyJWT
+keeps its sweep over the source and python-multipart its pinned security
+floor. A contract kept next to its feature smoke test says in its docstring
+which part no request reaches. The Postgres cases need `pgserver`, whose
+vector extension predates pgvector's `halfvec` and whose server has no SSL, so
+those two paths keep a unit contract as well.

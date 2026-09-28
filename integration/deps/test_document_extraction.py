@@ -20,6 +20,13 @@ itself (`ExcelFile`, `read_excel` per sheet on openpyxl or xlrd, `to_string` wit
 index) and slides with python-pptx (twin of unit/deps/test_pandas.py and
 unit/deps/test_openpyxl.py).
 
+A PDF is read page by page, each page keeping its label from the page label tree and the
+document's title, author and creation date from its info dictionary, or as one document split
+at page breaks in single mode. pypdf opens a PDF locked only against editing and refuses one
+that needs a password to open, and anything else named .pdf fails its upload. Without the
+pandoc program, a document unstructured converts through pypandoc names the missing program.
+pandas keeps a workbook's text columns in pyarrow arrays, with unstructured and without it.
+
 Windows-1251 Cyrillic is decoded with the codec chardet names, which ftfy could not repair
 after a latin-1 fallback.
 
@@ -46,6 +53,12 @@ openpyxl whose `load_workbook` raises fails both workbook uploads; the pandas lo
 row index or reading only the first sheet fails the pandas test, a python-pptx loader that skips
 text frames fails the slides test, and a PDF loader that no longer hands an image Pillow cannot open
 (`UnidentifiedImageError`) to pypdf fails the raw-pixel OCR case while the JPEG case passes.
+Also on ef67cc3fa, one copy that drops the PDF info dictionary, joins single-mode pages with a plain
+newline, refuses every encrypted PDF (with a message that fails the password test too), no longer
+recognises pypandoc's "No pandoc was found" and has a pyarrow that cannot build an array (patched in
+at import) fails the page-by-page, single-mode, editing-lock, pandoc and every workbook test; a copy
+that opens a locked PDF with its owner password fails the password test. A non-PDF fails its upload
+whether or not pypdf raises, so that test only shows the refusal.
 """
 
 from __future__ import annotations
@@ -127,8 +140,10 @@ def _text_pdf(blank_first_page: bool = False) -> bytes:
     )
 
 
-def _assembled_pdf(objects: list[bytes]) -> bytes:
+def _assembled_pdf(objects: list[bytes], info: bytes = b"") -> bytes:
     """A PDF of the numbered objects, the first the catalog, with its cross-reference table."""
+    if info:
+        objects = [*objects, info]
     pdf = bytearray(b"%PDF-1.4\n")
     offsets = []
     for number, body in enumerate(objects, start=1):
@@ -137,9 +152,30 @@ def _assembled_pdf(objects: list[bytes]) -> bytes:
     xref_offset = len(pdf)
     pdf += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
     pdf += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
-    pdf += b"trailer\n<< /Size %d /Root 1 0 R >>\n" % (len(objects) + 1)
+    info_entry = b" /Info %d 0 R" % len(objects) if info else b""
+    pdf += b"trailer\n<< /Size %d /Root 1 0 R%s >>\n" % (len(objects) + 1, info_entry)
     pdf += b"startxref\n%d\n%%%%EOF\n" % xref_offset
     return bytes(pdf)
+
+
+def _pdf(pages: list[str], info: bytes = b"", page_labels: bytes = b"") -> bytes:
+    """One page per text in Helvetica, with an optional info dictionary and page label tree."""
+    labels = b" /PageLabels %s" % page_labels if page_labels else b""
+    page_numbers = [4 + 2 * index for index in range(len(pages))]
+    kids = b" ".join(b"%d 0 R" % number for number in page_numbers)
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R%s >>" % labels,
+        b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, len(pages)),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    for number, text in zip(page_numbers, pages):
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode()
+        objects.append(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents %d 0 R "
+            b"/Resources << /Font << /F1 3 0 R >> >> >>" % (number + 1)
+        )
+        objects.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream))
+    return _assembled_pdf(objects, info)
 
 
 def _drawn(word: str):
@@ -634,3 +670,112 @@ def test_a_file_that_only_claims_to_be_a_workbook_is_refused(make_user):
         error = _processing_error(client, "fake.xlsx", b"not a workbook, only its name")
 
     assert "Not a valid XLSX file" in error, error
+
+
+# ---------------------------------------------------------------- PDFs, page by page
+
+HARBOUR_PAGES = ["The harbour chart shows the channel.", f"The {MARKER} was approved."]
+SURVEY_INFO = (
+    b"<< /Title (  Harbour survey  ) /Author (The keeper) "
+    b"/CreationDate (D:20240102030405+00'00') >>"
+)
+# the first page is numbered in roman numerals, the rest from 1
+ROMAN_THEN_ARABIC = b"<< /Nums [0 << /S /r >> 1 << /S /D >>] >>"
+PDF_PASSWORD = "harbour-password"
+
+
+def _chunks(client: httpx.Client, file_id: str) -> list[tuple[str, dict]]:
+    """Every stored chunk of the file with its metadata, in page order."""
+    found = client.post(
+        "/api/v1/retrieval/query/doc",
+        json={"collection_name": f"file-{file_id}", "query": "harbour", "k": 20},
+    )
+    assert found.status_code == 200, found.text
+    chunks = zip(found.json()["documents"][0], found.json()["metadatas"][0])
+    return sorted(chunks, key=lambda chunk: chunk[1].get("page", 0))
+
+
+def _locked_pdf(user_password: str) -> bytes:
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(_pdf(HARBOUR_PAGES))))
+    writer.encrypt(user_password=user_password, owner_password="harbour-owner")
+    locked = io.BytesIO()
+    writer.write(locked)
+    return locked.getvalue()
+
+
+def test_a_pdf_is_read_page_by_page_with_its_labels_and_metadata(make_user):
+    pdf = _pdf(HARBOUR_PAGES, info=SURVEY_INFO, page_labels=ROMAN_THEN_ARABIC)
+    with make_user().client() as client:
+        file_id = _upload(client, "survey.pdf", pdf, "application/pdf")
+        content = _read_back(client, file_id)
+        chunks = _chunks(client, file_id)
+
+    assert content == " ".join(HARBOUR_PAGES)
+    assert [text for text, _ in chunks] == HARBOUR_PAGES
+    assert [(meta["page"], meta["page_label"]) for _, meta in chunks] == [(0, "i"), (1, "1")]
+    first = chunks[0][1]
+    assert first["title"] == "Harbour survey", first
+    assert first["author"] == "The keeper"
+    assert first["creationdate"] == "2024-01-02T03:04:05+00:00"
+    assert first["total_pages"] == 2
+
+
+def test_in_single_mode_a_pdf_is_one_document_split_at_page_breaks(retrieval_settings, make_user):
+    retrieval_settings(PDF_LOADER_MODE="single")
+    with make_user().client() as client:
+        content = _upload_and_read(client, "survey.pdf", _pdf(HARBOUR_PAGES), "application/pdf")
+
+    assert content == "\n\f".join(HARBOUR_PAGES)
+
+
+def test_a_pdf_locked_only_against_editing_is_read(make_user):
+    with make_user().client() as client:
+        content = _upload_and_read(client, "survey.pdf", _locked_pdf(""), "application/pdf")
+
+    assert MARKER in content, content
+
+
+def test_a_pdf_that_needs_a_password_to_open_is_refused(make_user):
+    with make_user().client() as client:
+        file_id = _upload(client, "survey.pdf", _locked_pdf(PDF_PASSWORD), "application/pdf")
+        stored = client.get(f"/api/v1/files/{file_id}").json()
+        read = client.get(f"/api/v1/files/{file_id}/data/content")
+
+    assert stored["data"].get("status") == "failed", stored["data"]
+    assert "decrypt" in str(stored["data"].get("error")).lower(), stored["data"]
+    assert MARKER not in read.text
+
+
+def test_a_file_that_only_claims_to_be_a_pdf_is_refused(make_user):
+    with make_user().client() as client:
+        file_id = _upload(client, "survey.pdf", b"not a pdf, only its name", "application/pdf")
+        stored = client.get(f"/api/v1/files/{file_id}").json()
+
+    assert stored["data"].get("status") == "failed", stored["data"]
+    assert stored["data"].get("error"), stored["data"]
+
+
+# ---------------------------------------------------------------- without pandoc
+
+PANDOC_MISSING = (
+    "Pandoc is not installed on the server. Please contact your administrator for assistance."
+)
+
+
+def test_without_pandoc_a_document_it_converts_names_the_missing_program(make_user):
+    import pypandoc
+
+    try:
+        pypandoc.get_pandoc_version()
+    except OSError:
+        pass
+    else:
+        pytest.skip("pandoc is installed; this is the answer an install without it gives")
+    with make_user().client() as client:
+        file_id = _upload(client, "notes.rst", _rst(), "text/x-rst")
+        stored = client.get(f"/api/v1/files/{file_id}").json()
+
+    assert stored["data"].get("status") == "failed", stored["data"]
+    assert stored["data"]["error"] == PANDOC_MISSING, stored["data"]

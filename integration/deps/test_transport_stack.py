@@ -8,7 +8,8 @@ included) and split into versions and items by BeautifulSoup, each item cut at i
 into a title and its text.
 aiohttp decodes a Brotli-encoded provider reply with brotlicffi (Brotli when that is absent).
 python-socketio carries the chat events to the browser, and pycrdt merges the live edits two tabs
-make to one note.
+make to one note: a long edit still arrives whole after the server has folded its oldest updates
+into one snapshot, and an update that arrives twice counts once.
 
 Discriminates: passes on dev bbfa876af; in a backend copy, dropping `CompressMiddleware` fails
 every encoding, a `brotli.Compressor` that emits nothing (patched in at import) fails the
@@ -17,7 +18,9 @@ an item whose content is its raw HTML fails the changelog test, a provider sessi
 `auto_decompress=False` hands the Brotli bytes to the stream parser (as does a brotlicffi
 `Decompressor` patched to garble), emitting chat events to a room other than `user:{id}` starves
 the socket of them and not applying the stored updates before `ydoc.get_update()` sends the
-second tab an empty document.
+second tab an empty document. On dev ef67cc3fa, a compaction that keeps an empty snapshot fails
+the long edit, and a merge that appends each stored update's text fails the repeated update.
+Twin of unit/deps/test_pycrdt.py.
 """
 
 from __future__ import annotations
@@ -208,3 +211,50 @@ def test_two_tabs_editing_one_note_see_the_document_the_server_merged(make_user)
         second.call("ydoc:document:state", {"document_id": document_id})
 
         assert _a_state_reads(states, "hi"), "the second tab never got the merged document"
+
+
+def _typing(text: str) -> list[list[int]]:
+    """The updates a tab sends while `text` is typed into an empty note, one per character."""
+    document = pycrdt.Doc()
+    document["content"] = content = pycrdt.Text()
+    updates = []
+    for character in text:
+        before = document.get_state()
+        content += character
+        updates.append(list(document.get_update(before)))
+    return updates
+
+
+def _live_note(account) -> str:
+    with account.client() as client:
+        note = client.post(
+            "/api/v1/notes/create", json={"title": "typed", "data": {"content": {"md": ""}}}
+        )
+    assert note.status_code == 200, note.text
+    return f"note:{note.json()['id']}"
+
+
+def test_a_long_edit_survives_the_servers_compaction_of_its_updates(make_user):
+    # past 500 stored updates the server merges the oldest half into one
+    account = make_user()
+    document_id = _live_note(account)
+    text = "".join(f"tide {index:03d}. " for index in range(52))
+    assert len(text) > 500
+
+    with _document_tab(account, document_id) as (typist, _):
+        for update in _typing(text):
+            typist.call("ydoc:document:update", {"document_id": document_id, "update": update})
+        with _document_tab(account, document_id) as (_, states):
+            assert _a_state_reads(states, text), "the note came back without its early edits"
+
+
+def test_an_update_sent_twice_is_applied_once(make_user):
+    account = make_user()
+    document_id = _live_note(account)
+    edit = {"document_id": document_id, "update": _edit("hi")}
+
+    with _document_tab(account, document_id) as (typist, _):
+        typist.call("ydoc:document:update", edit)
+        typist.call("ydoc:document:update", edit)
+        with _document_tab(account, document_id) as (_, states):
+            assert _a_state_reads(states, "hi"), "the repeated update was applied again"
