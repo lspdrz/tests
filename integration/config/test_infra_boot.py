@@ -13,11 +13,12 @@
   wire compatible with, and a knowledge base is filled and searched on it.
 * 52 (same commit): the ColBERT reranker's startup record passed the model name to a message
   with no placeholder, so the record could not be formatted and the log never named the model.
-  The model here is a tiny ColBERT checkpoint written to disk, under a path the reranker loader
-  recognises as `jinaai/jina-colbert-v2`. Loading it fails today, for any checkpoint: colbert-ai
-  0.2.22's `HF_ColBERT` never calls `post_init`, which transformers 5 relies on to set
-  `all_tied_weights_keys`, so saving a ColBERT reranker switches hybrid search back off. The
-  reranking test stays red until the pins agree again.
+  The model here is a tiny ColBERT checkpoint written to disk, complete enough to load offline,
+  under a path the reranker loader recognises as `jinaai/jina-colbert-v2`. Loading it fails today,
+  for any checkpoint: colbert-ai 0.2.22's `HF_ColBERT` never calls `post_init`, which
+  transformers 5 relies on to set `all_tied_weights_keys`, so saving a ColBERT reranker switches
+  hybrid search back off (#31522). The reranking test stays red until PR31532 merges. It needs
+  `ninja` on PATH, since colbert-ai compiles a C++ extension to score, and skips without it.
 * 167 (PR27754, baeb2dfb8, issue #27752): with `DATABASE_ENABLE_IAM_TOKEN_AUTH` the main database
   signed in with an RDS IAM token, but the pgvector store built its own engine and signed in with
   the URL's password, so startup died with "no password supplied"; the token must also stay off a
@@ -41,6 +42,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import shutil
 import socket
 import uuid
 from pathlib import Path
@@ -182,6 +185,7 @@ def test_a_knowledge_base_fills_and_searches_on_opengauss(boot, postgres):
 
 COLBERT_VOCABULARY = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "[unused0]", "[unused1]"]
 COLBERT_VOCABULARY += "the a harbour master is who ingrid lighthouse keeper".split()
+COLBERT_DIM = 128
 
 
 @pytest.fixture(scope="module")
@@ -205,8 +209,10 @@ def colbert_checkpoint(tmp_path_factory) -> Path:
     config.save_pretrained(target)
     encoder = transformers.BertModel(config)
     weights = {f"bert.{name}": value.contiguous() for name, value in encoder.state_dict().items()}
-    weights["linear.weight"] = torch.randn(128, config.hidden_size)
+    weights["linear.weight"] = torch.randn(COLBERT_DIM, config.hidden_size)
     safetensors_torch.save_file(weights, str(target / "model.safetensors"))
+    # without it colbert-ai loses the checkpoint path and looks the tokenizer up on the Hub
+    (target / "artifact.metadata").write_text(json.dumps({"dim": COLBERT_DIM}), encoding="utf-8")
     return target
 
 
@@ -239,6 +245,9 @@ def test_the_colbert_startup_record_names_the_model(instance, admin, preserve, c
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(
+    shutil.which("ninja") is None, reason="colbert-ai compiles its scoring extension with ninja"
+)
 def test_a_colbert_reranker_reranks_a_knowledge_search(
     instance, admin, preserve, colbert_checkpoint
 ):
