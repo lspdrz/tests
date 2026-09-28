@@ -15,7 +15,7 @@ the revision id of the file it was copied from.
 Parsed with ast, never imported: this must stay runnable without the backend's
 dependencies installed, and importing a revision module runs nothing useful.
 
-test_lifecycle.py already drives a real `upgrade head` / `downgrade base`
+integration/migrations/test_lifecycle.py already drives a real `upgrade head` / `downgrade base`
 against SQLite and Postgres. This file is the cheap structural half: it names
 the exact broken edge instead of reporting that alembic exited non-zero.
 

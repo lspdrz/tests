@@ -21,18 +21,15 @@ sets still pass.
 from __future__ import annotations
 
 import contextlib
-import json
-import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
 import httpx
 import pytest
-import sqlalchemy
 
 from harness import upstream as upstream_module
-from harness.prepared_data import RunningBackend, restored_postgres, serving
+from harness.prepared_data import RunningBackend, release_data, serving
 
 pytestmark = [
     pytest.mark.journey,
@@ -82,12 +79,9 @@ class Upgraded:
 @pytest.fixture(scope="module", params=_data_set_params())
 def upgraded(request, tmp_path_factory) -> Iterator[Upgraded]:
     name = request.param
-    manifest = json.loads((DATA_SETS / f"{name}.json").read_text(encoding="utf-8"))
     root = tmp_path_factory.mktemp(name)
-    data_dir = root / "data"
-    with tarfile.open(DATA_SETS / f"{name}.tar.gz") as archive:
-        archive.extractall(data_dir, filter="data")
     with contextlib.ExitStack() as stack:
+        release = stack.enter_context(release_data(DATA_SETS / f"{name}.tar.gz", root))
         provider, shutdown = upstream_module.serve()
         stack.callback(shutdown)
         settings = {
@@ -95,32 +89,12 @@ def upgraded(request, tmp_path_factory) -> Iterator[Upgraded]:
             "RAG_EMBEDDING_ENGINE": "openai",
             "RAG_OPENAI_API_BASE_URL": provider.base_url,
             "RAG_OPENAI_API_KEY": "sk-mock",
+            **release.settings,
         }
-        if manifest["engine"] == "postgres":
-            dump = data_dir / "webui.sql"
-            database_url = stack.enter_context(restored_postgres(dump, root))
-            settings["DATABASE_URL"] = database_url
-            _run_sql(database_url, _RELOCATE_UPLOADS, manifest["data_dir"], str(data_dir))
-        else:
-            database_url = f"sqlite:///{data_dir / 'webui.db'}"
-            _run_sql(database_url, _RELOCATE_UPLOADS, manifest["data_dir"], str(data_dir))
-        backend = stack.enter_context(serving(data_dir, settings))
-        upgraded = Upgraded(backend, manifest)
+        backend = stack.enter_context(serving(release.data_dir, settings))
+        upgraded = Upgraded(backend, release.manifest)
         _point_embeddings_at(upgraded, provider.base_url)
         yield upgraded
-
-
-# uploads are stored by absolute path; a real upgrade keeps its data directory where it was
-_RELOCATE_UPLOADS = "UPDATE file SET path = REPLACE(path, :old, :new)"
-
-
-def _run_sql(database_url: str, statement: str, old: str, new: str) -> None:
-    engine = sqlalchemy.create_engine(database_url)
-    try:
-        with engine.begin() as connection:
-            connection.execute(sqlalchemy.text(statement), {"old": old, "new": new})
-    finally:
-        engine.dispose()
 
 
 def _point_embeddings_at(upgraded: Upgraded, base_url: str) -> None:

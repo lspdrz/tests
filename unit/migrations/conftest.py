@@ -9,7 +9,6 @@ or prints nothing fails the test with its output.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import subprocess
@@ -17,7 +16,6 @@ import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 import pytest
 
@@ -82,22 +80,3 @@ def _data_dir(root: Path) -> Path:
 def sqlite_at(backend: Path, root: Path) -> ScratchDatabase:
     """A fresh SQLite file under `root`, as a new install starts with."""
     return ScratchDatabase(backend, f"sqlite:///{root / 'webui.db'}", _data_dir(root))
-
-
-@contextlib.contextmanager
-def postgres_at(backend: Path, root: Path) -> Iterator[ScratchDatabase]:
-    """A fresh embedded Postgres (`pgserver`) under `root`, stopped again afterwards."""
-    pgserver = pytest.importorskip("pgserver", reason="pgserver not installed")
-    (root / "pgdata").mkdir(parents=True)
-    server = pgserver.get_server(str(root / "pgdata"), cleanup_mode=None)
-    try:
-        url = server.get_uri().replace("postgresql://", "postgresql+psycopg2://", 1)
-        yield ScratchDatabase(backend, url, _data_dir(root / "data"))
-    finally:
-        with contextlib.suppress(Exception):  # a server that failed to start has nothing to stop
-            server.cleanup()
-
-
-@pytest.fixture
-def sqlite_database(open_webui_backend: Path, tmp_path: Path) -> ScratchDatabase:
-    return sqlite_at(open_webui_backend, tmp_path)

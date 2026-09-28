@@ -11,7 +11,10 @@ is one too, shared by the API and browser tests: its data directory starts with 
 `config.json`, whose import at boot writes each key as a config row verbatim, ahead of the
 boot's repair of old row shapes. `serving(data_dir)` keeps the backend running on a data
 directory that already has accounts, and `restored_postgres(dump)` loads a `pg_dump` into an
-embedded Postgres for it to use.
+embedded Postgres for it to use. `release_data(archive, root)` unpacks a data set an older
+release wrote (`integration/migrations/upgrade_data/`), on its own database, ready to serve.
+`manual_alembic(data_dir, ...)` runs the `alembic` command an operator runs by hand, which is
+also how a test builds a database as a release from before a migration left it.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import weakref
@@ -32,6 +36,7 @@ from typing import Callable, Iterator
 
 import httpx
 import pytest
+import sqlalchemy
 
 from harness.instance import (
     LAUNCHER,
@@ -222,3 +227,77 @@ def restored_postgres(dump: Path, root: Path) -> Iterator[str]:
     finally:
         with contextlib.suppress(Exception):  # a server that failed to start has nothing to stop
             server.cleanup()
+
+
+@dataclass
+class ReleaseData:
+    data_dir: Path
+    manifest: dict  # what the seeding script made, and for whom
+    database_url: str
+    settings: dict[str, str]  # what `serving` needs to use this data set's database
+
+
+# uploads are stored by absolute path; a real upgrade keeps its data directory where it was
+_RELOCATE_UPLOADS = "UPDATE file SET path = REPLACE(path, :old, :new)"
+
+
+def run_sql(database_url: str, statement: str, rows: list[dict] | dict) -> None:
+    """Run one statement with `:name` parameters on a database no backend is serving yet."""
+    engine = sqlalchemy.create_engine(database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(sqlalchemy.text(statement), rows)
+    finally:
+        engine.dispose()
+
+
+@contextlib.contextmanager
+def release_data(archive: Path, root: Path) -> Iterator[ReleaseData]:
+    """The data set `archive` (`<name>.tar.gz` beside `<name>.json`) unpacked under `root`.
+
+    A Postgres set restores its `pg_dump` into an embedded server that lives for the block.
+    """
+    manifest = json.loads(
+        archive.with_name(archive.name.removesuffix(".tar.gz") + ".json").read_text(
+            encoding="utf-8"
+        )
+    )
+    data_dir = root / "data"
+    with tarfile.open(archive) as unpacking:
+        unpacking.extractall(data_dir, filter="data")
+    with contextlib.ExitStack() as stack:
+        if manifest["engine"] == "postgres":
+            database_url = stack.enter_context(restored_postgres(data_dir / "webui.sql", root))
+            settings = {"DATABASE_URL": database_url}
+        else:
+            database_url = f"sqlite:///{data_dir / 'webui.db'}"
+            settings = {}
+        relocation = {"old": manifest["data_dir"], "new": str(data_dir)}
+        run_sql(database_url, _RELOCATE_UPLOADS, relocation)
+        yield ReleaseData(data_dir, manifest, database_url, settings)
+
+
+def manual_alembic(
+    data_dir: Path, *arguments: str, database_url: str | None = None
+) -> subprocess.CompletedProcess:
+    """`alembic <arguments>` from `backend/open_webui`, as the manual migration guide runs it."""
+    backend = resolve_backend()
+    if backend is None:
+        pytest.skip("open-webui backend source not found (set OPEN_WEBUI_SOURCE_DIR)")
+    (data_dir / "static").mkdir(parents=True, exist_ok=True)
+    settings = {
+        "DATA_DIR": str(data_dir),
+        "STATIC_DIR": str(data_dir / "static"),
+        "WEBUI_SECRET_KEY": "integration-secret-key",
+        "PYTHONPATH": str(backend),
+    }
+    if database_url:
+        settings["DATABASE_URL"] = database_url
+    return subprocess.run(
+        [sys.executable, "-m", "alembic", *arguments],
+        cwd=backend / "open_webui",
+        env=isolated_env(settings),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )

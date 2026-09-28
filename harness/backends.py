@@ -50,9 +50,7 @@ def _brings_own_database(extra_env: dict[str, str]) -> bool:
 def _postgres_server():
     global _postgres
     if _postgres is None:
-        pgserver = pytest.importorskip(
-            "pgserver", reason="OWUI_TEST_DATABASE=postgres needs pgserver (the postgres extra)"
-        )
+        pgserver = pytest.importorskip("pgserver", reason="needs pgserver (the postgres extra)")
         pgdata = tempfile.mkdtemp(prefix="owui-pg-")
         _postgres = pgserver.get_server(pgdata, cleanup_mode="stop")
         atexit.register(shutil.rmtree, pgdata, ignore_errors=True)
@@ -61,7 +59,8 @@ def _postgres_server():
 
 
 @contextlib.contextmanager
-def _postgres_database() -> Iterator[str]:
+def postgres_database() -> Iterator[str]:
+    """An empty database of its own on the session's embedded Postgres; yields its URL."""
     server = _postgres_server()
     name = f"owui_{uuid.uuid4().hex[:12]}"
     server.psql(f"CREATE DATABASE {name};")
@@ -113,7 +112,7 @@ def services_for(extra_env: dict[str, str]) -> Iterator[dict[str, str]]:
     with contextlib.ExitStack() as stack:
         env: dict[str, str] = {}
         if DATABASE == "postgres" and not _brings_own_database(extra_env):
-            env["DATABASE_URL"] = stack.enter_context(_postgres_database())
+            env["DATABASE_URL"] = stack.enter_context(postgres_database())
         if REDIS and not any(name in extra_env for name in REDIS_SETTINGS):
             env["REDIS_URL"] = stack.enter_context(redis_server())
             env["WEBSOCKET_MANAGER"] = "redis"
