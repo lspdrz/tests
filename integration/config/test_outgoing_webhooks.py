@@ -10,20 +10,30 @@ The admin's event webhooks are admin-only on every route. One subscribed to `use
 receives the event when the admin adds an account, with the event's envelope: its name, the
 actor, the new account as subject and its role.
 
+A target subscribed to `chat.finished` is called when a reply finishes: an `away` one only once
+the user has not been active for three minutes (every request with the user's token counts as
+activity, so the test sets the stored time back while a slow reply streams), an `always` one at
+once, one not subscribed to the event never.
+
 Discriminates: in a backend copy, `_check_notifications_access` skipping the switch turns the
 switched-off test red (HTTP 200) and skipping the permission turns the permission test red,
 `_normalize_target` skipping `validate_url` turns the loopback test red (the target is saved),
-`test_target` sending an empty payload turns the delivery test red, and `add_user` publishing
-`user.updated` in place of `user.created` turns the event delivery test red.
+`test_target` sending an empty payload turns the delivery test red, `add_user` publishing
+`user.updated` in place of `user.created` turns the event delivery test red,
+`dispatch_notification_event` skipping every `away` target turns the idle-user test red (nothing
+is called) and ignoring a target's events turns the unsubscribed test red (the other target is
+called).
 """
 
 from __future__ import annotations
 
+import sqlite3
 import time
 
 import pytest
 
 from harness.actors import admin_of, create_user
+from harness.inflight import start_slow_reply
 from harness.listener import json_answer
 from harness.web_retrieval import LOCAL_WEB_FETCH
 
@@ -198,3 +208,80 @@ def test_a_new_account_is_delivered_to_an_event_webhook(fetching_instance, liste
     assert event["actor"]["id"] == admin.id and event["actor"]["role"] == "admin"
     assert event["source"] == "admin"
     assert event["data"] == {"role": "user"}
+
+
+# a finished reply and the user's targets
+
+
+def _add_targets(account, *targets: dict) -> None:
+    with account.client() as client:
+        for target in targets:
+            created = client.post(TARGETS, json=target)
+            assert created.status_code == 200, created.text
+
+
+def _mark_idle(instance, account) -> None:
+    connection = sqlite3.connect(instance.data_dir / "webui.db")
+    try:
+        with connection:
+            connection.execute("UPDATE user SET last_active_at = 0 WHERE id = ?", (account.id,))
+    finally:
+        connection.close()
+
+
+@pytest.fixture
+def allowed_notifications(fetching_instance, preserve, listener):
+    preserve("admin_config", "permissions", on=fetching_instance)
+    with admin_of(fetching_instance).client() as client:
+        _allow_user_webhooks(client)
+    for path in ("/away", "/always", "/other"):
+        listener.route("POST", path, json_answer({}))
+    return fetching_instance
+
+
+def test_an_away_target_is_called_once_the_user_has_been_idle(allowed_notifications, listener):
+    account = create_user(allowed_notifications)
+    _add_targets(
+        account,
+        {
+            "id": "away",
+            "config": {"url": f"{listener.base_url}/away"},
+            "events": ["chat.finished"],
+            "delivery": "away",
+        },
+    )
+
+    with account.client() as client:
+        start_slow_reply(client, allowed_notifications.upstream)
+    _mark_idle(allowed_notifications, account)
+
+    assert _wait_for(lambda: listener.requests_to("/away")), "the idle user's target was not called"
+    body = listener.requests_to("/away")[0].json()
+    assert body["action"] == "chat" and body["message"].startswith("part-0 ")
+
+
+def test_a_target_not_subscribed_to_the_event_is_not_called(allowed_notifications, listener):
+    account = create_user(allowed_notifications)
+    _add_targets(
+        account,
+        {
+            "id": "other",
+            "config": {"url": f"{listener.base_url}/other"},
+            "events": ["chat.failed"],
+            "delivery": "always",
+        },
+        {
+            "id": "always",
+            "config": {"url": f"{listener.base_url}/always"},
+            "events": ["chat.finished"],
+            "delivery": "always",
+        },
+    )
+
+    with account.client() as client:
+        start_slow_reply(client, allowed_notifications.upstream, chunk_delay=0.01)
+
+    assert _wait_for(lambda: listener.requests_to("/always")), (
+        "the subscribed target was not called"
+    )
+    assert listener.requests_to("/other") == []
