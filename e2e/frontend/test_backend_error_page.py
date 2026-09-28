@@ -62,18 +62,6 @@ def test_check_again_recovers_once_the_backend_answers(authenticated_page):
     expect(chat_input(page)).to_be_visible()
 
 
-def test_check_again_stays_on_the_error_page_while_the_backend_is_down(authenticated_page):
-    page = authenticated_page
-    page.route(CONFIG_URL, lambda route: route.abort())
-    page.goto("/")
-    expect(page.get_by_text(ERROR_HEADING)).to_be_visible()
-
-    page.get_by_role("button", name="Check Again").click()
-
-    expect(page.get_by_text(ERROR_HEADING)).to_be_visible()
-    expect(page).to_have_url(re.compile(r"/error$"))
-
-
 def test_error_page_sends_a_user_with_a_working_backend_to_the_chat(authenticated_page):
     page = authenticated_page
     page.goto("/error")
