@@ -2,10 +2,10 @@
 
 The broad layer of the 0.11.3 fixes `9962d122c`, `b6d505522`, `e96b6464b`, `8ed548769` and
 `873fb741c`, which rewrote `list[X | None] = None` as `list[X] | None = None`. The written form
-refuses the default it declares, so a client sending `null` got a 422. The request forms are
-pinned over HTTP by integration/models/test_optional_list_annotations.py; this sweep also covers
-the response and stats models (`PromptModel.tags`, `MessageStats.tags`) and the next field that
-repeats the mistake.
+refuses the default it declares, so a client sending `null` got a 422. The request forms and the
+chat stats export (`MessageStats.tags`) are pinned over HTTP by
+integration/models/test_optional_list_annotations.py; this sweep also covers `PromptModel.tags`,
+which no request stores as `None`, and the next field that repeats the mistake.
 
 Discriminates: passes on upstream dev `bbfa876af`; with `ModelForm.access_grants`,
 `PromptForm.tags`/`access_grants`, `PromptModel.tags`, `ToolForm.access_grants` and

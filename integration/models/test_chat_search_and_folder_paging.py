@@ -4,32 +4,41 @@
   its owner and for everyone it is shared with, returned one fixed page of sixty with no count,
   so chats past the sixtieth never appeared. It now takes `page`, `sort_by` and `sort_dir` and
   answers `total` and `has_more`.
-* `f1ded94` / `a9617ca` background writes during a reply (sources, files, embeds and more) went
-  through the chat upsert, which always bumped `updated_at`, so the sidebar re-sorted mid-reply.
-  The upsert now takes `touch` and the background writers pass `touch=False`.
+* `f1ded94` / `a9617ca` background writes during a reply (sources, files, embeds, follow-up
+  suggestions, the arena's pick and the compaction summary) went through the chat upsert, which
+  always bumped `updated_at`, so the sidebar re-sorted mid-reply. The upsert now takes `touch`
+  and the background writers pass `touch=False`. The follow-ups and the arena pick are written
+  deep inside a live reply, so the scripted provider answers them a few seconds late: a write
+  that still moved the chat would show as a later `updated_at`.
 * `cc9a445` on PostgreSQL a chat search matched only the legacy flat `chat->'messages'` array,
   while current conversations keep their text in `chat_message` and under
   `chat->'history'->'messages'`. It now matches all three.
 
-Twin of unit/models/test_chat_search_and_folder_paging.py, which keeps an audit of the background
-writes that only happen deep inside a live reply.
+Twin of unit/models/test_chat_search_and_folder_paging.py, which keeps the sweep over every chat
+upsert that writes one of those background fields, so a new call site is held to it too.
 
 Discriminates: passes on upstream dev `bbfa876af`. With the folder route back on one unpaged call
 the paging tests fail; with the chat upsert bumping `updated_at` regardless of `touch` the three
-background event cases fail; with the PostgreSQL match back on the legacy array alone the three
-history searches on PostgreSQL find nothing.
+background event cases fail; on dev ef67cc3fa, with `touch=False` dropped from the follow-ups,
+arena pick and compaction summary writes, those three tests fail; with the PostgreSQL match
+back on the legacy array alone the three history searches on PostgreSQL find nothing.
 """
 
 from __future__ import annotations
 
+import json
+import time
 import uuid
 from typing import Iterator
 
 import httpx
 import pytest
 
+from harness import upstream as reply
 from harness.actors import create_user
+from harness.chat import ChatTurn, send_message
 from harness.instance import LaunchedInstance, launch
+from harness.upstream import MOCK_MODEL_ID
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
 
@@ -239,3 +248,132 @@ def test_postgres_search_still_finds_legacy_messages_and_nothing_of_other_accoun
         create_chat(other_client, {"title": "Untitled", "history": history_with(word)})
 
     assert search(postgres_client, word) == [legacy_id]
+
+
+# The writes below happen in the background of a live reply, so each is timed to land seconds
+# after the last write that may move the chat: a write that moves it shows as a later updated_at.
+LATE_BY = 2.5
+TASKS_CONFIG = ("/api/v1/tasks/config", "/api/v1/tasks/config/update")
+EVALUATION_CONFIG = ("/api/v1/evaluations/config", "/api/v1/evaluations/config")
+CHAT_CONFIG = ("/api/v1/chats/config", "/api/v1/chats/config")
+PUBLIC_READ = [{"principal_type": "user", "principal_id": "*", "permission": "read"}]
+
+
+def stored_chat(client: httpx.Client, chat_id: str) -> dict:
+    response = client.get(f"/api/v1/chats/{chat_id}")
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def wait_for_message(client: httpx.Client, turn: ChatTurn, ready, timeout: float = 30.0) -> dict:
+    """The chat once its reply satisfies `ready`."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        chat = stored_chat(client, turn.chat_id)
+        if ready(chat["chat"]["history"]["messages"].get(turn.assistant_message_id, {})):
+            return chat
+        time.sleep(0.1)
+    raise AssertionError(f"the reply never reached the awaited state within {timeout}s")
+
+
+def is_task_request(body: dict) -> bool:
+    return not body.get("stream")
+
+
+@pytest.fixture
+def follow_ups_on(admin, preserve):
+    preserve("tasks")
+    with admin.client() as client:
+        current = client.get(TASKS_CONFIG[0]).json()
+        updated = client.post(
+            TASKS_CONFIG[1], json={**current, "ENABLE_FOLLOW_UP_GENERATION": True}
+        )
+    assert updated.status_code == 200, updated.text
+
+
+def test_saving_follow_ups_keeps_the_chats_place(follow_ups_on, make_user, upstream):
+    suggestions = {"follow_ups": ["And tomorrow?"]}
+    upstream.queue(
+        reply.text("Sunny.", match=reply.answering("weather today")),
+        reply.text(json.dumps(suggestions), delay=LATE_BY, match=is_task_request),
+    )
+    with make_user().client() as client:
+        turn = send_message(
+            client, "weather today", background_tasks={"follow_up_generation": True}
+        )
+        answered = wait_for_message(client, turn, lambda message: message.get("done"))
+        with_follow_ups = wait_for_message(client, turn, lambda message: message.get("followUps"))
+
+    assert with_follow_ups["updated_at"] == answered["updated_at"], (
+        "saving the follow-up suggestions after the reply moved the chat up the sidebar"
+    )
+
+
+@pytest.fixture
+def arena_model(admin, preserve) -> Iterator[str]:
+    """A public arena model whose pool is the scripted model alone."""
+    preserve(EVALUATION_CONFIG)
+    arena_id = f"arena-{uuid.uuid4().hex[:8]}"
+    arena = {
+        "id": arena_id,
+        "name": f"Arena {arena_id}",
+        "meta": {"model_ids": [MOCK_MODEL_ID], "access_grants": PUBLIC_READ},
+    }
+    with admin.client() as client:
+        saved = client.post(
+            EVALUATION_CONFIG[1],
+            json={"ENABLE_EVALUATION_ARENA_MODELS": True, "EVALUATION_ARENA_MODELS": [arena]},
+        )
+        assert saved.status_code == 200, saved.text
+        client.get("/api/models", params={"refresh": "true"}).raise_for_status()
+    return arena_id
+
+
+def test_saving_the_arena_pick_keeps_the_chats_place(arena_model, make_user, upstream):
+    prompt = "pick a contender"
+    pieces = ["The ", "pick ", "is ", "made."]
+    upstream.queue(
+        reply.text(pieces, delay=LATE_BY, chunk_delay=1.0, match=reply.answering(prompt))
+    )
+    with make_user().client() as client:
+        turn = send_message(client, prompt, model=arena_model)
+        asked = wait_for_message(client, turn, lambda message: message)
+        picked = wait_for_message(client, turn, lambda message: message.get("selectedModelId"))
+
+    assert picked["chat"]["history"]["messages"][turn.assistant_message_id].get("done") is not True
+    assert picked["updated_at"] == asked["updated_at"], (
+        "saving which model the arena picked moved the chat up the sidebar mid-reply"
+    )
+
+
+@pytest.fixture
+def compaction_on(admin, preserve):
+    preserve(CHAT_CONFIG)
+    with admin.client() as client:
+        current = client.get(CHAT_CONFIG[0]).json()
+        updated = client.post(CHAT_CONFIG[1], json={**current, "ENABLE_CONTEXT_COMPACTION": True})
+    assert updated.status_code == 200, updated.text
+
+
+def test_compacting_a_chat_keeps_its_place(compaction_on, make_user, upstream):
+    question = {"id": "m1", "parentId": None, "childrenIds": ["m2"], "role": "user", "content": "q"}
+    answer = {"id": "m2", "parentId": "m1", "childrenIds": [], "role": "assistant", "content": "a"}
+    history = {"currentId": "m2", "messages": {"m1": question, "m2": answer}}
+    upstream.queue(reply.text("A SUMMARY", match=is_task_request))
+    with make_user().client() as client:
+        imported = client.post(
+            "/api/v1/chats/import",
+            json={
+                "chats": [{"chat": {"title": "Old", "history": history}, "updated_at": LONG_AGO}]
+            },
+        )
+        assert imported.status_code == 200, imported.text
+        chat_id = imported.json()[0]["id"]
+
+        compacted = client.post(f"/api/v1/chats/{chat_id}/compact", json={"model": MOCK_MODEL_ID})
+        stored = stored_chat(client, chat_id)
+
+    assert compacted.status_code == 200, compacted.text
+    assert compacted.json()["compacted"] is True, compacted.json()
+    assert stored["chat"]["history"]["messages"]["m2"]["contextSummary"] == "A SUMMARY"
+    assert stored["updated_at"] == LONG_AGO, "compacting the chat moved it up the sidebar"

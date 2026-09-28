@@ -5,13 +5,16 @@ Fixed in open-webui 0.11.3 by `9962d122c` (`ModelsConfigForm.MODEL_ORDER_LIST`,
 (`PromptForm.access_grants`, `ToolForm.access_grants`) and `873fb741c` (`PromptForm.tags`). Each
 field was written `list[X | None] = None`, a list whose elements may be null, when it meant
 `list[X] | None = None`. So a form sending `null` got a 422 and one sending `[null]` got through
-to code that expects real elements.
+to code that expects real elements. `MessageStats.tags` (`8ed548769`) had the same shape on the
+way out: the chat stats export builds one per message with the annotation's tags, `None` when a
+message has none, and silently dropped every such message.
 
 Twin of unit/models/test_optional_list_annotations.py, which keeps the module-wide annotation sweep.
 
 Discriminates: passes on upstream dev `bbfa876af`; with each annotation back on `list[X | None]`
 every `test_null_is_accepted` and `test_a_null_element_is_refused` case and both config tests
-fail, while the real-list and still-required tests pass.
+fail, while the real-list and still-required tests pass. On dev ef67cc3fa, `MessageStats.tags`
+back on `list[str | None] = None` fails the stats export test (both messages dropped).
 """
 
 from __future__ import annotations
@@ -168,3 +171,42 @@ def test_web_search_domain_filter_accepts_null_and_refuses_a_null_element(admin_
         json={"web": {**web, "WEB_SEARCH_DOMAIN_FILTER_LIST": [None]}},
     )
     assert _refused_element(refused) == [["WEB_SEARCH_DOMAIN_FILTER_LIST", 0]]
+
+
+# --- MessageStats.tags: a message without annotation tags is still counted in its chat's stats
+
+
+def _stats_message(message_id: str, parent_id: str | None, role: str, **extra) -> dict:
+    return {
+        "id": message_id,
+        "parentId": parent_id,
+        "childrenIds": [],
+        "role": role,
+        "content": f"{role} message",
+        "timestamp": 1_700_000_000,
+        **extra,
+    }
+
+
+def test_the_stats_export_keeps_messages_without_annotation_tags(admin_client):
+    question = _stats_message("question", None, "user")
+    answer = _stats_message("answer", "question", "assistant", annotation={"rating": 1})
+    question["childrenIds"] = ["answer"]
+    chat = {"title": "Stats", "history": {"currentId": "answer", "messages": {}}}
+    chat["history"]["messages"] = {"question": question, "answer": answer}
+    created = admin_client.post("/api/v1/chats/new", json={"chat": chat})
+    assert created.status_code == 200, created.text
+    chat_id = created.json()["id"]
+    try:
+        exported = admin_client.get(f"/api/v1/chats/stats/export/{chat_id}")
+    finally:
+        admin_client.delete(f"/api/v1/chats/{chat_id}")
+
+    assert exported.status_code == 200, exported.text
+    messages = exported.json()["chat"]["history"]["messages"]
+    assert sorted(messages) == ["answer", "question"], (
+        "a message with no annotation tags was dropped from the chat's stats: its null tags were "
+        f"refused (MessageStats.tags): {sorted(messages)}"
+    )
+    assert messages["answer"]["rating"] == 1
+    assert messages["answer"]["tags"] is None

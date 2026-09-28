@@ -14,13 +14,22 @@
   refuses a non-admin whose base model has no workspace row, so only admins got the fallback.
 * `eadce55e34` (#28952, #28923): a workspace model whose `base_model_id` is its own id was stored
   as such on create, update and import, and then dropped while models were combined.
+* `16f118d77a`: the check that a named Ollama backend serves the model returned early under
+  `BYPASS_MODEL_ACCESS_CONTROL`, so a user could aim a request at any backend. Two Ollama
+  stand-ins, the model on the first only, on an instance booted with the bypass.
+* `9cf1a0796` (#27595): native Anthropic requests to api.anthropic.com were signed with a bearer
+  token, which Anthropic rejects; they now carry `x-api-key` and `anthropic-version`. The check
+  matches the host name anywhere in the connection URL, so a listener path of that name stands in.
 
-Twin of unit/models/test_model_registry.py. Its per-connection listing tests (`16f118d77a`) are
-already pinned by integration/security/test_connection_listing_roles.py.
+Twin of unit/models/test_model_registry.py, which keeps the sweep for model pool merges. Its
+per-connection listing tests (`16f118d77a`) are already pinned by
+integration/security/test_connection_listing_roles.py.
 
 Discriminates: passes on dev `bbfa876af`; each narrow test fails with its fix reverted (the alias
 removal, the sync update, the prefix strip, the passthrough timeout, the fallback ordering and
-the three self-reference guards, one mutation each). Two tests fail on dev until their fixes
+the three self-reference guards, one mutation each). On dev ef67cc3fa, restoring the bypass early
+return fails all four backend cases and dropping the api.anthropic.com header rewrite fails the
+Anthropic key test. Two tests fail on dev until their fixes
 merge: the fallback on the web client path (#31345, PR #31353) and a re-sync on the default
 SQLite setup (#31346, PR #31349).
 """
@@ -35,7 +44,8 @@ import pytest
 from harness import upstream as reply
 from harness.actors import admin_of, create_user
 from harness.chat import ask
-from harness.listener import json_answer
+from harness.listener import json_answer, listening
+from harness.ollama_provider import serve_ollama
 from harness.second_provider import OPENAI_CONFIG, attach
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
@@ -349,3 +359,144 @@ def test_syncing_a_model_that_already_exists_updates_it_by_default(fallback_inst
     answered, stored = _sync_twice(fallback_instance)
 
     assert stored["name"] == "Renamed on the second sync", answered
+
+
+# --- 16f118d77a: a named Ollama backend is checked when model access control is bypassed --
+
+BYPASS_ENV = {"BYPASS_MODEL_ACCESS_CONTROL": "true"}
+SERVED_MODEL = "llama3:latest"
+BACKEND_ROUTES = {
+    "chat": ("/ollama/api/chat", {"messages": [{"role": "user", "content": "hi"}]}),
+    "generate": ("/ollama/api/generate", {"prompt": "hi"}),
+    "embed": ("/ollama/api/embed", {"input": "hi"}),
+    "embeddings": ("/ollama/api/embeddings", {"prompt": "hi"}),
+}
+
+
+@pytest.fixture(scope="module")
+def two_ollama_backends(instance_with):
+    """An instance bypassing model access control, `SERVED_MODEL` on its first backend only."""
+    bypassing = instance_with(BYPASS_ENV)
+    with listening() as serving_listener, listening() as other_listener:
+        serving = serve_ollama(serving_listener, SERVED_MODEL)
+        other = serve_ollama(other_listener, "other:latest")
+        with admin_of(bypassing).client() as client:
+            current = client.get(OLLAMA_CONFIG[0]).json()
+            both = {
+                **current,
+                "ENABLE_OLLAMA_API": True,
+                "OLLAMA_BASE_URLS": [serving_listener.base_url, other_listener.base_url],
+                "OLLAMA_API_CONFIGS": {},
+            }
+            client.post(OLLAMA_CONFIG[1], json=both).raise_for_status()
+            client.get("/api/models", params={"refresh": "true"}).raise_for_status()
+        yield bypassing, serving, other
+
+
+def _ollama_call(actor, route: str, backend: int | None) -> int:
+    path, body = BACKEND_ROUTES[route]
+    target = path if backend is None else f"{path}/{backend}"
+    with actor.client() as client:
+        answered = client.post(target, json={"model": SERVED_MODEL, "stream": False, **body})
+    return answered.status_code
+
+
+def _calls_to(server) -> int:
+    return len([request for request in server.listener.received if request.method == "POST"])
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("route", BACKEND_ROUTES)
+def test_a_user_cannot_aim_a_model_at_a_backend_that_does_not_serve_it(two_ollama_backends, route):
+    bypassing, _serving, other = two_ollama_backends
+    calls_before = _calls_to(other)
+
+    status = _ollama_call(create_user(bypassing), route, backend=1)
+
+    assert status == 403, (
+        "BYPASS_MODEL_ACCESS_CONTROL waives per-model permissions, not the check that the named "
+        f"backend serves the model; a user reached another backend (HTTP {status})"
+    )
+    assert _calls_to(other) == calls_before, "the request was forwarded to the other backend"
+
+
+@pytest.mark.slow
+def test_the_backend_that_serves_the_model_can_be_named(two_ollama_backends):
+    bypassing, serving, _other = two_ollama_backends
+    calls_before = _calls_to(serving)
+
+    assert _ollama_call(create_user(bypassing), "generate", backend=0) == 200
+    assert _calls_to(serving) == calls_before + 1
+
+
+@pytest.mark.slow
+def test_without_a_named_backend_the_serving_one_is_used(two_ollama_backends):
+    bypassing, serving, other = two_ollama_backends
+    calls_before = (_calls_to(serving), _calls_to(other))
+
+    assert _ollama_call(create_user(bypassing), "generate", backend=None) == 200
+    assert (_calls_to(serving), _calls_to(other)) == (calls_before[0] + 1, calls_before[1])
+
+
+@pytest.mark.slow
+def test_an_admin_may_still_name_any_backend(two_ollama_backends):
+    bypassing, _serving, other = two_ollama_backends
+    calls_before = _calls_to(other)
+
+    _ollama_call(admin_of(bypassing), "generate", backend=1)
+
+    assert _calls_to(other) == calls_before + 1
+
+
+# --- 9cf1a0796: api.anthropic.com gets x-api-key and anthropic-version, not a bearer token -
+
+# the check matches the host name anywhere in the URL, so a local path of that name stands in
+ANTHROPIC_PATH = "/api.anthropic.com/v1"
+CLAUDE_MODEL = "claude-sonnet-4"
+
+
+@pytest.fixture
+def anthropic_connection(preserve, admin, listener):
+    """The listener added as an OpenAI connection whose URL names api.anthropic.com."""
+    preserve(OPENAI_CONFIG)
+    models = {"data": [{"id": CLAUDE_MODEL, "type": "model"}], "has_more": False}
+    listener.route("GET", f"{ANTHROPIC_PATH}/models", json_answer(models))
+    message = {"id": "msg_1", "type": "message", "role": "assistant", "content": []}
+    listener.route("POST", f"{ANTHROPIC_PATH}/messages", json_answer(message))
+    with admin.client() as client:
+        connections = client.get(OPENAI_CONFIG[0]).json()
+        index = str(len(connections["OPENAI_API_BASE_URLS"]))
+        updated = {
+            **connections,
+            "OPENAI_API_BASE_URLS": [
+                *connections["OPENAI_API_BASE_URLS"],
+                f"{listener.base_url}{ANTHROPIC_PATH}",
+            ],
+            "OPENAI_API_KEYS": [*connections["OPENAI_API_KEYS"], "sk-ant"],
+            "OPENAI_API_CONFIGS": {**connections["OPENAI_API_CONFIGS"], index: {"enable": True}},
+        }
+        client.post(OPENAI_CONFIG[1], json=updated).raise_for_status()
+        listed = client.get("/api/models", params={"refresh": "true"}).json()["data"]
+    assert CLAUDE_MODEL in [model["id"] for model in listed], listed
+    return listener
+
+
+def test_a_native_anthropic_request_carries_the_key_anthropic_expects(admin, anthropic_connection):
+    with admin.client() as client:
+        answered = client.post(
+            "/api/v1/messages",
+            json={
+                "model": CLAUDE_MODEL,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert answered.status_code == 200, answered.text
+    [sent] = anthropic_connection.requests_to(f"{ANTHROPIC_PATH}/messages")
+    headers = {name.lower(): value for name, value in sent.headers.items()}
+    assert headers.get("x-api-key") == "sk-ant", (
+        f"Anthropic's native endpoint was not sent its key as x-api-key (#27595): {headers}"
+    )
+    assert "authorization" not in headers, "Anthropic's native endpoint rejects a bearer token"
+    assert headers.get("anthropic-version")

@@ -1,10 +1,10 @@
 """An OpenAI-shaped model provider that records every request and answers from a script.
 
 `reset(mode)` sets the fallback every reply uses (`ok`, `stream` or `error`). `queue(...)` lines
-up scripted replies (text, reasoning, tool calls, usage, an HTTP error, a slow stream) that the
-next chat completions consume in order; a reply with `match` only answers a request it accepts,
-so a title or follow-up task cannot eat the reply meant for the chat. `requests` holds what
-Open WebUI actually sent, which is how a test sees the payload it built.
+up scripted replies (text, reasoning, tool calls, usage, an HTTP error, a slow stream, a late
+start) that the next chat completions consume in order; a reply with `match` only answers a
+request it accepts, so a title or follow-up task cannot eat the reply meant for the chat.
+`requests` holds what Open WebUI actually sent, which is how a test sees the payload it built.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ class Reply:
     status: int = 200
     error_message: str = "upstream failed"
     chunk_delay: float = 0.0
+    delay: float = 0.0  # seconds before the reply starts, headers included
     match: Callable[[dict], bool] | None = None
 
 
@@ -178,6 +179,7 @@ def _handler(upstream: MockUpstream):
                 self._answer(reply, bool((body or {}).get("stream")))
 
         def _answer(self, reply: Reply, stream: bool) -> None:
+            time.sleep(reply.delay)
             if reply.status != 200:
                 self._send_json(reply.status, {"error": {"message": reply.error_message}})
             elif stream:

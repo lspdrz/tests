@@ -3,10 +3,11 @@
 `f1ded94` / `a9617ca` (open-webui 0.11.0): suggestions, the chosen model and the compaction
 summary were saved through the chat upsert, which always bumped `Chat.updated_at`, so the sidebar
 re-sorted in the middle of a reply. The upsert now takes `touch`, and every background write
-passes `touch=False`. The socket event writes (sources, files, embeds) are pinned over HTTP by
-integration/models/test_chat_search_and_folder_paging.py, with the folder paging and PostgreSQL
-search fixes of the same release; the writes below only happen deep inside a live reply, so
-their call sites are audited here.
+passes `touch=False`. The socket event writes (sources, files, embeds) and today's follow-ups,
+arena pick and compaction summary writes are pinned over HTTP by
+integration/models/test_chat_search_and_folder_paging.py. This sweep holds every chat upsert in
+those modules that writes one of the background fields to `touch=False`, including a call site
+added later, which no request can find.
 
 Discriminates: passes on upstream dev `bbfa876af`; with `touch=False` removed from the
 `followUps` write in `utils/middleware.py` its case fails.

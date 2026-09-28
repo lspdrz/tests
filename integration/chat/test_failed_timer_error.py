@@ -10,8 +10,13 @@ and is marked done.
 The model sets a real timer through the `timer` tool (behind ENABLE_SUBAGENTS). The chat runs on
 a preset that is deleted before the timer fires.
 
+Also pins the older `f5a5a434b` (#27785, issue #27783), which caught the completion's error in
+the scheduler at all. Twin of unit/models/test_automations_and_calendar.py.
+
 Discriminates: passes on dev efe63bd34; with b0650d04b reverted in a backend copy the narrow test
-fails (the timer's reply stays empty and not done). The nearby test passes on both.
+fails (the timer's reply stays empty and not done). On dev ef67cc3fa, with the try/except around
+the timer's completion removed, the error escapes the scheduler task and the narrow test fails
+the same way. The nearby test passes on both.
 """
 
 from __future__ import annotations

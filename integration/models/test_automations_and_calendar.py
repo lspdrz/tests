@@ -13,16 +13,23 @@
   default) escapes non-ASCII while orjson (`ENABLE_ORJSON`) writes it raw. Automation search
   matched only the raw spelling and model tag search only the escaped one, so each found
   nothing under one of the two codecs (`189c14fc4`, #28399).
+* Forking a waiting timer chat copied its `meta`, and the scheduler claimed timers by `meta`,
+  so the fork was a second claim target and the timer fired twice. Timers now hang off the
+  `chat.timer_at` column, which a fork does not carry (`16c2a9eda`, #27663, issues
+  #27622/#27745). The model sets a real timer through the `timer` tool (behind
+  ENABLE_SUBAGENTS); no endpoint lists the internal timer chat, so its id is read from the
+  instance's database, and the owner forks it over the API.
 
-The timer and fork fixes in the same unit file stay there: their state lives on internal
-chats that no endpoint lists.
+The timer whose chat completion raised (`f5a5a434b`, #27785) is pinned by
+integration/chat/test_failed_timer_error.py: the reply it leaves carries the error.
 
 Twin of unit/models/test_automations_and_calendar.py.
 
 Discriminates: passes on dev bbfa876af; fails with each fix reverted (the expansion back on the
 server's clock, the COUNT check removed, `alert_minutes` compared unchecked, the single-spelling
 searches restored): occurrences move by the zone gap, a COUNT rule without DTSTART is stored, no
-reminder is sent while a text window exists, and a CJK prompt or tag is missed under one codec.
+reminder is sent while a text window exists, and a CJK prompt or tag is missed under one codec. On
+dev ef67cc3fa, claiming timers by `meta.timer_at` again fires the forked timer a second time.
 """
 
 from __future__ import annotations
@@ -35,7 +42,9 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+import sqlalchemy
 
+from harness import upstream as reply
 from harness.actors import create_user
 from harness.calendar_api import (
     DAY_NS,
@@ -46,6 +55,7 @@ from harness.calendar_api import (
     set_timezone,
     to_ns,
 )
+from harness.chat import ask
 
 pytestmark = [
     pytest.mark.regression,
@@ -384,3 +394,81 @@ def test_an_ascii_tag_still_matches_whole_tags_case_insensitively(any_codec_admi
 
     assert model_id in found
     assert model_id not in unrelated
+
+
+# ---------------------------------------------------------------- narrow: a forked timer chat
+
+SUBAGENTS = ("/api/v1/configs/subagents", "/api/v1/configs/subagents")
+TIMER_PROMPT = "The bread is out of the oven."
+
+
+@pytest.fixture
+def timers_enabled(preserve, admin):
+    preserve(SUBAGENTS)
+    with admin.client() as client:
+        current = client.get(SUBAGENTS[0]).json()
+        client.post(SUBAGENTS[1], json={**current, "ENABLE_SUBAGENTS": True}).raise_for_status()
+
+
+def _set_timer(client: httpx.Client, upstream, at: str) -> None:
+    upstream.queue(reply.tool_call("timer", {"prompt": TIMER_PROMPT, "at": at}), reply.text("Set."))
+    _turn, message = ask(client, "tell me when the bread is done")
+    assert message["content"].endswith("Set."), message
+
+
+def _pending_timer_ids(instance, owner_id: str) -> list[str]:
+    """The owner's waiting timer chats: no endpoint lists these internal chats."""
+    engine = sqlalchemy.create_engine(instance.database_url)
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(
+                sqlalchemy.text(
+                    "SELECT id FROM chat WHERE user_id = :owner AND timer_at IS NOT NULL"
+                ),
+                {"owner": owner_id},
+            )
+            return [row[0] for row in rows]
+    finally:
+        engine.dispose()
+
+
+def _timer_prompts_sent(upstream) -> int:
+    last_messages = [request["messages"][-1] for request in upstream.chat_requests()]
+    return sum(TIMER_PROMPT in str(message.get("content")) for message in last_messages)
+
+
+def _wait_for_timer_prompts(upstream, count: int, within: float) -> int:
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline and _timer_prompts_sent(upstream) < count:
+        time.sleep(0.2)
+    return _timer_prompts_sent(upstream)
+
+
+def test_a_forked_timer_chat_does_not_fire_a_second_time(
+    timers_enabled, instance, make_user, upstream
+):
+    owner = make_user()
+    with owner.client() as client:
+        _set_timer(client, upstream, at="4s")
+        [timer_id] = _pending_timer_ids(instance, owner.id)
+        forked = client.post(f"/api/v1/chats/{timer_id}/fork")
+        assert forked.status_code == 200, forked.text
+
+    assert _wait_for_timer_prompts(upstream, 1, within=20) == 1, "the timer never fired"
+    # polled every second, so a second claim would fire within a few seconds
+    assert _wait_for_timer_prompts(upstream, 2, within=5) == 1, (
+        "the fork of a waiting timer chat was claimed as a second timer and fired again "
+        "(#27622, #27745)"
+    )
+
+
+# ---------------------------------------------------------------- nearby
+
+
+def test_a_timer_not_yet_due_does_not_fire(timers_enabled, instance, make_user, upstream):
+    owner = make_user()
+    with owner.client() as client:
+        _set_timer(client, upstream, at="1h")
+
+    assert _pending_timer_ids(instance, owner.id), "the timer was not stored as waiting"
+    assert _wait_for_timer_prompts(upstream, 1, within=4) == 0, "a timer fired an hour early"
