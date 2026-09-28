@@ -8,11 +8,12 @@ anything. A repeated version silently drops one release from the "What's New" di
 anything around the brackets ends up in the version key.
 
 The headings are found the way env.py finds them (h2 elements of the rendered markdown, so a
-setext heading counts and a fenced one does not), and the dict env.py built on import is
-compared against them.
+setext heading counts and a fenced one does not). This sweeps every heading of the file: the
+integration and browser twins (integration/config/test_changelog_boot_parse.py) see only the
+five newest, which is all /api/changelog serves.
 
-Discriminates: passes on bbfa876af; a heading without its date fails the shape test and the
-import, and a repeated or decorated version fails the duplicate, version and parsed-release tests.
+Discriminates: passes on bbfa876af; a heading without its date fails the shape test, and a
+repeated or decorated version fails the duplicate and version tests.
 """
 
 from __future__ import annotations
@@ -68,11 +69,3 @@ def test_no_version_is_released_twice(release_headings):
     versions = [_version(heading) for heading in release_headings]
     repeated = sorted({version for version in versions if versions.count(version) > 1})
     assert not repeated, f"versions with more than one heading, one of them dropped: {repeated}"
-
-
-def test_env_parsed_every_release(owui_module, release_headings):
-    """The dict the "What's New" dialog renders holds one dated entry per release heading."""
-    parsed = owui_module("open_webui.env").CHANGELOG
-
-    assert list(parsed) == [_version(heading) for heading in release_headings]
-    assert all(entry.get("date") for entry in parsed.values())
