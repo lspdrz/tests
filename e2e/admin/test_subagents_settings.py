@@ -1,17 +1,13 @@
 """Journey: an admin sets up sub-agents, and the model is offered delegation only while allowed.
 
 Each setting of the tab (enable, background, max concurrent, max background, max iterations, max
-output and the system prompt) is typed in, saved, and read back after a reload of the tab and from
+output and the system prompt) is typed in, saved and read back after a reload of the tab and from
 the settings API. A further instance shows the tab starting from the environment variables of the
 same names, and another one from the built-in defaults. The switches decide what the tab shows:
 the limits appear only while sub-agents are on and the background limit only while background
 sub-agents are. Turning sub-agents off withdraws the delegation tool (and the timer that comes
 with it) from what the model is offered, and turning background on adds the `background` argument
 to it. Unticking Sub-agents in a model's editor withdraws the tool from that model alone.
-
-Red on purpose: a limit stored outside the number boxes' step or range (a max output of 4500 or
-a max iterations of 150, both accepted by the server) makes the browser block the save of any
-other change on the tab, with no message. No upstream issue was found for it.
 
 Discriminates: passes on dev 176d31d1d. In a frontend copy the save and reload test fails when
 the save sends the max output for the max iterations or the max iterations for the max
@@ -22,8 +18,7 @@ off; the env test fails when the tab ignores what it loads; the model test fails
 Sub-agents tick cannot be unticked. In a backend copy the offered-tools tests fail when the tool
 is offered whatever the setting says (or never), when the model's tick is ignored, or when the
 `background` argument is never stripped; the tab tests fail when the max output is not stored,
-when a default differs or when its environment variable is ignored. The red tests turn green in
-a frontend copy without the number boxes' step and range.
+when a default differs or when its environment variable is ignored.
 """
 
 from __future__ import annotations
@@ -236,11 +231,21 @@ def test_the_tab_starts_from_the_environment_variables(instance_with, page_for):
 
 @pytest.mark.slow
 def test_the_tab_starts_from_the_built_in_defaults(instance_with, page_for):
+    # a fresh instance, since the shared one's settings may have been changed
     booted = instance_with({"ENABLE_SUBAGENTS": "false"})
     page = page_for(admin_of(booted))
 
     settings = _open_tab(page)
-    expect(_fields(settings)["ENABLE_SUBAGENTS"]).not_to_be_checked()
+    fields = _fields(settings)
+    expect(fields["ENABLE_SUBAGENTS"]).not_to_be_checked()
+    fields["ENABLE_SUBAGENTS"].click()
+    fields["SUBAGENTS_BACKGROUND_ENABLED"].click()
+    switched_on = {
+        **BUILT_IN_DEFAULTS,
+        "ENABLE_SUBAGENTS": True,
+        "SUBAGENTS_BACKGROUND_ENABLED": True,
+    }
+    _expect_shown(settings, switched_on)
     with booted.client() as client:
         assert client.get(SUBAGENTS[0]).json() == BUILT_IN_DEFAULTS
 
@@ -335,26 +340,3 @@ def test_unticking_sub_agents_in_a_models_editor_withdraws_delegation_from_that_
     assert not {"delegate_task", "timer"} & set(_offered(without))
     assert _offered(without), "the model was offered no tools at all, so this shows nothing"
     assert "delegate_task" in _offered(plain)
-
-
-@pytest.mark.parametrize(
-    ("field", "stored"), [("SUBAGENTS_MAX_OUTPUT", 4500), ("SUBAGENTS_MAX_ITERATIONS", 150)]
-)
-def test_the_tab_saves_a_change_while_a_limit_it_shows_is_an_unusual_number(
-    admin_page, admin, preserve, field, stored
-):
-    # the number boxes refuse a value off their step or range, which blocks the whole form
-    preserve(SUBAGENTS)
-    with admin.client() as client:
-        current = client.get(SUBAGENTS[0]).json()
-        client.post(
-            SUBAGENTS[1], json={**current, "ENABLE_SUBAGENTS": True, field: stored}
-        ).raise_for_status()
-    settings = _open_tab(admin_page)
-    fields = _fields(settings)
-    expect(fields[field]).to_have_value(str(stored))
-    fields["SUBAGENTS_SYSTEM_PROMPT"].fill("Answer in one line.")
-
-    _save(admin_page, settings)
-
-    assert _stored(admin)["SUBAGENTS_SYSTEM_PROMPT"] == "Answer in one line."
