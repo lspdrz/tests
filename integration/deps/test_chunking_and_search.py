@@ -5,13 +5,18 @@ langchain-text-splitters splitter chosen by the admin's `TEXT_SPLITTER`: the rec
 splitter (""), the tiktoken-measured `TokenTextSplitter` ("token") and, before either, the
 `MarkdownHeaderTextSplitter` when `ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER` is on. With
 `ENABLE_RAG_HYBRID_SEARCH`, `/api/v1/retrieval/query/doc` ranks the chunks with rank_bm25's
-`BM25Okapi` inside langchain-classic's ensemble and compression retrievers. A bump that breaks a
-splitter leaves a file as one chunk; one that breaks BM25 fails or misranks the query. The
-provider embeds every text as the same vector, so only the keyword ranking can pick a chunk.
+`BM25Okapi` inside langchain-classic's ensemble and compression retrievers: the ensemble fuses the
+keyword and the vector retriever (a langchain-core retriever answering asynchronously) and drops
+a chunk both found twice, and the compressor scores what is left against the query's embedding.
+A bump that breaks a splitter leaves a file as one chunk; one that breaks BM25 fails or misranks
+the query. The provider embeds every text as the same vector, so only the keyword ranking can
+pick a chunk, and every chunk scores a cosine of 1 against the query.
 
 Discriminates: passes on dev bbfa876af. A backend copy without the character splitter's
 `split_documents` fails only the character test; one without the token splitter's
-`split_documents`, the markdown `split_text` and `BM25Okapi` fails only the other four.
+`split_documents`, the markdown `split_text` and `BM25Okapi` fails only the other four. On dev
+ef67cc3fa, an ensemble that keeps both copies of a chunk (patched in at import) fails the fusion
+test, and so does a compressor that keeps no score.
 """
 
 from __future__ import annotations
@@ -162,3 +167,35 @@ def test_bm25_finds_the_one_chunk_with_the_term(retrieval_settings, make_user, t
         best = _query(client, file_id, term, k=1, k_reranker=1, hybrid_bm25_weight=1)
 
     assert len(best) == 1 and term in best[0], best
+
+
+def test_the_ensemble_fuses_both_retrievers_once_per_chunk(retrieval_settings, make_user):
+    retrieval_settings(
+        ENABLE_RAG_HYBRID_SEARCH=True,
+        TEXT_SPLITTER="",
+        ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER=False,
+        CHUNK_SIZE=120,
+        CHUNK_OVERLAP=0,
+    )
+    paragraphs = list(PARAGRAPHS)
+    paragraphs[7] += " zephyrquartz"
+    with make_user().client() as client:
+        file_id = _upload(client, "log.txt", "\n\n".join(paragraphs))
+        stored = len(_all_chunks(client, file_id))
+        answered = client.post(
+            "/api/v1/retrieval/query/doc",
+            json={
+                "collection_name": f"file-{file_id}",
+                "query": "zephyrquartz",
+                "k": stored,
+                "k_reranker": stored,
+                "hybrid_bm25_weight": 0.5,
+            },
+        )
+
+    assert answered.status_code == 200, answered.text
+    [documents], [distances] = answered.json()["documents"], answered.json()["distances"]
+    # both retrievers return every chunk; fused, each comes back once
+    assert len(documents) == len(set(documents)) == stored, documents
+    assert any("zephyrquartz" in document for document in documents)
+    assert distances == pytest.approx([1.0] * stored), distances

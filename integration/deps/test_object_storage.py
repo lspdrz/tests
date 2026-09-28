@@ -1,4 +1,4 @@
-"""Dependency smoke: uploads kept in S3 through boto3 and in Azure Blob Storage through its SDK.
+"""Dependency smoke: uploads kept in S3, Azure Blob Storage and Google Cloud Storage via their SDKs.
 
 With `STORAGE_PROVIDER=s3` every upload is written to the bucket by boto3's `upload_file`, tagged
 with its owner when `S3_ENABLE_TAGGING` is on, read back with `download_fileobj` whenever the file
@@ -8,26 +8,44 @@ key, azure-storage-blob does the same with `upload_blob`, `download_blob`, `dele
 `list_blobs`. Without the key the blob client signs in with azure-identity's
 `DefaultAzureCredential`, here through an App Service managed identity played by a `listener`;
 the SDK only sends such a token over TLS, so that container is served with a certificate of its
-own. Both services are local fakes (`harness.object_storage`) that keep the objects, so a test
-reads what reached the store and changes it behind the instance's back to show a download comes
-from there.
+own. With `STORAGE_PROVIDER=gcs` google-cloud-storage uploads with `upload_from_filename`, finds
+the object with `get_blob` to `download_to_filename` it or `delete` it, and deletes every object
+`list_blobs` names. Without `GOOGLE_APPLICATION_CREDENTIALS_JSON` it goes anonymous against the
+emulator host; with it, `Client.from_service_account_info` signs a JWT with the account's key,
+trades it at the account's token endpoint and sends the token it got. The services are local
+fakes (`harness.object_storage`) that keep the objects, so a test reads what reached the store
+and changes it behind the instance's back to show a download comes from there.
 
 Discriminates: passes on dev ef67cc3fa; in a backend copy whose S3 provider skips `upload_file`,
 downloads the key into nothing, skips `delete_object` or deletes every key of the bucket, the
 upload, download, delete and delete-all S3 tests fail in turn, and the same four edits to the
-Azure provider (`upload_blob`, `download_blob`, `delete_blob`, `list_blobs`) fail the Azure four;
-building the keyless client with an anonymous credential fails the managed identity test.
+Azure provider (`upload_blob`, `download_blob`, `delete_blob`, `list_blobs`) fail the Azure four
+and to the GCS provider (`upload_from_filename`, `download_to_filename`, `blob.delete`,
+`list_blobs`) the GCS four; building the keyless Azure client with an anonymous credential fails
+the managed identity test, and a GCS client built with `storage.Client()` in place of
+`from_service_account_info` fails the service account test.
 """
 
 from __future__ import annotations
 
 import httpx
+import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from harness.actors import Actor, admin_of, create_user
 from harness.instance import LaunchedInstance
 from harness.listener import json_answer, listening
-from harness.object_storage import azure_blob_env, s3_env, serving_azure_blob, serving_s3
+from harness.object_storage import (
+    GCS_ACCESS_TOKEN,
+    azure_blob_env,
+    gcs_env,
+    s3_env,
+    serving_azure_blob,
+    serving_gcs,
+    serving_s3,
+)
 
 pytestmark = [pytest.mark.depcheck, pytest.mark.api, pytest.mark.requires_source, pytest.mark.slow]
 
@@ -36,6 +54,11 @@ KEY_PREFIX = "open-webui"
 CONTAINER = "owui-uploads"
 TEXT = "The harbour lighthouse keeps its logbook in the cloud."
 STORAGE_TOKEN = "managed-identity-storage-token"
+GCS_BUCKET = "owui-uploads"
+SERVICE_ACCOUNT_EMAIL = "open-webui@harbour-project.iam.gserviceaccount.com"
+# google-auth names Google's token endpoint as the audience whatever `token_uri` says
+GOOGLE_TOKEN_AUDIENCE = "https://oauth2.googleapis.com/token"
+SERVICE_ACCOUNT_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
 @pytest.fixture(scope="module")
@@ -69,6 +92,18 @@ def managed_identity():
         yield endpoint
 
 
+@pytest.fixture(scope="module")
+def gcs():
+    with serving_gcs() as fake:
+        yield fake
+
+
+@pytest.fixture(scope="module")
+def gcs_with_token_endpoint():
+    with serving_gcs(token_endpoint=True) as fake:
+        yield fake
+
+
 @pytest.fixture
 def on_s3(instance_with, s3) -> LaunchedInstance:
     return instance_with(s3_env(s3, BUCKET, S3_KEY_PREFIX=KEY_PREFIX, S3_ENABLE_TAGGING="true"))
@@ -88,6 +123,36 @@ def on_azure_identity(instance_with, azure_over_tls, managed_identity) -> Launch
             "IDENTITY_HEADER": "managed-identity-secret",
         }
     )
+
+
+@pytest.fixture
+def on_gcs(instance_with, gcs) -> LaunchedInstance:
+    return instance_with(gcs_env(gcs, GCS_BUCKET))
+
+
+def _service_account(token_uri: str) -> dict:
+    """A service account's JSON key, the way the Google Cloud console downloads it."""
+    private_key = SERVICE_ACCOUNT_KEY.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    return {
+        "type": "service_account",
+        "project_id": "harbour-project",
+        "private_key_id": "harbour-key-1",
+        "private_key": private_key.decode(),
+        "client_email": SERVICE_ACCOUNT_EMAIL,
+        "client_id": "104",
+        "token_uri": token_uri,
+    }
+
+
+@pytest.fixture
+def on_gcs_service_account(instance_with, gcs_with_token_endpoint) -> LaunchedInstance:
+    fake = gcs_with_token_endpoint
+    account = _service_account(f"{fake.base_url}/token")
+    return instance_with(gcs_env(fake, GCS_BUCKET, credentials=account))
 
 
 def _upload(account: Actor, filename: str, text: str = TEXT) -> str:
@@ -227,3 +292,73 @@ def test_without_a_key_the_container_is_reached_with_the_managed_identity(
     assert set(azure_over_tls.authorizations) == {f"Bearer {STORAGE_TOKEN}"}
     asked = managed_identity.requests_to("/msi/token")[-1]
     assert "resource=https://storage.azure.com" in asked.path
+
+
+# ---------------------------------------------------------------- Google Cloud Storage
+
+
+def test_an_upload_is_stored_in_the_gcs_bucket(on_gcs, gcs):
+    owner = create_user(on_gcs)
+    file_id = _upload(owner, "logbook.txt")
+    name = f"{file_id}_logbook.txt"
+
+    assert name in gcs.keys(GCS_BUCKET), gcs.keys(GCS_BUCKET)
+    assert gcs.objects[GCS_BUCKET][name] == TEXT.encode()
+    assert _extracted_text(owner, file_id) == TEXT
+
+
+def test_a_download_is_read_from_the_gcs_bucket(on_gcs, gcs):
+    owner = create_user(on_gcs)
+    file_id = _upload(owner, "tides.txt")
+    gcs.objects[GCS_BUCKET][f"{file_id}_tides.txt"] = b"changed in the bucket"
+
+    downloaded = _download(owner, file_id)
+
+    assert downloaded.status_code == 200, downloaded.text
+    assert downloaded.content == b"changed in the bucket"
+
+
+def test_a_deleted_file_leaves_the_gcs_bucket(on_gcs, gcs):
+    owner = create_user(on_gcs)
+    file_id = _upload(owner, "ferries.txt")
+    name = f"{file_id}_ferries.txt"
+    assert name in gcs.keys(GCS_BUCKET)
+
+    _delete(owner, file_id)
+
+    assert name not in gcs.keys(GCS_BUCKET)
+
+
+def test_deleting_every_file_empties_the_gcs_bucket(on_gcs, gcs):
+    _upload(create_user(on_gcs), "weather.txt")
+    assert gcs.keys(GCS_BUCKET)
+
+    _delete_every_file(on_gcs)
+
+    assert gcs.keys(GCS_BUCKET) == []
+
+
+def test_with_a_service_account_the_bucket_is_reached_with_its_token(
+    on_gcs_service_account, gcs_with_token_endpoint
+):
+    fake = gcs_with_token_endpoint
+    owner = create_user(on_gcs_service_account)
+    file_id = _upload(owner, "logbook.txt")
+
+    assert fake.objects[GCS_BUCKET][f"{file_id}_logbook.txt"] == TEXT.encode()
+    assert _download(owner, file_id).content == TEXT.encode()
+    storage_calls = [
+        authorization
+        for (_, path), authorization in zip(fake.requests, fake.authorizations)
+        if path != "/token"
+    ]
+    assert set(storage_calls) == {f"Bearer {GCS_ACCESS_TOKEN}"}
+    # the assertion traded for the token is signed with the account's own key
+    claims = jwt.decode(
+        fake.assertions[-1],
+        SERVICE_ACCOUNT_KEY.public_key(),
+        algorithms=["RS256"],
+        audience=GOOGLE_TOKEN_AUDIENCE,
+    )
+    assert claims["iss"] == SERVICE_ACCOUNT_EMAIL
+    assert "devstorage" in claims["scope"]

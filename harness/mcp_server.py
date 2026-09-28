@@ -3,7 +3,9 @@
 `serving_mcp()` runs one over Streamable HTTP in a thread of the test process and yields its
 URL, the one an admin enters for an MCP tool server connection. It offers a single tool, `echo`,
 and stops again when the block ends. With `media=True` it also offers `snapshot`, answering
-with `SNAPSHOT_PNG` as an image, and `chime`, answering with `CHIME_WAV` as audio.
+with `SNAPSHOT_PNG` as an image, and `chime`, answering with `CHIME_WAV` as audio; with
+`failing=True`, `capsize`, which fails with `CAPSIZE_ERROR`. `tls=True` serves it over HTTPS
+with a self-signed certificate.
 `mcp_connection(...)` is the admin's connection to it without auth; save it through
 `TOOL_SERVERS` after `preserve(TOOL_SERVERS)`. Given FastMCP's `auth` settings and a
 `token_verifier`, the SDK guards it the way a real OAuth-protected MCP server is guarded: a
@@ -16,17 +18,21 @@ from __future__ import annotations
 import base64
 import contextlib
 import io
+import tempfile
 import threading
 import time
 import wave
+from pathlib import Path
 from typing import Any, Iterator
 
 import uvicorn
 from mcp.server.fastmcp import Audio, FastMCP, Image
 
 from harness.instance import free_port
+from harness.object_storage import self_signed_certificate
 
 ECHO_DESCRIPTION = "Repeat the text back."
+CAPSIZE_ERROR = "the boat capsized in the harbour"
 SNAPSHOT_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
@@ -45,7 +51,7 @@ def _silence_wav() -> bytes:
 CHIME_WAV = _silence_wav()
 
 
-def _echo_server(media: bool = False, **auth: Any) -> FastMCP:
+def _echo_server(media: bool = False, failing: bool = False, **auth: Any) -> FastMCP:
     server = FastMCP("harness-mcp", log_level="WARNING", **auth)
 
     @server.tool(description=ECHO_DESCRIPTION)
@@ -62,30 +68,48 @@ def _echo_server(media: bool = False, **auth: Any) -> FastMCP:
         def chime() -> Audio:
             return Audio(data=CHIME_WAV, format="wav")
 
+    if failing:
+
+        @server.tool(description="Take the boat out.")
+        def capsize() -> str:
+            raise RuntimeError(CAPSIZE_ERROR)
+
     return server
 
 
 @contextlib.contextmanager
-def serving_mcp(port: int | None = None, media: bool = False, **auth: Any) -> Iterator[str]:
+def serving_mcp(
+    port: int | None = None,
+    media: bool = False,
+    failing: bool = False,
+    tls: bool = False,
+    **auth: Any,
+) -> Iterator[str]:
     """Serve the echo server on `port` (a free one by default); `auth` goes to FastMCP."""
     port = port or free_port()
-    app = _echo_server(media, **auth).streamable_http_app()
-    # log_config=None keeps uvicorn from reconfiguring the test process's logging
-    runner = uvicorn.Server(
-        uvicorn.Config(app, host="127.0.0.1", port=port, log_config=None, log_level="warning")
-    )
-    thread = threading.Thread(target=runner.run, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 30
-    while not runner.started:
-        if not thread.is_alive() or time.monotonic() > deadline:
-            raise RuntimeError("the MCP server did not start")
-        time.sleep(0.05)
-    try:
-        yield f"http://127.0.0.1:{port}/mcp"
-    finally:
-        runner.should_exit = True
-        thread.join(timeout=10)
+    app = _echo_server(media, failing, **auth).streamable_http_app()
+    with tempfile.TemporaryDirectory(prefix="owui-mcp-") as certificates:
+        certificate = {}
+        if tls:
+            certificate_path, key_path = self_signed_certificate(Path(certificates))
+            certificate = {"ssl_certfile": str(certificate_path), "ssl_keyfile": str(key_path)}
+        # log_config=None keeps uvicorn from reconfiguring the test process's logging
+        config = uvicorn.Config(
+            app, host="127.0.0.1", port=port, log_config=None, log_level="warning", **certificate
+        )
+        runner = uvicorn.Server(config)
+        thread = threading.Thread(target=runner.run, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 30
+        while not runner.started:
+            if not thread.is_alive() or time.monotonic() > deadline:
+                raise RuntimeError("the MCP server did not start")
+            time.sleep(0.05)
+        try:
+            yield f"{'https' if tls else 'http'}://127.0.0.1:{port}/mcp"
+        finally:
+            runner.should_exit = True
+            thread.join(timeout=10)
 
 
 TOOL_SERVERS = ("/api/v1/configs/tool_servers", "/api/v1/configs/tool_servers")

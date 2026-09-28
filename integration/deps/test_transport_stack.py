@@ -3,8 +3,9 @@
 starlette-compress compresses a response in the encoding the client asks for, with Brotli,
 gzip and zstandard doing the work: a response sent whole goes through `brotli.compress`, a file
 streamed in parts through a `brotli.Compressor`. /api/changelog is a large public response that
-shows it, and its body is CHANGELOG.md turned into HTML by Markdown and split into versions and
-items by BeautifulSoup, each item cut at its first ": " into a title and its text.
+shows it, and its body is CHANGELOG.md turned into HTML by Markdown (bold text and links
+included) and split into versions and items by BeautifulSoup, each item cut at its first ": "
+into a title and its text.
 aiohttp decodes a Brotli-encoded provider reply with brotlicffi (Brotli when that is absent).
 python-socketio carries the chat events to the browser, and pycrdt merges the live edits two tabs
 make to one note.
@@ -44,6 +45,7 @@ pytestmark = [pytest.mark.depcheck, pytest.mark.api, pytest.mark.requires_source
 
 VERSION_HEADING = re.compile(r"^## \[(?P<version>[^\]]+)\] - (?P<date>.+)$", re.MULTILINE)
 SECTION_HEADING = re.compile(r"^### (?P<section>.+)$", re.MULTILINE)
+MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 STATE_WAIT = 10.0
 
 
@@ -109,6 +111,13 @@ def test_the_changelog_is_read_from_the_markdown(instance):
     items = [item for name in sections for item in newest[name]]
     assert items and all(item["raw"].startswith("<li>") for item in items)
     assert any("<strong>" in item["raw"] for item in items), "the bold markdown was not rendered"
+    rendered = "".join(item["raw"] for item in items)
+    links = MARKDOWN_LINK.findall(newest_body)
+    assert links, "the newest release links nothing; retarget the link check"
+    unrendered = [
+        f"[{text}]({url})" for text, url in links if f'<a href="{url}">{text}</a>' not in rendered
+    ]
+    assert not unrendered, f"links left as markdown: {unrendered[:3]}"
     # each item's text is split at its first ": " into a title and the rest
     assert all("<strong>" not in item["title"] + item["content"] for item in items)
     titled = [item for item in items if item["title"]]

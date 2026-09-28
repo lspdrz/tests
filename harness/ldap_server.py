@@ -3,21 +3,27 @@
 The server speaks the part of RFC 4511 that ldap3 uses for a sign-in: simple binds, a search
 matched against the people it holds and unbind, decoded and encoded with ldap3's own ASN.1
 models. A service account binds first; `add_person(...)` puts someone in the directory, with the
-groups their `memberOf` names. `binds` and `searches` record what the instance asked for.
+groups their `memberOf` names. `binds` and `searches` record what the instance asked for, each
+search with the DNs it `found`.
 
 `serve_directory()` starts it for a block, and `save_ldap_settings(client, directory)` points the
-admin's LDAP settings at it and switches LDAP sign-in on. Wrap a change on the shared instance in
-`preserve(LDAP_CONFIG)`, which switches LDAP sign-in off again. The server settings stay pointing
-at the stopped directory: the settings endpoint refuses the empty defaults it starts with, and
-nothing reads them while LDAP sign-in is off.
+admin's LDAP settings at it and switches LDAP sign-in on. `serve_directory(tls=True)` speaks
+LDAPS, with a certificate of its own at `directory.certificate_path` for the instance to trust,
+and counts the connections that completed the handshake in `tls_handshakes`. Wrap a change on
+the shared instance in `preserve(LDAP_CONFIG)`, which switches LDAP sign-in off again. The server
+settings stay pointing at the stopped directory: the settings endpoint refuses the empty defaults
+it starts with, and nothing reads them while LDAP sign-in is off.
 """
 
 from __future__ import annotations
 
 import socketserver
+import ssl
+import tempfile
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator
 
 import httpx
@@ -45,6 +51,8 @@ from ldap3.utils.asn1 import encode
 from ldap3.utils.dn import escape_rdn
 from pyasn1.codec.ber import decoder
 from pyasn1.type.namedtype import NamedType, NamedTypes
+
+from harness.object_storage import self_signed_certificate
 
 LDAP_SERVER_CONFIG = ("/api/v1/auths/admin/config/ldap/server",) * 2
 LDAP_CONFIG = ("/api/v1/auths/admin/config/ldap",) * 2
@@ -105,6 +113,7 @@ class Search:
     base: str
     filter: str
     attributes: list[str]
+    found: list[str] = field(default_factory=list)  # the DNs it answered with
 
 
 @dataclass
@@ -114,6 +123,8 @@ class Directory:
     people: dict[str, Person] = field(default_factory=dict)
     binds: list[Bind] = field(default_factory=list)
     searches: list[Search] = field(default_factory=list)
+    certificate_path: str = ""
+    tls_handshakes: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def add_person(
@@ -157,17 +168,18 @@ class Directory:
 
     def _search(self, request) -> list[Person]:
         described = search_request_to_dict(request)
+        search = Search(described["base"], described["filter"], list(described["attributes"]))
         with self.lock:
-            self.searches.append(
-                Search(described["base"], described["filter"], list(described["attributes"]))
-            )
+            self.searches.append(search)
             people = list(self.people.values())
         base = described["base"].lower()
-        return [
+        found = [
             person
             for person in people
             if person.dn.lower().endswith(base) and _matches(request["filter"], person)
         ]
+        search.found = [person.dn for person in found]
+        return found
 
 
 def _values(person: Person, name: str) -> list[str]:
@@ -275,19 +287,38 @@ def _handler(directory: Directory):
 class _Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
+    tls_context: ssl.SSLContext | None = None
+    directory: Directory | None = None
+
+    def finish_request(self, request, client_address) -> None:
+        if self.tls_context:
+            try:
+                request = self.tls_context.wrap_socket(request, server_side=True)
+            except (ssl.SSLError, OSError):
+                return  # a client that refused the certificate
+            with self.directory.lock:
+                self.directory.tls_handshakes += 1
+        super().finish_request(request, client_address)
 
 
 @contextmanager
-def serve_directory(host: str = "127.0.0.1") -> Iterator[Directory]:
+def serve_directory(host: str = "127.0.0.1", tls: bool = False) -> Iterator[Directory]:
     server = _Server((host, 0), None)
     directory = Directory(host=host, port=server.server_address[1])
     server.RequestHandlerClass = _handler(directory)
-    threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
-    try:
-        yield directory
-    finally:
-        server.shutdown()
-        server.server_close()
+    server.directory = directory
+    with tempfile.TemporaryDirectory(prefix="owui-ldap-") as certificates:
+        if tls:
+            certificate_path, key_path = self_signed_certificate(Path(certificates))
+            server.tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server.tls_context.load_cert_chain(certificate_path, key_path)
+            directory.certificate_path = str(certificate_path)
+        threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
+        try:
+            yield directory
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 def save_ldap_settings(client: httpx.Client, directory: Directory, **changes) -> None:
@@ -303,6 +334,7 @@ def save_ldap_settings(client: httpx.Client, directory: Directory, **changes) ->
         "search_base": PEOPLE_DN,
         "search_filters": "",
         "use_tls": False,
+        "certificate_path": None,
         "validate_cert": False,
         **changes,
     }

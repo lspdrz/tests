@@ -1,30 +1,49 @@
 """Dependency smoke: code and services Open WebUI reaches out to, each through its feature.
 
 The mcp SDK connects to an MCP tool server when an admin verifies the connection and lists its
-tools. validators decides which links a page fetch accepts, BeautifulSoup reads the fetched page
-(its text, and the title, description and language stored with it; a `.xml` link through its
-XML parser), black formats code for the code
-editor, and opentelemetry exports request traces to an OTLP/HTTP collector (requests carries
-them there, as it carries a document to Tika). The collector's address is only read at boot, so
-the tracing test boots an instance of its own.
+tools, and calls a tool when the model asks for one, over an httpx client Open WebUI builds: it
+sends the connection's bearer key, follows a server that moved, and checks the server's certificate
+unless `AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL` is off. validators decides which links a page fetch
+accepts, BeautifulSoup reads the fetched page (its text, and the title, description and language
+stored with it; a `.xml` link through its XML parser), black formats code for the code editor, and
+opentelemetry exports request traces to an OTLP/HTTP collector (requests carries them there, as it
+carries a document to Tika). The collector's address is only read at boot, so the tracing test boots
+an instance of its own.
 
-Discriminates: passes on dev bbfa876af; in a backend copy, skipping `session.initialize()` fails
-the MCP verification, dropping the `validators.url` check lets the malformed link through to the
-fetch, a loader that stores no page title fails the metadata test, asking BeautifulSoup for an
-unknown parser in place of "xml" fails the feed test, returning the code unformatted fails the
-formatter, black without string normalisation fails the wrapping test and never adding the span
-processor leaves the collector empty.
+Discriminates: passes on dev bbfa876af; in a backend copy, skipping `session.initialize()` fails the
+MCP verification, building the httpx client without `headers`, with `follow_redirects=False` or with
+`verify=False` always fails the bearer, moved and certificate tests in turn, taking an `isError`
+result for a success fails the failing tool test, dropping the `validators.url` check lets the
+malformed link through to the fetch, a loader that stores no page title fails the metadata test,
+asking BeautifulSoup for an unknown parser in place of "xml" fails the feed test, returning the code
+unformatted fails the formatter, black without string normalisation fails the wrapping test and
+never adding the span processor leaves the collector empty.
 """
 
 from __future__ import annotations
 
+import json
+import secrets
 import time
+from dataclasses import dataclass, field
 
 import pytest
+from mcp.server.auth.provider import AccessToken
+from mcp.server.auth.settings import AuthSettings
 
+from harness import upstream as reply
+from harness.actors import admin_of
+from harness.chat import ask
 from harness.instance import free_port
 from harness.listener import listening, text_answer
-from harness.mcp_server import ECHO_DESCRIPTION, serving_mcp
+from harness.mcp_server import (
+    CAPSIZE_ERROR,
+    ECHO_DESCRIPTION,
+    TOOL_SERVERS,
+    mcp_connection,
+    serving_mcp,
+)
+from harness.terminal_server import read_grant
 from harness.web_retrieval import LOCAL_WEB_FETCH
 
 pytestmark = [pytest.mark.depcheck, pytest.mark.api, pytest.mark.requires_source]
@@ -33,13 +52,13 @@ PAGE_TEXT = "Herons wait motionless in the shallows"
 EXPORT_WAIT = 30.0
 
 
-def _verify_mcp(admin, url: str):
+def _verify_mcp(admin, url: str, key: str = ""):
     connection = {
         "type": "mcp",
         "url": url,
         "path": "",
-        "auth_type": "none",
-        "key": "",
+        "auth_type": "bearer" if key else "none",
+        "key": key,
         "config": {},
     }
     with admin.client() as client:
@@ -61,6 +80,108 @@ def test_verifying_an_mcp_server_that_is_not_there_fails(admin):
     verified = _verify_mcp(admin, f"http://127.0.0.1:{free_port()}/mcp")
 
     assert verified.status_code == 400, verified.text
+
+
+@dataclass
+class KeyCheck:
+    """An MCP server's bearer check that takes one key and keeps every token it was shown."""
+
+    key: str
+    presented: list[str] = field(default_factory=list)
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        self.presented.append(token)
+        if token != self.key:
+            return None
+        return AccessToken(token=token, client_id="open-webui", scopes=[])
+
+
+def test_the_connection_key_reaches_an_mcp_server_that_requires_it(admin):
+    port = free_port()
+    check = KeyCheck(key=f"harbour-{secrets.token_hex(8)}")
+    settings = AuthSettings(
+        issuer_url="http://127.0.0.1:9", resource_server_url=f"http://127.0.0.1:{port}/mcp"
+    )
+    with serving_mcp(port, auth=settings, token_verifier=check) as url:
+        with_key = _verify_mcp(admin, url, key=check.key)
+        with_wrong_key = _verify_mcp(admin, url, key="not-the-key")
+        without_key = _verify_mcp(admin, url)
+
+    assert with_key.status_code == 200, with_key.text
+    assert [spec["name"] for spec in with_key.json()["specs"]] == ["echo"]
+    assert with_wrong_key.status_code == 400
+    assert without_key.status_code == 400
+    assert check.key in check.presented
+
+
+def test_an_mcp_server_that_moved_is_followed(admin, listener):
+    with serving_mcp() as url:
+        for method in ("GET", "POST", "DELETE"):
+            listener.route(method, "/old/mcp", (307, {"Location": url}, b""))
+        verified = _verify_mcp(admin, f"{listener.base_url}/old/mcp")
+
+    assert verified.status_code == 200, verified.text
+    assert [spec["name"] for spec in verified.json()["specs"]] == ["echo"]
+    assert listener.requests_to("/old/mcp"), "the old address was never asked"
+
+
+def test_an_mcp_server_with_an_untrusted_certificate_is_refused(admin):
+    with serving_mcp(tls=True) as url:
+        verified = _verify_mcp(admin, url)
+
+    assert verified.status_code == 400, verified.text
+
+
+@pytest.mark.slow
+def test_with_certificate_checks_off_an_untrusted_mcp_server_is_used(instance_with):
+    unchecked = instance_with({"AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL": "false"})
+    with serving_mcp(tls=True) as url:
+        verified = _verify_mcp(admin_of(unchecked), url)
+
+    assert verified.status_code == 200, verified.text
+    assert [spec["name"] for spec in verified.json()["specs"]] == ["echo"]
+
+
+@pytest.fixture
+def harbour_tools(admin, make_user, preserve):
+    """(person, server id): an MCP server with a tool that fails, which `person` may use."""
+    preserve(TOOL_SERVERS)
+    person = make_user()
+    server_id = f"harbour_{secrets.token_hex(4)}"
+    with serving_mcp(failing=True) as url:
+        connection = mcp_connection(url, server_id, [read_grant(person.id)])
+        with admin.client() as client:
+            saved = client.post(TOOL_SERVERS[1], json={"TOOL_SERVER_CONNECTIONS": [connection]})
+        assert saved.status_code == 200, saved.text
+        yield person, server_id
+
+
+def _tool_result(person, upstream, server_id: str, tool: str, arguments: dict) -> str:
+    """Have the model call one MCP tool; returns what the tool message told the model."""
+    upstream.queue(reply.tool_call(f"{server_id}_{tool}", arguments), reply.text("Noted."))
+    with person.client() as client:
+        ask(client, f"use {tool}", tool_ids=[f"server:mcp:{server_id}"])
+    follow_up = upstream.chat_requests()[-1]["messages"]
+    [tool_message] = [entry for entry in follow_up if entry["role"] == "tool"]
+    return tool_message["content"]
+
+
+def test_the_model_calls_an_mcp_tool_and_gets_its_answer(harbour_tools, upstream):
+    person, server_id = harbour_tools
+
+    answered = _tool_result(person, upstream, server_id, "echo", {"text": "high tide at six"})
+
+    assert "high tide at six" in answered
+    assert "error" not in answered
+
+
+def test_a_failing_mcp_tool_is_reported_to_the_model_as_an_error(harbour_tools, upstream):
+    person, server_id = harbour_tools
+
+    answered = _tool_result(person, upstream, server_id, "capsize", {})
+
+    assert CAPSIZE_ERROR in answered
+    assert "error" in json.loads(answered), f"the failure came back as a result: {answered}"
 
 
 @pytest.fixture

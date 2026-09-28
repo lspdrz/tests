@@ -21,13 +21,16 @@ lacked, and Shift-JIS was missing from its try order. Both cases pass on dev efe
 with 3c47f0d7e reverted.
 
 Discriminates: passes on dev bbfa876af (.rst, .epub and .odt with a pandoc binary on PATH). One
-backend copy broke pypdf's `extract_text`, `docx2txt.process`, the xlsx, rst and epub partitions
-and `chardet.detect`; another broke rapidocr's `RapidOCR`, the pptx, xml and odt partitions,
+backend copy broke pypdf's `extract_text`, `docx2txt.process`, the xlsx, rst and epub partitions and
+`chardet.detect`; another broke rapidocr's `RapidOCR`, the pptx, xml and odt partitions,
 BeautifulSoup's `get_text` and `ftfy.fix_text`. Each copy turned exactly its own formats red and
 left the others green. Mapping cp949 in a third copy makes the EUC-KR case pass. A fourth copy
 whose `chardet.detect` names no encoding fails the Big5, EUC-KR, Shift-JIS and Windows-1251 cases.
 On dev ef67cc3fa, dropping `output_content_format='markdown'` from the Document Intelligence
-loader fails its test.
+loader fails its test; msoffcrypto's `OfficeFile` answering "not encrypted" (patched in at import)
+fails the password-protected workbook test, one that accepts any bytes fails the test of a file
+that only claims to be a workbook, and OpenCV's `minAreaRect` answering an empty box or
+onnxruntime refusing to build a session fails the PDF image test.
 """
 
 from __future__ import annotations
@@ -409,3 +412,35 @@ def test_document_intelligence_reads_a_pdf_as_markdown(retrieval_settings, make_
     assert "outputContentFormat=markdown" in analyze.path
     assert analyze.body == pdf
     assert listener.requests_to(AZURE_RESULT_PATH), "the analysis result was never polled"
+
+
+# ---------------------------------------------------------------- password-protected workbooks
+
+
+def _encrypted_xlsx() -> bytes:
+    from msoffcrypto.format.ooxml import OOXMLFile
+
+    encrypted = io.BytesIO()
+    OOXMLFile(io.BytesIO(_xlsx())).encrypt("harbour-password", encrypted)
+    return encrypted.getvalue()
+
+
+def _processing_error(client: httpx.Client, filename: str, content: bytes) -> str:
+    """Why the upload could not be read, from the file's stored status."""
+    stored = client.get(f"/api/v1/files/{_upload(client, filename, content, XLSX_TYPE)}").json()
+    assert stored["data"].get("status") != "completed", f"{filename} was read: {stored}"
+    return str(stored["data"].get("error"))
+
+
+def test_a_password_protected_workbook_is_refused_as_such(make_user):
+    with make_user().client() as client:
+        error = _processing_error(client, "locked.xlsx", _encrypted_xlsx())
+
+    assert "password protected" in error, error
+
+
+def test_a_file_that_only_claims_to_be_a_workbook_is_refused(make_user):
+    with make_user().client() as client:
+        error = _processing_error(client, "fake.xlsx", b"not a workbook, only its name")
+
+    assert "Not a valid XLSX file" in error, error

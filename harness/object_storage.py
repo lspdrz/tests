@@ -1,4 +1,4 @@
-"""S3 and Azure Blob Storage played by local services that keep objects, for uploads stored there.
+"""S3, Azure Blob Storage and Google Cloud Storage played by local services that keep objects.
 
 `serving_s3()` yields a `FakeS3` speaking the part of the S3 REST API boto3 uses for Open WebUI's
 file storage, with path-style addressing: put, head, get, delete and tag an object, and list a
@@ -6,19 +6,28 @@ bucket (`list-type=2`). `serving_azure_blob()` yields a `FakeAzureBlob` speaking
 REST API azure-storage-blob uses: put, get (ranged), delete and list the blobs of a container,
 under an account path the way the Azurite emulator serves it. Neither checks signatures, and
 both refuse a request without the `Authorization` header the SDK signs with, as the real
-services do. `objects` is what each keeps, by bucket or container and key, `tags` the S3 tag set
-of each key, and `requests` every `(method, path)` they got.
+services do. `serving_gcs()` yields a `FakeGcs` speaking the part of the Cloud Storage JSON API
+google-cloud-storage uses: a multipart upload, an object's metadata and media, delete and list.
+Like the emulator the SDK is pointed at with `STORAGE_EMULATOR_HOST`, it takes anonymous
+requests; with `token_endpoint=True` it also answers a service account's OAuth token exchange
+at `/token` and refuses storage requests without the token it issued there (`GCS_ACCESS_TOKEN`).
+`objects` is what each keeps, by bucket or container and key, `tags` the S3 tag set of each key,
+`requests` every `(method, path)` they got and `authorizations` the `Authorization` header of each.
 
-`s3_env(fake, bucket)` and `azure_blob_env(fake, container)` are the environment of an instance
-that keeps its uploads there.
+`s3_env(fake, bucket)`, `azure_blob_env(fake, container)` and `gcs_env(fake, bucket)` are the
+environment of an instance that keeps its uploads there.
 """
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import datetime
+import email.parser
+import email.policy
 import hashlib
 import ipaddress
+import json
 import ssl
 import tempfile
 import threading
@@ -42,6 +51,7 @@ AZURE_ACCOUNT_KEY = (
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 )
 S3_NAMESPACE = "http://s3.amazonaws.com/doc/2006-03-01/"
+GCS_ACCESS_TOKEN = "service-account-storage-token"
 
 Answer = tuple[int, dict[str, str], bytes]
 
@@ -75,6 +85,13 @@ class FakeAzureBlob(_Store):
     ca_bundle: str = ""
 
 
+@dataclass
+class FakeGcs(_Store):
+    # a service account's token exchange: the JWT assertions it was sent, newest last
+    assertions: list[str] = field(default_factory=list)
+    token_endpoint: bool = False
+
+
 def s3_env(fake: FakeS3, bucket: str, **settings: str) -> dict[str, str]:
     return {
         "STORAGE_PROVIDER": "s3",
@@ -99,6 +116,18 @@ def azure_blob_env(fake: FakeAzureBlob, container: str, with_key: bool = True) -
         env["AZURE_STORAGE_KEY"] = AZURE_ACCOUNT_KEY
     if fake.ca_bundle:
         env["REQUESTS_CA_BUNDLE"] = fake.ca_bundle
+    return env
+
+
+def gcs_env(fake: FakeGcs, bucket: str, credentials: dict | None = None) -> dict[str, str]:
+    """Without `credentials` (a service account's JSON key) the SDK goes anonymous."""
+    env = {
+        "STORAGE_PROVIDER": "gcs",
+        "GCS_BUCKET_NAME": bucket,
+        "STORAGE_EMULATOR_HOST": fake.base_url,
+    }
+    if credentials:
+        env["GOOGLE_APPLICATION_CREDENTIALS_JSON"] = json.dumps(credentials)
     return env
 
 
@@ -222,7 +251,69 @@ def _azure_answer(
     return _azure_error(405, "UnsupportedHttpVerb")
 
 
-def _self_signed_certificate(directory: Path) -> tuple[Path, Path]:
+def _gcs_json(payload: dict, status: int = 200) -> Answer:
+    return status, {"Content-Type": "application/json"}, json.dumps(payload).encode()
+
+
+def _gcs_error(status: int, message: str) -> Answer:
+    return _gcs_json({"error": {"code": status, "message": message}}, status)
+
+
+def _gcs_resource(bucket: str, name: str, data: bytes) -> dict:
+    return {
+        "kind": "storage#object",
+        "id": f"{bucket}/{name}/1",
+        "name": name,
+        "bucket": bucket,
+        "generation": "1",
+        "metageneration": "1",
+        "size": str(len(data)),
+        "md5Hash": base64.b64encode(hashlib.md5(data).digest()).decode(),
+    }
+
+
+def _multipart_upload(headers: dict, body: bytes) -> tuple[str, bytes]:
+    """The object name from the metadata part and the bytes of the media part."""
+    envelope = f"Content-Type: {headers['content-type']}\r\n\r\n".encode() + body
+    message = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(envelope)
+    metadata_part, media_part = message.iter_parts()
+    return json.loads(metadata_part.get_content())["name"], media_part.get_payload(decode=True)
+
+
+def _gcs_answer(fake: FakeGcs, method: str, path: str, query: dict, headers: dict, body: bytes):
+    if fake.token_endpoint and path == "/token" and method == "POST":
+        form = dict(urllib.parse.parse_qsl(body.decode()))
+        with fake.lock:
+            fake.assertions.append(form.get("assertion", ""))
+        token = {"access_token": GCS_ACCESS_TOKEN, "expires_in": 3600, "token_type": "Bearer"}
+        return _gcs_json(token)
+    if fake.token_endpoint and headers.get("authorization") != f"Bearer {GCS_ACCESS_TOKEN}":
+        return _gcs_error(401, "Invalid Credentials")
+    route, _, rest = urllib.parse.unquote(path).lstrip("/").partition("storage/v1/b/")
+    bucket, _, name = rest.partition("/o")
+    name = name.removeprefix("/")
+    with fake.lock:
+        stored = fake.objects.setdefault(bucket, {})
+        if route == "upload/" and method == "POST" and query.get("uploadType") == "multipart":
+            name, data = _multipart_upload(headers, body)
+            stored[name] = data
+            return _gcs_json(_gcs_resource(bucket, name, data))
+        if route == "" and not name and method == "GET":
+            items = [_gcs_resource(bucket, key, data) for key, data in sorted(stored.items())]
+            return _gcs_json({"kind": "storage#objects", "items": items})
+        if name not in stored:
+            return _gcs_error(404, "No such object")
+        if route == "download/" and method == "GET":
+            return 200, {"Content-Type": "application/octet-stream"}, stored[name]
+        if route == "" and method == "GET":
+            return _gcs_json(_gcs_resource(bucket, name, stored[name]))
+        if route == "" and method == "DELETE":
+            del stored[name]
+            return 204, {}, b""
+    return _gcs_error(405, "Method not allowed")
+
+
+def self_signed_certificate(directory: Path) -> tuple[Path, Path]:
     """A certificate for 127.0.0.1 that is its own authority, and its key."""
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
@@ -268,7 +359,7 @@ def _self_signed_certificate(directory: Path) -> tuple[Path, Path]:
     return certificate_path, key_path
 
 
-def _serve(fake: _Store, answer) -> tuple[ThreadingHTTPServer, str]:
+def _serve(fake: _Store, answer, anonymous: bool) -> tuple[ThreadingHTTPServer, str]:
     class RequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -284,7 +375,7 @@ def _serve(fake: _Store, answer) -> tuple[ThreadingHTTPServer, str]:
             path, _, raw_query = self.path.partition("?")
             query = dict(urllib.parse.parse_qsl(raw_query, keep_blank_values=True))
             headers = {name.lower(): value for name, value in self.headers.items()}
-            if "authorization" not in headers:
+            if "authorization" not in headers and not anonymous:
                 status, answer_headers, answer_body = 403, {}, b"AuthenticationFailed"
             else:
                 status, answer_headers, answer_body = answer(
@@ -305,11 +396,11 @@ def _serve(fake: _Store, answer) -> tuple[ThreadingHTTPServer, str]:
 
 
 @contextlib.contextmanager
-def _running(fake: _Store, answer, tls: bool = False) -> Iterator[None]:
-    server, fake.base_url = _serve(fake, answer)
+def _running(fake: _Store, answer, tls: bool = False, anonymous: bool = False) -> Iterator[None]:
+    server, fake.base_url = _serve(fake, answer, anonymous)
     with tempfile.TemporaryDirectory(prefix="owui-object-storage-") as directory:
         if tls:
-            certificate_path, key_path = _self_signed_certificate(Path(directory))
+            certificate_path, key_path = self_signed_certificate(Path(directory))
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(certificate_path, key_path)
             server.socket = context.wrap_socket(server.socket, server_side=True)
@@ -342,4 +433,15 @@ def serving_azure_blob(tls: bool = False) -> Iterator[FakeAzureBlob]:
         return _azure_answer(fake, method, path, query, headers, body)
 
     with _running(fake, answer, tls):
+        yield fake
+
+
+@contextlib.contextmanager
+def serving_gcs(token_endpoint: bool = False) -> Iterator[FakeGcs]:
+    fake = FakeGcs(token_endpoint=token_endpoint)
+
+    def answer(method, path, query, headers, body):
+        return _gcs_answer(fake, method, path, query, headers, body)
+
+    with _running(fake, answer, anonymous=True):
         yield fake
