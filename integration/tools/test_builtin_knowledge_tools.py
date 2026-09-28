@@ -52,9 +52,15 @@ KNOWLEDGE_TOOLS = {
 }
 
 
-def call(actor, upstream, tool: str, model: str = MOCK_MODEL_ID, files=None, **arguments):
+def call(
+    actor, upstream, tool: str, model: str = MOCK_MODEL_ID, files=None, chat_files=None, **arguments
+):
     """The tool result the model got for `actor` in a chat with `files`, parsed when JSON."""
-    chat = {"model": model, **({"files": files} if files else {})}
+    chat = {
+        "model": model,
+        **({"files": files} if files else {}),
+        **({"chat_files": chat_files} if chat_files else {}),
+    }
     with actor.client() as client:
         result = run_tool(client, upstream, tool, arguments, **chat)
     try:
@@ -348,19 +354,19 @@ def test_the_chats_files_are_listed_grepped_and_queried(library, file_reader, up
     reader, herons = library["reader"], library["herons"]
     files = chat_files(herons)
 
-    listed = call(reader, upstream, "list_chat_files", model=file_reader, files=files)
+    listed = call(reader, upstream, "list_chat_files", model=file_reader, chat_files=files)
     grepped = call(
-        reader, upstream, "grep_chat_files", model=file_reader, files=files, pattern="nest"
+        reader, upstream, "grep_chat_files", model=file_reader, chat_files=files, pattern="nest"
     )
     queried = call(
-        reader, upstream, "query_chat_files", model=file_reader, files=files, query="heron"
+        reader, upstream, "query_chat_files", model=file_reader, chat_files=files, query="heron"
     )
     unattached = call(
         reader,
         upstream,
         "grep_chat_files",
         model=file_reader,
-        files=files,
+        chat_files=files,
         pattern="x",
         file_id=library["grebes"],
     )
@@ -376,13 +382,15 @@ def test_the_chats_files_are_listed_grepped_and_queried(library, file_reader, up
 def test_a_chat_naming_someone_elses_file_cannot_read_it(library, file_reader, upstream):
     files = chat_files(library["ledger"])
 
-    listed = call(library["reader"], upstream, "list_chat_files", model=file_reader, files=files)
+    listed = call(
+        library["reader"], upstream, "list_chat_files", model=file_reader, chat_files=files
+    )
     grepped = call(
         library["reader"],
         upstream,
         "grep_chat_files",
         model=file_reader,
-        files=files,
+        chat_files=files,
         pattern="secret",
     )
 
