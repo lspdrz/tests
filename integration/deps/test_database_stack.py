@@ -20,6 +20,12 @@ statement and cut into pages of 30 with `order_by`, `offset` and `limit`. On SQL
 event hook on the sync and the async engine sets each new connection's PRAGMAs, among them the
 journal mode `DATABASE_ENABLE_SQLITE_WAL` chooses, which the database file keeps.
 
+`DATABASE_SCHEMA` gives SQLAlchemy's `MetaData` a schema, so every query names its tables as
+`<schema>.<table>`. The Alembic migrations take no notice of it and create the tables in the
+connection's default schema, so a fresh Postgres install with `DATABASE_SCHEMA` set stops at boot
+looking for `<schema>.config`; it works only when the connection's `search_path` happens to put
+that schema first. That test stays red until the migrations honour the setting.
+
 Discriminates: passes on dev ef67cc3fa; in a backend copy with `aiosqlite.Connection.commit`
 made a no-op every write is lost, down to the admin account the boot signs up, so both SQLite
 cases fail. With `psycopg.AsyncConnection.commit` made a no-op both Postgres cases fail, and
@@ -29,7 +35,8 @@ codec that loses nulls stops the first sign-up, so the chat test cannot be singl
 user search without its `offset`
 (every page the first) fails the search test, each on both databases, `like` in place of `ilike`
 fails it on Postgres (Open WebUI's own SQLite `like` folds case anyway), and the connect hooks
-left unregistered fail the WAL case.
+left unregistered fail the WAL case. The schema test passes in a copy that puts `DATABASE_SCHEMA`
+on the connection's `search_path`.
 """
 
 from __future__ import annotations
@@ -203,3 +210,45 @@ def test_every_sqlite_connection_gets_the_configured_journal_mode(instance_with,
         [(mode,)] = database.execute("PRAGMA journal_mode").fetchall()
 
     assert mode == ("wal" if wal else "delete")
+
+
+def _tables_by_schema(database_url: str) -> dict[str, int]:
+    import sqlalchemy
+
+    engine = sqlalchemy.create_engine(database_url)
+    try:
+        with engine.begin() as connection:
+            rows = connection.execute(
+                sqlalchemy.text(
+                    "SELECT table_schema, count(*) FROM information_schema.tables"
+                    " WHERE table_name IN ('config', 'note', 'user') GROUP BY table_schema"
+                )
+            ).fetchall()
+    finally:
+        engine.dispose()
+    return dict(rows)
+
+
+@pytest.mark.slow
+def test_a_fresh_postgres_install_keeps_its_tables_in_the_database_schema(instance_with):
+    pytest.importorskip("pgserver", reason="the schema case runs on the embedded server")
+    with backends.postgres_database() as url:
+        import sqlalchemy
+
+        engine = sqlalchemy.create_engine(url)
+        with engine.begin() as connection:
+            connection.execute(sqlalchemy.text("CREATE SCHEMA harbour"))
+        engine.dispose()
+        try:
+            launched = instance_with({"DATABASE_URL": url, "DATABASE_SCHEMA": "harbour"})
+        except pytest.fail.Exception:
+            launched = None
+        tables = _tables_by_schema(url)
+
+        assert launched is not None and tables == {"harbour": 3}, (
+            "with DATABASE_SCHEMA set, the migrations create the tables in the default schema "
+            f"({tables}) while the app reads them from harbour, so a fresh install never boots"
+        )
+        with create_user(launched).client() as client:
+            note = _create_note(client, "schema", "kept in harbour")
+            assert _stored_markdown(client, note["id"]) == "kept in harbour"
