@@ -2,14 +2,16 @@
 
 `snapshot_database(instance, data_dir)` copies a running instance's SQLite database, migrated to
 head, into `data_dir`, for a test to alter before the next boot. `boot_until_settled(data_dir)`
-starts the backend there the way `launch` does and reports how the boot ended: the process
-exiting, or `/health` answering. A boot that is expected to work needs nothing new: `launch`
-and `instance_with` take `DATA_DIR` as an extra variable, and signing up the admin works on a
-data directory without accounts. `with_legacy_config(...)` is such an instance, shared by the
-API and browser tests: its data directory starts with a legacy `config.json`, whose import at
-boot writes each key as a config row verbatim, ahead of the boot's repair of old row shapes.
-`serving(data_dir)` keeps the backend running on a data directory that already has accounts,
-and `restored_postgres(dump)` loads a `pg_dump` into an embedded Postgres for it to use.
+starts the backend there the way `launch` does, with any extra `settings`, and reports how the
+boot ended: the process exiting, or `/health` answering. A boot that is expected to work needs
+nothing new: `launch` and `instance_with` take `DATA_DIR` as an extra variable, and signing up
+the admin works on a data directory without accounts; `booted_again(...)` is such an instance
+on the data directory a first boot with other settings left behind. `with_legacy_config(...)`
+is one too, shared by the API and browser tests: its data directory starts with a legacy
+`config.json`, whose import at boot writes each key as a config row verbatim, ahead of the
+boot's repair of old row shapes. `serving(data_dir)` keeps the backend running on a data
+directory that already has accounts, and `restored_postgres(dump)` loads a `pg_dump` into an
+embedded Postgres for it to use.
 """
 
 from __future__ import annotations
@@ -84,6 +86,19 @@ def with_legacy_config(
     return instance_with({"DATA_DIR": str(data_dir)})
 
 
+def booted_again(
+    instance_with: Callable[[dict[str, str]], LaunchedInstance],
+    data_dir: Path,
+    first: dict[str, str],
+    second: dict[str, str],
+) -> LaunchedInstance:
+    """Boot on a fresh `data_dir` with `first` until healthy, stop, then boot it with `second`."""
+    data_dir.mkdir(parents=True)
+    outcome = boot_until_settled(data_dir, settings=first)
+    assert outcome.healthy, f"the first boot failed:\n{outcome.log[-3000:]}"
+    return instance_with({"DATA_DIR": str(data_dir), **second})
+
+
 def _answers_health(base_url: str) -> bool:
     try:
         return httpx.get(f"{base_url}/health", timeout=3.0).status_code == 200
@@ -137,9 +152,11 @@ def _read_log(scratch: Path) -> str:
     return without_colour((scratch / "server.log").read_text(encoding="utf-8", errors="replace"))
 
 
-def boot_until_settled(data_dir: Path, timeout: float = 180.0) -> BootOutcome:
+def boot_until_settled(
+    data_dir: Path, timeout: float = 180.0, settings: dict[str, str] | None = None
+) -> BootOutcome:
     """Start the backend on `data_dir` until it exits or answers `/health`, then stop it."""
-    process, base_url, scratch = _start(data_dir, None, {})
+    process, base_url, scratch = _start(data_dir, None, settings or {})
     try:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

@@ -14,19 +14,26 @@
 - MCP OAuth callback (c2107e5bb): the callback bound the new connection to whoever returned
   with the code instead of the account that started the flow. The initiator is now stamped into
   the state, and a different signed-in account returning to the callback gets nothing.
+- Provider tokens without an expiry (#26802, issue #26141, commit 98656b7): a provider that sent
+  neither `expires_in` nor a refresh token got a fabricated one-hour lifetime, after which the
+  stored SSO session was dead with no way to renew it. Such a token is now kept as non-expiring;
+  with a refresh token the hour still applies.
 
 Twin of unit/security/test_oauth_session_lifecycle.py (and of the client-callback test in
-unit/security/test_oauth_identity.py).
+unit/security/test_oauth_identity.py). The profile picture fetch is in
+test_oauth_picture_fetch.py, the sign-up race in test_first_sign_in_race.py and the seeding of
+OAuth settings in integration/auth/test_oauth_settings_from_env.py.
 
 Discriminates: passes on dev bbfa876af; in a copy with the matching fix reverted, login and
 callback redirect to the provider while OAuth is off, the sign-in after a key rotation keeps
-failing, the MCP authorize answers 500 and the callback files the connection under the account
-that returned to it.
+failing, the MCP authorize answers 500, the callback files the connection under the account
+that returned to it and the token without an expiry is stored as expiring in an hour.
 """
 
 from __future__ import annotations
 
 import secrets
+import time
 import urllib.parse
 
 import httpx
@@ -36,6 +43,7 @@ from harness.listener import json_answer
 from harness.oidc_provider import (
     browser_for,
     oauth_settings,
+    session_user,
     shared_provider,
     sign_in,
     sso_env,
@@ -126,6 +134,60 @@ def test_a_failed_code_exchange_is_not_retried_and_keeps_the_keys(sso, idp):
     assert len(idp.requests_to("/token")) == 2, "a failed code exchange was retried"
     assert sign_in(sso).token
     assert len(idp.requests_to("/jwks")) == key_fetches, "a token error evicted the keys"
+
+
+# ── provider tokens without an expiry (#26802) ────────────────────────────
+
+YEAR = 365 * 86400
+HOUR = 3600
+
+
+def stored_session(sso, idp) -> dict:
+    """Sign a fresh person in; returns the SSO session the admin sees stored for them."""
+    idp.sign_in_as()
+    result = sign_in(sso)
+    assert result.token, f"the sign-in failed: {result.error}"
+    account_id = session_user(sso, result.token)["id"]
+    with sso.client() as admin:
+        sessions = admin.get(f"/api/v1/users/{account_id}/oauth/sessions")
+    assert sessions.status_code == 200, sessions.text
+    (session,) = sessions.json()
+    return session
+
+
+def test_a_token_that_cannot_be_refreshed_is_not_given_an_invented_expiry(sso, idp):
+    """Narrow: no expiry and no refresh token means non-expiring, not dead in an hour."""
+    idp.sends_expiry = False
+    idp.sends_refresh_token = False
+
+    session = stored_session(sso, idp)
+
+    assert session["expires_at"] > time.time() + YEAR, (
+        f"the session expires at {session['expires_at']}, an hour it invented, although nothing "
+        "can renew it; the person's SSO session dies with no way back (#26802)"
+    )
+
+
+def test_a_refreshable_token_without_an_expiry_keeps_the_one_hour_default(sso, idp):
+    """Nearby: with a refresh token to renew it, the conservative hour still applies."""
+    idp.sends_expiry = False
+
+    session = stored_session(sso, idp)
+
+    assert session["expires_at"] == pytest.approx(time.time() + HOUR, abs=60)
+
+
+@pytest.mark.parametrize("refreshable", [True, False], ids=["refreshable", "not-refreshable"])
+def test_a_token_with_an_expiry_keeps_it(sso, idp, refreshable):
+    """Broad: a stated lifetime is used as it is, with an issue time stamped beside it."""
+    idp.token_lifetime = 300
+    idp.sends_refresh_token = refreshable
+
+    session = stored_session(sso, idp)
+
+    assert session["expires_at"] == pytest.approx(time.time() + 300, abs=60)
+    assert session["token"]["expires_at"] == session["expires_at"]
+    assert session["token"]["issued_at"] == pytest.approx(time.time(), abs=60)
 
 
 # ── MCP OAuth: authorize and callback ──────────────────────────────────────

@@ -9,14 +9,19 @@ key under the same `kid`, the way an IdP rotates without renaming its key.
 The token endpoint also takes `grant_type=refresh_token`: a live refresh token gets new tokens
 and is spent (rotation), a spent, revoked or unknown one answers `invalid_grant`. Setting
 `token_lifetime` shortens the `expires_in` of the tokens it issues next,
-`id_token_lifetime` gives the ID token of the next sign-in a lifetime of its own,
-`revoke_refresh_tokens()` withdraws every refresh token issued so far and `refresh_delay` holds
-each refresh answer back that many seconds after the token was spent, so concurrent refreshes
-overlap.
+`id_token_lifetime` gives the ID token of the next sign-in a lifetime of its own, `sends_expiry`
+and `sends_refresh_token` leave either out of the answers, `revoke_refresh_tokens()` withdraws
+every refresh token issued so far and `refresh_delay` holds each refresh answer back that many
+seconds after the token was spent, so concurrent refreshes overlap. `jwks_refused_agent` makes
+the key endpoint answer 403 to a client whose User-Agent starts with it, the way a provider's
+firewall turns away anonymous scripts.
 
 `sso_env(provider)` is the environment that points an instance at it, `sign_in(instance)` walks
 the browser's redirect chain with httpx and returns the session the callback handed out, and
 `oauth_settings(instance, ...)` changes admin-panel OAuth settings for the length of a block.
+`store_oauth_entry(instance, account_id, oauth)` gives an account the `oauth` column an older
+release wrote (a sub stored as a JSON number, extra keys beside it), and `oauth_entry` reads the
+column back the way the admin's user list shows it.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
 
+from harness.backends import write_rows
 from harness.instance import LaunchedInstance, free_port
 
 CLIENT_ID = "owui-test-client"
@@ -78,6 +84,9 @@ class OidcProvider:
     token_lifetime: int = 3600  # seconds, for access tokens and ID tokens issued from now on
     id_token_lifetime: int | None = None  # seconds, for ID tokens only when set
     refresh_delay: float = 0.0  # seconds a refresh answer waits after spending the token
+    sends_expiry: bool = True  # whether token answers carry `expires_in`
+    sends_refresh_token: bool = True
+    jwks_refused_agent: str | None = None  # a User-Agent prefix the key endpoint answers 403
 
     @property
     def issuer(self) -> str:
@@ -95,6 +104,9 @@ class OidcProvider:
             self.token_lifetime = 3600
             self.id_token_lifetime = None
             self.refresh_delay = 0.0
+            self.sends_expiry = True
+            self.sends_refresh_token = True
+            self.jwks_refused_agent = None
         self.sign_in_as()
 
     def sign_in_as(
@@ -264,15 +276,21 @@ class OidcProvider:
         answer = {
             "access_token": access_token,
             "token_type": "Bearer",
-            "expires_in": self.token_lifetime,
-            "refresh_token": refresh_token,
+            **({"expires_in": self.token_lifetime} if self.sends_expiry else {}),
+            **({"refresh_token": refresh_token} if self.sends_refresh_token else {}),
             **({"id_token": id_token} if id_token else {}),
             "scope": "openid email profile",
         }
         with self.lock:
-            self.refresh_tokens[refresh_token] = {"userinfo": dict(userinfo), "sub": sub}
+            if self.sends_refresh_token:
+                self.refresh_tokens[refresh_token] = {"userinfo": dict(userinfo), "sub": sub}
             self.issued.append(answer)
         return answer
+
+    def refuses_key_fetch(self, user_agent: str) -> bool:
+        with self.lock:
+            refused = self.jwks_refused_agent
+        return bool(refused) and user_agent.startswith(refused)
 
     def _userinfo(self, authorization: str) -> tuple[int, dict]:
         token = authorization.removeprefix("Bearer ").strip()
@@ -320,6 +338,10 @@ def serve() -> tuple[OidcProvider, Callable[[], None]]:
             entry = self._record()
             if entry.path == "/.well-known/openid-configuration":
                 self._send(200, provider.discovery())
+            elif entry.path == "/jwks" and provider.refuses_key_fetch(
+                entry.headers.get("User-Agent", "")
+            ):
+                self._send(403, {"error": "forbidden"})
             elif entry.path == "/jwks":
                 self._send(200, provider.jwks())
             elif entry.path == "/authorize":
@@ -436,3 +458,19 @@ def group_member_ids(instance: LaunchedInstance, group: dict) -> list[str]:
         exported = admin.get(f"/api/v1/groups/id/{group['id']}/export")
     exported.raise_for_status()
     return exported.json()["user_ids"]
+
+
+def store_oauth_entry(instance: LaunchedInstance, account_id: str, oauth: dict) -> None:
+    """Write the account's `oauth` column as given, the way an older release left it."""
+    statement = 'UPDATE "user" SET oauth = :oauth WHERE id = :account'
+    write_rows(instance, statement, [{"oauth": json.dumps(oauth), "account": account_id}])
+
+
+def oauth_entry(instance: LaunchedInstance, email: str) -> dict | None:
+    """The `oauth` column of the account with `email`, as the admin's user list shows it."""
+    with instance.client() as admin:
+        listed = admin.get("/api/v1/users/", params={"query": email})
+    listed.raise_for_status()
+    matches = [user for user in listed.json()["users"] if user["email"] == email]
+    assert len(matches) == 1, f"expected one account for {email}, got {matches}"
+    return matches[0]["oauth"]

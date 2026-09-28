@@ -14,13 +14,22 @@ open-webui 0.11.1 gathered these fixes to the provider sign-in path:
 * `d799e81ed` / `e96844581`: token exchange skipped role and group mapping, and a provider that
   sent no roles claim reset an existing account to the default role.
 * `c2107e5bb`: signout left the `owui-session` cookie and its server-side session behind.
+* `aeda6ff13`: back-channel logout fetched the provider's keys with an anonymous `PyJWKClient`,
+  so a provider whose key endpoint turns away such clients never signed anyone out. The keys
+  now come through the provider's configured client.
+
+Accounts linked by releases before `a6834f089` are written into the instance's database the way
+those releases left them (the sub as a JSON number, other keys beside it) and then signed in to.
 
 Twin of unit/security/test_oauth_identity.py.
 
 Discriminates: passes on dev bbfa876af; with each fix reverted in a copy, the matching narrow
 tests fail (the vendor header refuses the sign-in, the pattern sub lands on the victim's
 account, the back-channel logout misses the numeric sub's session, the exchange leaves the group
-unjoined, the admin comes back pending and signout leaves `owui-session` in the browser).
+unjoined, the admin comes back pending and signout leaves `owui-session` in the browser); with
+a6834f089 reverted the JSON-number account is missed and its entry loses its other keys, with
+73c1f5806 reverted the entry with other keys is missed, and with the key fetch put back on
+`PyJWKClient` the logout answers 400.
 """
 
 from __future__ import annotations
@@ -30,14 +39,17 @@ import secrets
 import httpx
 import pytest
 
+from harness.actors import create_user
 from harness.oidc_provider import (
     group_member_ids,
     group_named,
+    oauth_entry,
     oauth_settings,
     session_user,
     shared_provider,
     sign_in,
     sso_env,
+    store_oauth_entry,
 )
 
 pytestmark = [
@@ -143,6 +155,50 @@ def test_a_back_channel_logout_reaches_an_account_with_a_numeric_sub(sso, idp):
     assert disconnect.status_code == expected, "the logout missed the account's SSO session"
 
 
+def verified_sign_in(sso, idp):
+    """A fresh person signed in with the user role, so their session may use the API."""
+    with oauth_settings(sso, ENABLE_OAUTH_ROLE_MANAGEMENT=True):
+        idp.sign_in_as(roles=["user"])
+        account = sign_in(sso)
+    assert account.token, f"the sign-in failed: {account.error}"
+    return account
+
+
+def test_a_back_channel_logout_fetches_the_keys_through_the_providers_client(sso, idp):
+    """Narrow (aeda6ff13): a provider whose key endpoint refuses anonymous scripts still gets
+    its logout honoured, because the keys are fetched the way sign-in fetches them."""
+    account = verified_sign_in(sso, idp)
+    sub = idp.claims["sub"]
+    idp.jwks_refused_agent = "Python-urllib"
+
+    logout = httpx.post(
+        f"{sso.base_url}/oauth/backchannel-logout",
+        data={"logout_token": idp.logout_token(sub)},
+        timeout=60.0,
+    )
+
+    assert logout.status_code == 200, f"the logout was refused: {logout.text}"
+    with sso.client(account.token) as client:
+        disconnect = client.delete("/api/v1/auths/oauth/sessions/oidc")
+    expected = 401 if sso.redis_url else 404
+    assert disconnect.status_code == expected, "the logout missed the account's SSO session"
+
+
+def test_a_logout_signed_with_a_key_the_provider_never_published_is_refused(sso, idp):
+    """Nearby: fetching keys another way still checks the signature against them."""
+    account = verified_sign_in(sso, idp)
+
+    logout = httpx.post(
+        f"{sso.base_url}/oauth/backchannel-logout",
+        data={"logout_token": idp.logout_token(idp.claims["sub"], signature="foreign-key")},
+        timeout=60.0,
+    )
+
+    assert logout.status_code == 400, logout.text
+    with sso.client(account.token) as client:
+        assert client.delete("/api/v1/auths/oauth/sessions/oidc").status_code == 200
+
+
 def test_a_numeric_sub_signs_in_to_the_same_account_twice(sso, idp):
     """Nearby: a provider sending the sub as a JSON number keeps one account."""
     sign_in_with_numeric_sub(idp)
@@ -158,6 +214,55 @@ def test_the_same_sub_is_the_same_account_and_a_new_sub_a_new_one(sso, idp):
     assert signed_in_user(sso)["id"] == first["id"]
     idp.sign_in_as()
     assert signed_in_user(sso)["id"] != first["id"]
+
+
+# --------------------------------------------------------------------------- legacy rows
+
+
+def test_an_account_stored_with_a_numeric_sub_still_signs_in(sso, idp):
+    """Narrow (#28954): the JSON number an older release stored matches the provider's text sub,
+    and the sign-in rewrites it as text without dropping the entry's other keys."""
+    numeric_sub = 700_000_000 + secrets.randbelow(10**8)
+    account = create_user(sso)
+    store_oauth_entry(sso, account.id, {"oidc": {"sub": numeric_sub, "email": account.email}})
+
+    idp.sign_in_as(sub=str(numeric_sub), email=account.email)
+    result = sign_in(sso)
+
+    assert result.token, f"the account stored with a numeric sub could not sign in: {result.error}"
+    assert session_user(sso, result.token)["id"] == account.id
+    assert oauth_entry(sso, account.email) == {
+        "oidc": {"sub": str(numeric_sub), "email": account.email}
+    }, "the sign-in did not store the sub as text beside the entry's other keys"
+
+
+def test_an_entry_with_keys_besides_the_sub_still_matches(sso, idp):
+    """Narrow (#28624): the match is on the sub's value, not on the serialised entry."""
+    sub = f"sub-{secrets.token_hex(4)}"
+    account = create_user(sso)
+    store_oauth_entry(sso, account.id, {"oidc": {"sub": sub, "email": account.email}})
+
+    idp.sign_in_as(sub=sub, email=account.email)
+    result = sign_in(sso)
+
+    assert result.token, f"the entry with other keys was not matched: {result.error}"
+    assert session_user(sso, result.token)["id"] == account.id
+
+
+def test_linking_by_email_keeps_the_other_providers_entries(sso, idp):
+    """Nearby: merging a sign-in into an account by email adds the provider's entry beside the
+    others instead of replacing them."""
+    account = create_user(sso)
+    store_oauth_entry(sso, account.id, {"github": {"sub": "4242"}})
+    sub = f"sub-{secrets.token_hex(4)}"
+
+    with oauth_settings(sso, OAUTH_MERGE_ACCOUNTS_BY_EMAIL=True):
+        idp.sign_in_as(sub=sub, email=account.email)
+        result = sign_in(sso)
+
+    assert result.token, f"the sign-in was not merged into the account: {result.error}"
+    assert session_user(sso, result.token)["id"] == account.id
+    assert oauth_entry(sso, account.email) == {"github": {"sub": "4242"}, "oidc": {"sub": sub}}
 
 
 # --------------------------------------------------------------------------- roles
