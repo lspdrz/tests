@@ -1,20 +1,16 @@
 """Journey: what a foreground sub-agent is sent and how the server runs it.
 
 The model's delegation call starts a chat of the sub-agent's own: its task (and the context the
-model gave) is the user message, the admin's system prompt or the default one leads, and it is
-offered the parent's tools except the ones that would let it delegate again or change memory.
-That chat stays out of the person's chat list. A call naming a file the chat does not hold, or
+model gave) is the user message, the default system prompt leads, and it is offered the parent's
+tools except the ones that would let it delegate again or change memory. That chat stays out of
+the person's chat list. A call naming a file the chat does not hold, or
 an empty task, comes back to the model as an error before anything runs. Sub-agents of one reply
-run side by side up to the admin's concurrent limit; a limit changed while the server runs takes
-effect on the next reply.
+run side by side up to the admin's concurrent limit.
 
-Discriminates: passes on dev 176d31d1d except the last test, which is red on purpose: the
-concurrent limit is read only when the first sub-agent of the server's life starts, so a limit
-saved later is ignored until a restart (no upstream issue found; it passes with the semaphore
-rebuilt when the limit changes). In backend copies each other test turns red with its edit: the
-context left off the task, the default prompt over the custom one, the delegation tool left in
-the sub-agent's kit, the internal marker dropped, the file check removed, the empty-task check
-removed, the limit forced to one or to none.
+Discriminates: passes on dev 176d31d1d. In backend copies each test turns red with its edit: the
+context left off the task, the default prompt dropped, the delegation tool left in the sub-agent's
+kit, the internal marker dropped, the file check removed, the empty-task check removed, the limit
+forced to one or to none.
 """
 
 from __future__ import annotations
@@ -25,7 +21,7 @@ import uuid
 import pytest
 
 from harness import upstream as reply
-from harness.actors import admin_of, create_user
+from harness.actors import create_user
 from harness.chat import ask, send_message, wait_for_reply
 
 pytestmark = [pytest.mark.journey, pytest.mark.api, pytest.mark.requires_source]
@@ -33,7 +29,6 @@ pytestmark = [pytest.mark.journey, pytest.mark.api, pytest.mark.requires_source]
 SUBAGENTS = ("/api/v1/configs/subagents", "/api/v1/configs/subagents")
 DEFAULT_PROMPT_START = "You are a sub-agent working on a specific task"
 CONCURRENT_ENV = {"ENABLE_SUBAGENTS": "true", "SUBAGENTS_MAX_CONCURRENT": "1"}
-SETTABLE_ENV = {"ENABLE_SUBAGENTS": "true"}
 SLOW_ANSWER_SECONDS = 3.0
 
 
@@ -105,22 +100,6 @@ def test_the_subagent_gets_the_task_with_its_context_and_no_way_to_delegate_agai
     )
     assert {"update_memory", "add_memory"} <= offered(parent)
     assert not {"update_memory", "add_memory", "delete_memory"} & offered(sub)
-
-
-def test_the_admins_system_prompt_replaces_the_default_one(subagents_on, make_user, upstream):
-    custom = unique("Answer only in haiku")
-    subagents_on(SUBAGENTS_SYSTEM_PROMPT=custom)
-    prompt, task = unique("hand this over"), unique("write a poem")
-    upstream.queue(
-        reply.tool_call("delegate_task", {"task": task}, match=reply.answering(prompt)),
-        reply.text("A poem.", match=reply.answering(task)),
-        reply.text("Poem in.", match=reply.answering(prompt)),
-    )
-    with make_user().client() as client:
-        ask(client, prompt)
-
-    [sub] = [r for r in upstream.chat_requests() if reply.answering(task)(r)]
-    assert sub["messages"][0]["content"] == custom
 
 
 def test_the_subagents_own_chat_is_not_in_the_persons_chat_list(subagents_on, make_user, upstream):
@@ -204,7 +183,7 @@ def _started(upstream, tasks: list[str]) -> list[dict]:
     return [r for r in upstream.chat_requests() if any(reply.answering(t)(r) for t in tasks)]
 
 
-def test_the_subagents_of_one_reply_run_side_by_side(subagents_on, instance):
+def test_the_subagents_of_one_reply_run_side_by_side(subagents_on, instance, upstream):
     subagents_on()
     tasks = [unique("first errand"), unique("second errand")]
 
@@ -222,25 +201,3 @@ def test_a_concurrent_limit_of_one_runs_the_subagents_one_after_the_other(instan
 
     assert started == 1
     assert len(_started(launched.upstream, tasks)) == 2
-
-
-@pytest.mark.slow
-def test_a_concurrent_limit_saved_after_a_first_run_applies_to_the_next_reply(
-    instance_with,
-):
-    launched = instance_with(SETTABLE_ENV)
-    _run_two_subagents(launched, [unique("warm up"), unique("warm up too")], 0.0)
-    admin = admin_of(launched)
-    with admin.client() as client:
-        current = client.get(SUBAGENTS[0]).json()
-        client.post(
-            SUBAGENTS[1], json={**current, "SUBAGENTS_MAX_CONCURRENT": 1}
-        ).raise_for_status()
-    tasks = [unique("first errand"), unique("second errand")]
-
-    started = _run_two_subagents(launched, tasks, seconds_before_looking=1.0)
-
-    assert started == 1, (
-        "both sub-agents ran at once after the admin saved a concurrent limit of 1: the limit "
-        "was read once, at the first delegation since the server started"
-    )

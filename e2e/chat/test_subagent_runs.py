@@ -112,9 +112,10 @@ def test_the_result_row_opens_to_the_task_and_the_answer(
     expect(last_reply(page)).not_to_contain_text(answer)
     sub_row(page, task).click()
 
-    expect(last_reply(page)).to_contain_text(task)
-    expect(last_reply(page)).to_contain_text("the country is Austria")
-    expect(last_reply(page)).to_contain_text(answer)
+    # exact matches: the task also sits in the row's own name
+    expect(last_reply(page).get_by_text(task, exact=True)).to_be_visible()
+    expect(last_reply(page).get_by_text("the country is Austria", exact=True)).to_be_visible()
+    expect(last_reply(page).get_by_text(answer, exact=True)).to_be_visible()
 
 
 def test_the_row_reads_executing_while_the_subagent_is_still_working(
