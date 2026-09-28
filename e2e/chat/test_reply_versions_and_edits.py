@@ -1,0 +1,171 @@
+"""Reply versions and message edits, driven through the browser against the scripted model.
+
+Regenerating a reply keeps the old one as a version behind a `1/2` switcher, editing a sent
+question starts a branch with its own reply, and an edited reply or a deleted version is what a
+reload shows. Each test signs in as a fresh account and scripts every reply by its prompt.
+
+Discriminates: passes on upstream dev `176d31d1d`; in a frontend build with the reply switcher
+removed, the edit-and-send branch replacing the question, an edited reply not saved, continue
+sent without its marker or a deleted version not stored, the matching tests turn red.
+"""
+
+from __future__ import annotations
+
+import pytest
+from playwright.sync_api import Locator, Page, expect
+
+from harness import upstream as reply
+from utils.chat_ui import conversation, expect_reply, last_reply, send
+
+pytestmark = [pytest.mark.journey, pytest.mark.requires_browser, pytest.mark.requires_source]
+
+
+@pytest.fixture
+def chat_page(page_for, make_user):
+    page = page_for(make_user())
+    page.goto("/")
+    return page
+
+
+def _reply_buttons(page: Page) -> Locator:
+    last_reply(page).hover()
+    return conversation(page)
+
+
+def _regenerate(page: Page) -> None:
+    _reply_buttons(page).get_by_role("button", name="Regenerate").last.click()
+    page.get_by_text("Try Again").click()
+
+
+def _last_question(page: Page) -> Locator:
+    question = conversation(page).locator(".chat-user").last
+    question.hover()
+    return question
+
+
+def test_regenerating_a_reply_keeps_the_first_as_a_version_behind_a_switcher(chat_page, upstream):
+    upstream.queue(
+        reply.text("first version", match=reply.answering("name a colour")),
+        reply.text("second version", match=reply.answering("name a colour")),
+    )
+    send(chat_page, "name a colour")
+    expect_reply(chat_page, "first version")
+    expect(conversation(chat_page).get_by_text("1/2")).to_be_hidden()
+
+    _regenerate(chat_page)
+    expect_reply(chat_page, "second version")
+    expect(conversation(chat_page).get_by_text("2/2")).to_be_visible()
+
+    conversation(chat_page).get_by_role("button", name="Previous message").click()
+    expect_reply(chat_page, "first version")
+    expect(conversation(chat_page).get_by_text("1/2")).to_be_visible()
+    expect(conversation(chat_page).get_by_text("second version")).to_be_hidden()
+
+    conversation(chat_page).get_by_role("button", name="Next message").click()
+    expect_reply(chat_page, "second version")
+
+
+def test_both_versions_of_a_regenerated_reply_are_there_after_a_reload(chat_page, upstream):
+    upstream.queue(
+        reply.text("kept version", match=reply.answering("name a fruit")),
+        reply.text("newer version", match=reply.answering("name a fruit")),
+    )
+    send(chat_page, "name a fruit")
+    expect_reply(chat_page, "kept version")
+    _regenerate(chat_page)
+    expect_reply(chat_page, "newer version")
+
+    chat_page.reload()
+    expect_reply(chat_page, "newer version")
+    expect(conversation(chat_page).get_by_text("2/2")).to_be_visible()
+    conversation(chat_page).get_by_role("button", name="Previous message").click()
+    expect_reply(chat_page, "kept version")
+
+
+def test_continue_response_appends_to_the_same_reply(chat_page, upstream):
+    upstream.queue(
+        reply.text("The story begins", match=reply.answering("tell a story")),
+        reply.text(" and then it ends.", match=reply.answering("tell a story")),
+    )
+    send(chat_page, "tell a story")
+    expect_reply(chat_page, "The story begins")
+
+    _reply_buttons(chat_page).get_by_role("button", name="Continue Response").click()
+    expect_reply(chat_page, "and then it ends.")
+    expect(last_reply(chat_page)).to_contain_text("The story begins")
+    expect(conversation(chat_page).locator(".chat-assistant")).to_have_count(1)
+    expect(conversation(chat_page).get_by_text("2/2")).to_be_hidden()
+    resumed_from = upstream.chat_requests()[-1]["messages"][-1]
+    assert (resumed_from["role"], resumed_from["content"]) == ("assistant", "The story begins")
+
+    chat_page.reload()
+    expect_reply(chat_page, "and then it ends.")
+    expect(last_reply(chat_page)).to_contain_text("The story begins")
+
+
+def test_sending_an_edited_question_starts_a_branch_with_its_own_reply(chat_page, upstream):
+    upstream.queue(
+        reply.text("answer to the original", match=reply.answering("original question")),
+        reply.text("answer to the rewrite", match=reply.answering("rewritten question")),
+    )
+    send(chat_page, "original question")
+    expect_reply(chat_page, "answer to the original")
+
+    question = _last_question(chat_page)
+    question.get_by_role("button", name="Edit").click()
+    question.locator("textarea").fill("rewritten question")
+    question.get_by_role("button", name="Send").click()
+
+    expect_reply(chat_page, "answer to the rewrite")
+    expect(conversation(chat_page).get_by_text("rewritten question")).to_be_visible()
+    expect(conversation(chat_page).get_by_text("2/2")).to_be_visible()
+    expect(conversation(chat_page).get_by_text("original question")).to_be_hidden()
+
+    chat_page.reload()
+    expect_reply(chat_page, "answer to the rewrite")
+    expect(conversation(chat_page).get_by_text("2/2")).to_be_visible()
+
+    _last_question(chat_page).get_by_role("button", name="Previous message").click()
+    expect(conversation(chat_page).get_by_text("original question")).to_be_visible()
+    expect_reply(chat_page, "answer to the original")
+    expect(conversation(chat_page).get_by_text("answer to the rewrite")).to_be_hidden()
+    expect(conversation(chat_page).get_by_text("1/2")).to_be_visible()
+
+
+def test_saving_an_edited_reply_keeps_the_edit_after_a_reload(chat_page, upstream):
+    upstream.queue(reply.text("a reply with a typo", match=reply.answering("say something")))
+    send(chat_page, "say something")
+    expect_reply(chat_page, "a reply with a typo")
+
+    _reply_buttons(chat_page).get_by_role("button", name="Edit").last.click()
+    editor = last_reply(chat_page).locator("textarea")
+    editor.fill("a reply without the typo")
+    last_reply(chat_page).get_by_role("button", name="Save", exact=True).click()
+    expect_reply(chat_page, "a reply without the typo")
+    expect(conversation(chat_page).get_by_text("with a typo")).to_be_hidden()
+    expect(conversation(chat_page).get_by_text("1/2")).to_be_hidden()
+
+    chat_page.reload()
+    expect_reply(chat_page, "a reply without the typo")
+    expect(conversation(chat_page).get_by_text("with a typo")).to_be_hidden()
+
+
+def test_deleting_a_reply_version_leaves_the_other_one_after_a_reload(chat_page, upstream):
+    upstream.queue(
+        reply.text("version to keep", match=reply.answering("pick a number")),
+        reply.text("version to delete", match=reply.answering("pick a number")),
+    )
+    send(chat_page, "pick a number")
+    expect_reply(chat_page, "version to keep")
+    _regenerate(chat_page)
+    expect_reply(chat_page, "version to delete")
+
+    _reply_buttons(chat_page).get_by_role("button", name="Delete").last.click()
+    chat_page.get_by_role("button", name="Confirm").click()
+    expect_reply(chat_page, "version to keep")
+    expect(conversation(chat_page).get_by_text("version to delete")).to_be_hidden()
+    expect(conversation(chat_page).get_by_text("1/2")).to_be_hidden()
+
+    chat_page.reload()
+    expect_reply(chat_page, "version to keep")
+    expect(conversation(chat_page).get_by_text("version to delete")).to_be_hidden()
