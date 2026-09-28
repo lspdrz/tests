@@ -7,6 +7,9 @@ answer can still be kept through the header's Save Chat button, and an account t
 Temporary Chat by Default in its Interface settings starts every new chat temporary.
 
 Twin of integration/chat/test_temporary_chat.py.
+
+Discriminates: passes on dev 176d31d1d, fails with `is_saved_chat_id` treating a `temporary:` id
+as saved (it reaches the sidebar, the search and the database).
 """
 
 from __future__ import annotations
@@ -42,7 +45,8 @@ def stored_chats(account, text: str) -> list[dict]:
         listed = client.get("/api/v1/chats/", params={"page": 1})
     found.raise_for_status()
     listed.raise_for_status()
-    return [*found.json(), *[chat for chat in listed.json() if text in chat["title"]]]
+    matching = [*found.json(), *[chat for chat in listed.json() if text in chat["title"]]]
+    return list({chat["id"]: chat for chat in matching}.values())
 
 
 def sidebar_entry(page: Page):
@@ -91,7 +95,7 @@ def test_turning_temporary_chat_off_again_saves_the_chat(page_for, make_user, up
     expect_reply(page, ANSWER)
     expect(page).to_have_url(re.compile(r"/c/[\w-]+$"))
     expect(sidebar_entry(page)).to_be_visible()
-    assert len(stored_chats(account, "Carinthia")) >= 1
+    assert len(stored_chats(account, "Carinthia")) == 1
 
 
 def test_saving_a_temporary_chat_keeps_the_conversation(page_for, make_user, upstream):
@@ -132,7 +136,7 @@ def test_temporary_chat_by_default_starts_new_chats_temporary(page_for, make_use
     with page.expect_response(lambda response: "/user/settings/update" in response.url):
         settings.get_by_role("switch", name="Temporary Chat by Default").click()
     page.keyboard.press("Escape")
-    page.goto("/")
+    page.get_by_role("link", name="New Chat").click()
 
     expect(temporary_label(page)).to_be_visible()
     send(page, PROMPT)

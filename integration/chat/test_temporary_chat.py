@@ -6,6 +6,9 @@ no chat, so the account's chat list and search stay empty while the same message
 makes a saved chat.
 
 Twin of e2e/chat/test_temporary_chat.py.
+
+Discriminates: passes on dev 176d31d1d, fails with `is_saved_chat_id` treating a `temporary:` id
+as saved (the temporary chat is stored).
 """
 
 from __future__ import annotations

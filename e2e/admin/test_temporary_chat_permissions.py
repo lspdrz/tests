@@ -4,6 +4,9 @@ Admin Panel > Users > Groups > Default permissions holds Allow Temporary Chat an
 on, Enforce Temporary Chat. With the first off an account's header has no Temporary Chat button
 and its chats are saved. With the second on the button is gone as well and every new chat is
 temporary, so nothing it sends is stored. An admin keeps the button whatever the defaults say.
+
+Discriminates: passes on dev 176d31d1d, fails with `is_saved_chat_id` treating a `temporary:` id
+as saved (an enforced temporary chat is stored).
 """
 
 from __future__ import annotations
