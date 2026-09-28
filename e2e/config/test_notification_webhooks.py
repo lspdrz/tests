@@ -7,7 +7,9 @@ finished reply calls every enabled target that subscribes to it (an away target 
 the user is on the page, a switched-off one stays quiet always) and with the admin switch off the
 section is not offered and nothing is called. An admin adds an event webhook under Admin Settings
 > General, and a new account then reaches its URL as a `user.created` event until it is
-switched off. Loopback URLs are only fetchable on an instance booted with local fetching allowed.
+switched off. The chat link a finished reply sends must open that chat; it is rewritten from
+`/c/<id>` to `/<id>`, which the frontend has no route for (404), so that test is red until fixed.
+Loopback URLs are only fetchable on an instance booted with local fetching allowed.
 
 Discriminates: passes on the 176d31d1d frontend and backend; in frontend copies, with the target
 save sending no URL the save test fails, with the Send Test call removed the test-button test
@@ -99,6 +101,10 @@ def _stored_targets(account: Actor) -> list[dict]:
     return listed.json()["targets"]
 
 
+def _stored_target(account: Actor, target_id: str) -> dict:
+    return next(target for target in _stored_targets(account) if target["id"] == target_id)
+
+
 def _wait_for(condition, timeout: float = DELIVERY_TIMEOUT) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -174,15 +180,21 @@ def test_a_finished_reply_calls_an_always_target_with_the_reply(
     [delivered] = hook.requests_to("/hook")
     body = delivered.json()
     assert (body["action"], body["message"]) == ("chat", "the codeword is pelican")
-    [chat] = _chats(account)
-    assert chat["id"] in body["url"]
 
 
-def _chats(account: Actor) -> list[dict]:
-    with account.client() as client:
-        listed = client.get("/api/v1/chats/")
-    listed.raise_for_status()
-    return listed.json()
+def test_the_chat_link_in_a_finished_reply_notification_opens_the_chat(
+    fetching_instance, user_webhooks, hook, page_for
+):
+    account = create_user(fetching_instance)
+    _add_target(account, "ops", f"{hook.base_url}/hook", delivery="always")
+    page = page_for(account)
+    _reply_to(page, fetching_instance, "say the codeword", "the codeword is pelican")
+    assert _wait_for(lambda: hook.requests_to("/hook")), "the finished reply called nothing"
+    link = hook.requests_to("/hook")[0].json()["url"]
+
+    page.goto(link)
+
+    expect_reply(page, "the codeword is pelican")
 
 
 def test_an_away_target_stays_quiet_while_the_user_is_on_the_page(
@@ -209,9 +221,12 @@ def test_a_target_switched_off_in_the_list_is_not_called(
     page = page_for(account)
     settings = _open_notifications(page)
 
-    settings.get_by_role("switch", name="Enabled").first.click()
+    row = settings.get_by_text("off", exact=True).locator(
+        "xpath=ancestor::div[.//button[@role='switch']][1]"
+    )
+    row.get_by_role("switch", name="Enabled").click()
 
-    assert _wait_for(lambda: not _stored_targets(account)[0]["enabled"])
+    assert _wait_for(lambda: _stored_target(account, "off")["enabled"] is False)
     page.keyboard.press("Escape")
     _reply_to(page, fetching_instance, "say the codeword", "the codeword is ibis")
     assert _wait_for(lambda: hook.requests_to("/always")), "the enabled target was not called"
@@ -264,6 +279,11 @@ def test_with_user_webhooks_off_a_finished_reply_calls_nothing(
     ]
 
 
+def _webhook_enabled(client, name: str) -> bool:
+    [webhook] = [w for w in client.get("/api/events/webhooks").json() if w["name"] == name]
+    return webhook["enabled"]
+
+
 def _add_event_webhook(page: Page, name: str, url: str, pattern: str) -> None:
     page.goto("/admin/settings/general")
     general = page.get_by_role("dialog")
@@ -301,19 +321,13 @@ def test_an_event_webhook_switched_off_in_the_list_is_not_called(
     admin = create_user(fetching_instance, role="admin")
     page = page_for(admin)
     _add_event_webhook(page, "Paused audit", f"{hook.base_url}/events", "user.created")
-    row = page.get_by_role("dialog").locator("div.flex.w-full").filter(has_text="Paused audit").last
+    row = page.get_by_text("Paused audit", exact=True).locator(
+        "xpath=ancestor::div[.//button[@role='switch']][1]"
+    )
 
     row.get_by_role("switch").click()
     with admin_of(fetching_instance).client() as client:
-        assert _wait_for(
-            lambda: (
-                not [
-                    w
-                    for w in client.get("/api/events/webhooks").json()
-                    if w["name"] == "Paused audit"
-                ][0]["enabled"]
-            )
-        )
+        assert _wait_for(lambda: _webhook_enabled(client, "Paused audit") is False)
     create_user(fetching_instance)
     row.get_by_role("switch").click()
     second = create_user(fetching_instance)
