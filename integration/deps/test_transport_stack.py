@@ -1,11 +1,12 @@
 """Dependency smoke: how responses and live updates travel, each library through its feature.
 
 starlette-compress compresses a response in the encoding the client asks for, with Brotli,
-gzip and zstandard doing the work: a response sent whole goes through `brotli.compress`, a file
-streamed in parts through a `brotli.Compressor`. /api/changelog is a large public response that
-shows it, and its body is CHANGELOG.md turned into HTML by Markdown (bold text and links
-included) and split into versions and items by BeautifulSoup, each item cut at its first ": "
-into a title and its text.
+gzip and zstandard doing the work, and leaves a small response, or one for a client that names
+no encoding, as it is (twin of unit/deps/test_starlette_compress.py). A response sent whole goes
+through `brotli.compress`, a file streamed in parts through a `brotli.Compressor`.
+/api/changelog is a large public response that shows it, and its body is CHANGELOG.md turned
+into HTML by Markdown (bold text and links included) and split into versions and items by
+BeautifulSoup, each item cut at its first ": " into a title and its text.
 aiohttp decodes a Brotli-encoded provider reply with brotlicffi (Brotli when that is absent).
 python-socketio carries the chat events to the browser: over a websocket by default, and over
 HTTP long polling alone when `ENABLE_WEBSOCKET_SUPPORT` is off, which then refuses a websocket
@@ -19,7 +20,9 @@ server has folded its oldest updates into one snapshot, and an update that arriv
 once.
 
 Discriminates: passes on dev bbfa876af; in a backend copy, dropping `CompressMiddleware` fails
-every encoding, a `brotli.Compressor` that emits nothing (patched in at import) fails the
+every encoding, `CompressMiddleware` with a `minimum_size` of 1 compresses the health check and
+one that treats a request without `Accept-Encoding` as asking for gzip compresses the plain
+changelog, a `brotli.Compressor` that emits nothing (patched in at import) fails the
 streamed download and the Brotli changelog, skipping `markdown.markdown` empties the changelog,
 an item whose content is its raw HTML fails the changelog test, a provider session with
 `auto_decompress=False` hands the Brotli bytes to the stream parser (as does a brotlicffi
@@ -76,6 +79,26 @@ def test_the_changelog_is_compressed_in_the_encoding_asked_for(instance, encodin
     assert compressed.headers.get("content-encoding") == encoding
     assert compressed.num_bytes_downloaded < plain.num_bytes_downloaded
     assert compressed.json() == plain.json()
+
+
+def test_a_small_response_is_sent_plain_even_to_a_client_that_accepts_gzip(instance):
+    with httpx.Client(base_url=instance.base_url, timeout=60.0) as client:
+        health = client.get("/health", headers={"Accept-Encoding": "gzip"})
+
+    assert health.status_code == 200, health.text
+    assert "content-encoding" not in health.headers
+    assert health.json() == {"status": True}
+
+
+def test_a_client_that_names_no_encoding_gets_the_body_plain(instance):
+    with httpx.Client(base_url=instance.base_url, timeout=60.0) as client:
+        request = client.build_request("GET", "/api/changelog")
+        del request.headers["Accept-Encoding"]
+        answered = client.send(request)
+
+    assert answered.status_code == 200, answered.text
+    assert "content-encoding" not in answered.headers
+    assert answered.num_bytes_downloaded == len(answered.content) > 10_000
 
 
 def test_a_large_file_download_is_streamed_brotli_compressed(make_user):

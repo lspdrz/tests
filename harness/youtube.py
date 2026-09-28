@@ -7,10 +7,11 @@ three pages the loader reads (the watch page, the player API and the transcript 
 instance trusts the authority through `youtube_env(fake)`, which sets `REQUESTS_CA_BUNDLE`.
 
 `fake.videos[video_id]` says what YouTube answers for a video, built with the helpers here:
-`with_transcript(*lines)`, `unplayable(status, reason)`, `without_captions()`, `blocked_page()`
-(the recaptcha page a blocked server gets), `rate_limited()` (HTTP 429) or
-`needs_verification()` (a transcript URL that asks for a proof-of-origin token). `fake.requests`
-lists every `(method, path)` it was sent.
+`with_transcript(*lines)`, `with_tracks(*tracks)` (several caption tracks, each a `Track` with its
+language, lines and whether YouTube generated it), `unplayable(status, reason)`,
+`without_captions()`, `blocked_page()` (the recaptcha page a blocked server gets), `rate_limited()`
+(HTTP 429) or `needs_verification()` (a transcript URL that asks for a proof-of-origin token).
+`fake.requests` lists every `(method, path)` it was sent.
 """
 
 from __future__ import annotations
@@ -44,20 +45,43 @@ class Video:
     watch_page: str | None = None
     status: int = 200
     transcript: tuple[str, ...] = ()
+    # (language code, generated) -> lines, for a video with several caption tracks
+    tracks: dict[tuple[str, bool], tuple[str, ...]] = field(default_factory=dict)
+
+
+@dataclass
+class Track:
+    language_code: str
+    lines: tuple[str, ...]
+    generated: bool = False
+
+
+def _caption_track(language_code: str, generated: bool) -> dict:
+    kind = "asr" if generated else ""
+    return {
+        "baseUrl": f"https://www.youtube.com/api/timedtext?lang={language_code}&kind={kind}",
+        "name": {"runs": [{"text": language_code}]},
+        "languageCode": language_code,
+        "kind": kind,
+    }
+
+
+def _playable(*caption_tracks: dict) -> dict:
+    return {
+        "playabilityStatus": {"status": "OK"},
+        "captions": {"playerCaptionsTracklistRenderer": {"captionTracks": list(caption_tracks)}},
+    }
 
 
 def with_transcript(*lines: str, language_code: str = "en", generated: bool = False) -> Video:
-    track = {
-        "baseUrl": "https://www.youtube.com/api/timedtext?lang=" + language_code,
-        "name": {"runs": [{"text": language_code}]},
-        "languageCode": language_code,
-        "kind": "asr" if generated else "",
-    }
-    player = {
-        "playabilityStatus": {"status": "OK"},
-        "captions": {"playerCaptionsTracklistRenderer": {"captionTracks": [track]}},
-    }
-    return Video(player=player, transcript=lines)
+    return Video(player=_playable(_caption_track(language_code, generated)), transcript=lines)
+
+
+def with_tracks(*tracks: Track) -> Video:
+    """A video offering each track, manual or generated, in the order given."""
+    player = _playable(*(_caption_track(track.language_code, track.generated) for track in tracks))
+    lines = {(track.language_code, track.generated): track.lines for track in tracks}
+    return Video(player=player, tracks=lines)
 
 
 def needs_verification() -> Video:
@@ -145,9 +169,13 @@ def _youtube_handler(fake: FakeYouTube):
 
         def _transcript(self, query: dict) -> None:
             video = fake.videos.get(query.get("v", [""])[0], Video())
+            lines = video.transcript
+            if video.tracks:
+                track = (query.get("lang", [""])[0], query.get("kind", [""])[0] == "asr")
+                lines = video.tracks.get(track, ())
             snippets = "".join(
                 f'<text start="{index}.0" dur="1.0">{escape(line)}</text>'
-                for index, line in enumerate(video.transcript)
+                for index, line in enumerate(lines)
             )
             self._answer(200, "text/xml", f"<transcript>{snippets}</transcript>")
 

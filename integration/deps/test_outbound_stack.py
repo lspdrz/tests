@@ -4,26 +4,28 @@ The mcp SDK connects to an MCP tool server when an admin verifies the connection
 tools, and calls a tool when the model asks for one, over an httpx client Open WebUI builds: it
 sends the connection's bearer key, follows a server that moved, and checks the server's certificate
 unless `AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL` is off. validators decides which links a page fetch
-accepts, BeautifulSoup reads the fetched page (its text, and the title, description and language
-stored with it; a `.xml` link through its XML parser), black formats code for the code editor, and
-opentelemetry exports request traces to an OTLP/HTTP collector (requests carries them there, as it
-carries a document to Tika) or, by default, over gRPC, where a busy collector's `RetryInfo`
-(googleapis-common-protos) tells the exporter when to try again. The collector's address is only
-read at boot, so each tracing test boots an instance of its own; the gRPC collector is
-`harness/otlp_collector.py`.
+accepts (a bare hostname only with local fetch on) and which search results survive a domain filter
+(twin of unit/deps/test_validators.py), BeautifulSoup reads the fetched page (its text, and the
+title, description and language stored with it; a `.xml` link through its XML parser), black formats
+code for the code editor, and opentelemetry exports request traces to an OTLP/HTTP collector
+(requests carries them there, as it carries a document to Tika) or, by default, over gRPC, where a
+busy collector's `RetryInfo` (googleapis-common-protos) tells the exporter when to try again. The
+collector's address is only read at boot, so each tracing test boots an instance of its own; the
+gRPC collector is `harness/otlp_collector.py`.
 
 Discriminates: passes on dev bbfa876af; in a backend copy, skipping `session.initialize()` fails the
 MCP verification, building the httpx client without `headers`, with `follow_redirects=False` or with
 `verify=False` always fails the bearer, moved and certificate tests in turn, taking an `isError`
 result for a success fails the failing tool test, dropping the `validators.url` check lets the
-malformed link through to the fetch, a loader that stores no page title fails the metadata test,
-asking BeautifulSoup for an unknown parser in place of "xml" fails the feed test, returning the code
-unformatted fails the formatter, black without string normalisation fails the wrapping test and
-never adding the span processor leaves the collector empty. On dev ef67cc3fa, a
-`google.rpc.error_details_pb2` whose `RetryInfo` reads no delay, placed ahead of the real one in a
-backend copy (a bump that stops parsing it), fails the retry test: the batch comes back long before
-the delay the collector asked for. Exporting with the HTTP exporter in the gRPC branch fails both
-gRPC tests.
+malformed link through to the fetch, calling it without `simple_host` refuses the bare hostname,
+dropping it from the search result filter keeps the malformed results, a loader that stores no page
+title fails the metadata test, asking BeautifulSoup for an unknown parser in place of "xml" fails
+the feed test, returning the code unformatted fails the formatter, black without string
+normalisation fails the wrapping test and never adding the span processor leaves the collector
+empty. On dev ef67cc3fa, a `google.rpc.error_details_pb2` whose `RetryInfo` reads no delay, placed
+ahead of the real one in a backend copy (a bump that stops parsing it), fails the retry test: the
+batch comes back long before the delay the collector asked for. Exporting with the HTTP exporter in
+the gRPC branch fails both gRPC tests.
 """
 
 from __future__ import annotations
@@ -51,7 +53,12 @@ from harness.mcp_server import (
 )
 from harness.otlp_collector import serving_trace_collector, trace_collector_env
 from harness.terminal_server import read_grant
-from harness.web_retrieval import LOCAL_WEB_FETCH
+from harness.web_retrieval import (
+    LOCAL_WEB_FETCH,
+    RETRIEVAL_CONFIG,
+    save_web_settings,
+    serve_search_results,
+)
 
 pytestmark = [pytest.mark.depcheck, pytest.mark.api, pytest.mark.requires_source]
 
@@ -215,6 +222,39 @@ def test_a_page_link_is_fetched_and_a_malformed_one_refused_unfetched(local_fetc
     assert refused.status_code == 400, refused.text
     assert len(listener.received) == fetches_so_far, "a link validators refuses was fetched"
     assert _fetch(local_fetch, "not a url").status_code == 400
+
+
+@pytest.mark.slow
+def test_with_local_fetch_on_a_link_to_a_bare_hostname_is_fetched(local_fetch, listener):
+    listener.route("GET", "/page", text_answer(f"<html><body><p>{PAGE_TEXT}</p></body></html>"))
+    bare_hostname = listener.base_url.replace("127.0.0.1", "localhost")
+
+    fetched = _fetch(local_fetch, f"{bare_hostname}/page")
+
+    assert fetched.status_code == 200, fetched.text
+    assert PAGE_TEXT in fetched.json()["content"]
+
+
+def test_a_search_result_with_a_malformed_link_is_dropped(admin, preserve, listener):
+    preserve(RETRIEVAL_CONFIG)
+    links = [
+        "https://example.org/herons",
+        "https://example.org/pa ge",
+        "not a url",
+        "https://example.org/egrets",
+    ]
+    with admin.client() as client:
+        save_web_settings(
+            client,
+            **serve_search_results(listener, links),
+            WEB_SEARCH_DOMAIN_FILTER_LIST=["!blocked.example"],
+            BYPASS_WEB_SEARCH_WEB_LOADER=True,
+        )
+        searched = client.post("/api/v1/retrieval/process/web/search", json={"queries": ["herons"]})
+
+    assert searched.status_code == 200, searched.text
+    found = [item["link"] for item in searched.json()["items"]]
+    assert found == ["https://example.org/herons", "https://example.org/egrets"]
 
 
 PAGE = f"""<!DOCTYPE html>

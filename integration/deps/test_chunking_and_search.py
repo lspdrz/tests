@@ -3,28 +3,35 @@
 `save_docs_to_vector_db` in `routers/retrieval.py` cuts every processed file with a
 langchain-text-splitters splitter chosen by the admin's `TEXT_SPLITTER`: the recursive character
 splitter (""), the tiktoken-measured `TokenTextSplitter` ("token") and, before either, the
-`MarkdownHeaderTextSplitter` when `ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER` is on. The
-"token_transformers" splitter measures with the tokenizer `RAG_TOKENIZER_MODEL` names, here a
-SentencePiece `spiece.model` whose pieces transformers reads through sentencepiece's model
-proto. With
+`MarkdownHeaderTextSplitter` when `ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER` is on, whose sections are
+merged up to `CHUNK_MIN_SIZE_TARGET` measured by the splitter's own count: tokens from tiktoken's
+`get_encoding(...).encode` for "token", with special-token markers allowed as plain text. The
+configured encoding is loaded by name first, so an unknown one fails the upload naming it (twin of
+unit/deps/test_tiktoken.py). The "token_transformers" splitter measures with the tokenizer
+`RAG_TOKENIZER_MODEL` names, here a SentencePiece `spiece.model` whose pieces transformers reads
+through sentencepiece's model proto, or a tokenizer transformers' `AutoTokenizer` loads from a
+directory (twin of the tokenizer part of unit/deps/test_transformers.py). With
 `ENABLE_RAG_HYBRID_SEARCH`, `/api/v1/retrieval/query/doc` ranks the chunks with rank_bm25's
 `BM25Okapi` inside langchain-classic's ensemble and compression retrievers: the ensemble fuses the
-keyword and the vector retriever (a langchain-core retriever answering asynchronously) and drops
-a chunk both found twice, and the compressor scores what is left against the query's embedding.
-A bump that breaks a splitter leaves a file as one chunk; one that breaks BM25 fails or misranks
-the query: a word every chunk shares counts for next to nothing next to a rare one, and a chunk
-holding more of the query's rare words ranks above one holding fewer. The provider embeds every
-text as the same vector, so only the keyword ranking can pick a chunk, and every chunk scores a
-cosine of 1 against the query.
+keyword and the vector retriever (a langchain-core retriever answering asynchronously) and drops a
+chunk both found twice, and the compressor scores what is left against the query's embedding. A bump
+that breaks a splitter leaves a file as one chunk; one that breaks BM25 fails or misranks the query:
+a word every chunk shares counts for next to nothing next to a rare one, and a chunk holding more of
+the query's rare words ranks above one holding fewer. The provider embeds every text as the same
+vector, so only the keyword ranking can pick a chunk, and every chunk scores a cosine of 1 against
+the query.
 
 Discriminates: passes on dev bbfa876af. A backend copy without the character splitter's
-`split_documents` fails only the character test; one without the token splitter's
-`split_documents`, the markdown `split_text` and `BM25Okapi` fails only the other four. On dev
-ef67cc3fa, an ensemble that keeps both copies of a chunk (patched in at import) fails the fusion
-test, and so does a compressor that keeps no score. A `BM25Okapi` that weighs every word alike
-(its IDF set to one, patched in at import) ranks the chunk that repeats "harbour" first and fails
-the rare term test. Measuring the transformers splitter's chunks by characters, or a
-sentencepiece model proto that reads nothing (patched in at import), fails the SentencePiece test.
+`split_documents` fails only the character test; one without the token splitter's `split_documents`,
+the markdown `split_text` and `BM25Okapi` fails only the other four. On dev ef67cc3fa, an ensemble
+that keeps both copies of a chunk (patched in at import) fails the fusion test, and so does a
+compressor that keeps no score. A `BM25Okapi` that weighs every word alike (its IDF set to one,
+patched in at import) ranks the chunk that repeats "harbour" first and fails the rare term test.
+Measuring the transformers splitter's chunks by characters, or a sentencepiece model proto that
+reads nothing (patched in at import), fails the SentencePiece test. A token measure that encodes
+without `disallowed_special` fails the merge test on its marker, and one that counts characters
+leaves its three sections apart; the transformers splitter measuring characters in place of the
+tokenizer's `encode` fails its test.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ import os
 import httpx
 import pytest
 
+from harness.actors import admin_of
 from harness.knowledge_bases import add_text_file, knowledge_base
 from harness.local_embedding import save_sentencepiece_tokenizer
 
@@ -123,10 +131,7 @@ def test_the_character_splitter_cuts_by_length(retrieval_settings, make_user):
 
 
 def test_the_token_splitter_cuts_by_tokens(retrieval_settings, make_user):
-    # env-only; the scratch instance inherits this process's environment
-    encoding_name = os.environ.get("TIKTOKEN_ENCODING_NAME", "cl100k_base")
-    if not _tiktoken_loads_offline(encoding_name):
-        pytest.skip(f"the {encoding_name} BPE file is not cached and may not be downloaded")
+    _require_default_encoding()
     retrieval_settings(
         TEXT_SPLITTER="token",
         ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER=False,
@@ -162,6 +167,42 @@ def test_the_transformers_splitter_counts_sentencepiece_pieces(
     assert [len(chunk.split()) for chunk in chunks] == [3] * 18, chunks
 
 
+def _save_word_tokenizer(directory) -> None:
+    """A tokenizer that counts each word and each punctuation mark as one token."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    words = Tokenizer(WordLevel(vocab={"[UNK]": 0, "harbour": 1}, unk_token="[UNK]"))
+    words.pre_tokenizer = Whitespace()
+    PreTrainedTokenizerFast(tokenizer_object=words, unk_token="[UNK]").save_pretrained(directory)
+
+
+def test_the_transformers_splitter_counts_with_the_named_tokenizer(
+    retrieval_settings, make_user, tmp_path
+):
+    pytest.importorskip("transformers", reason="the Token (Transformers) splitter needs it")
+    from transformers import AutoTokenizer
+
+    _save_word_tokenizer(tmp_path)
+    retrieval_settings(
+        TEXT_SPLITTER="token_transformers",
+        RAG_TOKENIZER_MODEL=str(tmp_path),
+        ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER=False,
+        CHUNK_SIZE=20,
+        CHUNK_OVERLAP=0,
+    )
+    with make_user().client() as client:
+        chunks = _all_chunks(client, _upload(client, "log.txt", "\n\n".join(PARAGRAPHS)))
+
+    tokenizer = AutoTokenizer.from_pretrained(str(tmp_path))
+    assert len(chunks) > 1, "the document was stored as one chunk"
+    assert max(len(tokenizer.encode(chunk)) for chunk in chunks) <= 20, chunks
+    # 20 words and marks run far past 20 characters
+    assert min(map(len, chunks)) > 40, [len(chunk) for chunk in chunks]
+
+
 def test_the_markdown_splitter_cuts_at_headers(retrieval_settings, make_user):
     retrieval_settings(
         TEXT_SPLITTER="",
@@ -177,6 +218,56 @@ def test_the_markdown_splitter_cuts_at_headers(retrieval_settings, make_user):
 
     # The whole file fits one character chunk, so only the header split can cut it.
     assert sorted(chunk.splitlines()[0].strip() for chunk in chunks) == sorted(sections), chunks
+
+
+def _require_default_encoding() -> None:
+    # env-only; the scratch instance inherits this process's environment
+    encoding_name = os.environ.get("TIKTOKEN_ENCODING_NAME", "cl100k_base")
+    if not _tiktoken_loads_offline(encoding_name):
+        pytest.skip(f"the {encoding_name} BPE file is not cached and may not be downloaded")
+
+
+def test_small_sections_are_merged_up_to_a_size_counted_in_tokens(retrieval_settings, make_user):
+    _require_default_encoding()
+    retrieval_settings(
+        TEXT_SPLITTER="token",
+        ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER=True,
+        CHUNK_MIN_SIZE_TARGET=30,
+        CHUNK_SIZE=200,
+        CHUNK_OVERLAP=0,
+    )
+    # each section runs past 30 characters but stays well under 30 tokens
+    sections = [
+        "# Tides\n\nThe tide turns at noon today.",
+        "## Ferries\n\nThe ferry <|endoftext|> leaves hourly.",
+        "## Weather\n\nFog is expected by the evening.",
+    ]
+    with make_user().client() as client:
+        chunks = _all_chunks(client, _upload(client, "log.md", "\n\n".join(sections)))
+
+    assert len(chunks) == 1, chunks
+    assert all(section.splitlines()[0] in chunks[0] for section in sections), chunks
+
+
+@pytest.mark.slow
+def test_an_unknown_token_encoding_fails_the_upload_by_name(instance_with):
+    # the encoding name is only read from the environment
+    unknown = instance_with({"TIKTOKEN_ENCODING_NAME": "harbour_base"})
+    with admin_of(unknown).client() as client:
+        saved = client.post(
+            RETRIEVAL_CONFIG[1],
+            json={"TEXT_SPLITTER": "token", "ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER": False},
+        )
+        assert saved.status_code == 200, saved.text
+        uploaded = client.post(
+            "/api/v1/files/",
+            params={"process": "true", "process_in_background": "false"},
+            files={"file": ("log.txt", "\n\n".join(PARAGRAPHS).encode(), "text/plain")},
+        )
+        stored = client.get(f"/api/v1/files/{uploaded.json()['id']}").json()
+
+    assert stored["data"].get("status") == "failed", stored["data"]
+    assert "harbour_base" in stored["data"].get("error", ""), stored["data"]
 
 
 # ---------------------------------------------------------------- hybrid search

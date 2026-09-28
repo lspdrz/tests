@@ -21,7 +21,15 @@ hands it to pandas' `read_excel` on openpyxl. `pip install open-webui` leaves `u
 and an instance booted that way (`harness.missing_packages`) reads spreadsheets with pandas
 itself (`ExcelFile`, `read_excel` per sheet on openpyxl or xlrd, `to_string` without the row
 index) and slides with python-pptx (twin of unit/deps/test_pandas.py and
-unit/deps/test_openpyxl.py).
+unit/deps/test_openpyxl.py). A legacy .xls reaches pandas on xlrd either way: every sheet, its
+numbers and its dates, and on the pandas path xlrd's own reason for a workbook it cannot parse
+(twin of unit/deps/test_xlrd.py).
+
+Legacy Word (.doc) and PowerPoint (.ppt) files go to unstructured's `partition_doc` and
+`partition_ppt`, which convert them with LibreOffice, and a modern file under a legacy name is
+told apart by `detect_filetype` and read without it. An Outlook message goes to `partition_msg`,
+which reads its body (twin of unit/deps/test_unstructured.py); `harness/outlook_message.py` builds
+one.
 
 A PDF is read page by page, each page keeping its label from the page label tree and the
 document's title, author and creation date from its info dictionary, or as one document split
@@ -42,35 +50,42 @@ Discriminates: passes on dev bbfa876af (.rst, .epub and .odt with a pandoc binar
 backend copy broke pypdf's `extract_text`, `docx2txt.process`, the xlsx, rst and epub partitions and
 `chardet.detect`; another broke rapidocr's `RapidOCR`, the pptx, xml and odt partitions,
 BeautifulSoup's `get_text` and `ftfy.fix_text`. Each copy turned exactly its own formats red and
-left the others green. Mapping cp949 in a third copy makes the EUC-KR case pass. A fourth copy
-whose `chardet.detect` names no encoding fails the Big5, EUC-KR, Shift-JIS and Windows-1251 cases.
-On dev ef67cc3fa, dropping `output_content_format='markdown'` from the Document Intelligence loader
-fails its test; msoffcrypto's `OfficeFile` answering "not encrypted" (patched in at import) fails
-the password-protected workbook test, one that accepts any bytes fails the test of a file that only
+left the others green. Mapping cp949 in a third copy makes the EUC-KR case pass. A fourth copy whose
+`chardet.detect` names no encoding fails the Big5, EUC-KR, Shift-JIS and Windows-1251 cases. On dev
+ef67cc3fa, dropping `output_content_format='markdown'` from the Document Intelligence loader fails
+its test; msoffcrypto's `OfficeFile` answering "not encrypted" (patched in at import) fails the
+password-protected workbook test, one that accepts any bytes fails the test of a file that only
 claims to be a workbook, and OpenCV's `minAreaRect` answering an empty box or onnxruntime refusing
 to build a session fails the PDF image test; `RapidOCR` answering every image with the same text
 fails both OCR tests, as does one that fetches its models before building. pyxlsb reading every
 number as zero fails the binary workbook numbers test, and its strings read as empty fail the .xlsb
-upload. A docx2txt result cut to its first paragraph or to
-ASCII fails the Word paragraphs test, `ftfy.fix_text` left out fails the mojibake, smart quote and
-control character tests, `fix_text` without `unescape_html=False` fails the literal entity test and
-one that fails on empty text fails the blank page test (and the empty Word document one). An
-openpyxl whose `load_workbook` raises fails both workbook uploads; the pandas loader printing the
-row index or reading only the first sheet fails the pandas test, a python-pptx loader that skips
-text frames fails the slides test, and a PDF loader that no longer hands an image Pillow cannot open
-(`UnidentifiedImageError`) to pypdf fails the raw-pixel OCR case while the JPEG case passes.
-Also on ef67cc3fa, one copy that drops the PDF info dictionary, joins single-mode pages with a plain
-newline, refuses every encrypted PDF (with a message that fails the password test too), no longer
-recognises pypandoc's "No pandoc was found" and has a pyarrow that cannot build an array (patched in
-at import) fails the page-by-page, single-mode, editing-lock, pandoc and every workbook test; a copy
-that opens a locked PDF with its owner password fails the password test. A non-PDF fails its upload
-whether or not pypdf raises, so that test only shows the refusal.
+upload. A docx2txt result cut to its first paragraph or to ASCII fails the Word paragraphs test,
+`ftfy.fix_text` left out fails the mojibake, smart quote and control character tests, `fix_text`
+without `unescape_html=False` fails the literal entity test and one that fails on empty text fails
+the blank page test (and the empty Word document one). An openpyxl whose `load_workbook` raises
+fails both workbook uploads; the pandas loader printing the row index or reading only the first
+sheet fails the pandas test, a python-pptx loader that skips text frames fails the slides test, and
+a PDF loader that no longer hands an image Pillow cannot open (`UnidentifiedImageError`) to pypdf
+fails the raw-pixel OCR case while the JPEG case passes. Also on ef67cc3fa, one copy that drops the
+PDF info dictionary, joins single-mode pages with a plain newline, refuses every encrypted PDF (with
+a message that fails the password test too), no longer recognises pypandoc's "No pandoc was found"
+and has a pyarrow that cannot build an array (patched in at import) fails the page-by-page,
+single-mode, editing-lock, pandoc and every workbook test; a copy that opens a locked PDF with its
+owner password fails the password test. A non-PDF fails its upload whether or not pypdf raises, so
+that test only shows the refusal. An xlrd that lists only a workbook's first sheet and shifts every
+date by a day (patched in at import) fails both legacy workbook tests, and one whose parse error is
+replaced by a generic one fails the broken record test. A `detect_filetype` answering "unknown" for
+every file (patched in at import) fails the legacy Word, legacy PowerPoint and Outlook tests, and a
+loader that takes every .doc and .ppt for legacy Office fails the tests of modern files under those
+names.
 """
 
 from __future__ import annotations
 
 import io
+import shutil
 import struct
+import subprocess
 import zipfile
 import zlib
 from pathlib import Path
@@ -81,6 +96,7 @@ import pytest
 from harness.actors import admin_of, create_user
 from harness.listener import json_answer
 from harness.missing_packages import without_packages_env
+from harness.outlook_message import outlook_message
 
 pytestmark = [pytest.mark.depcheck, pytest.mark.api, pytest.mark.requires_source]
 
@@ -323,6 +339,17 @@ def _xlsb(rows: list[list[str | float]]) -> bytes:
     return buffer.getvalue()
 
 
+def _ledger_xls() -> bytes:
+    """Two sheets saved by LibreOffice as .xls: text, whole and fractional numbers, and dates."""
+    return (FIXTURES / "ledger.xls").read_bytes()
+
+
+LEDGER_ROWS = [
+    ["lighthouse", "1250", "2024-03-15"],
+    ["ferry", "80.5", "2024-11-02"],
+]
+
+
 def _xml() -> bytes:
     return f"<?xml version='1.0'?><notes><note>{SENTENCE}</note></notes>".encode()
 
@@ -463,6 +490,97 @@ def test_every_sheet_of_a_workbook_is_read_in_order(make_user):
     assert content.index("lighthouse") < content.index("Mara")
 
 
+def test_every_sheet_of_a_legacy_workbook_is_read_with_its_numbers_and_dates(make_user):
+    with make_user().client() as client:
+        content = _upload_and_read(client, "ledger.xls", _ledger_xls(), "application/vnd.ms-excel")
+
+    for row in [*LEDGER_ROWS, ["Mara", "keeper"]]:
+        assert " ".join(row) in content, f"{row} is missing from {content!r}"
+    assert content.index("lighthouse") < content.index("Mara")
+
+
+# ---------------------------------------------------------------- legacy Office and Outlook
+
+
+@pytest.fixture(scope="module")
+def legacy_office(tmp_path_factory):
+    """(.doc, .ppt) saved by LibreOffice, which unstructured also converts them back with."""
+    soffice = shutil.which("soffice")
+    if soffice is None:
+        pytest.skip("no soffice binary; unstructured reads .doc and .ppt through LibreOffice")
+    directory = tmp_path_factory.mktemp("legacy-office")
+    for name, build in (("notes.docx", _docx), ("slides.pptx", _pptx)):
+        (directory / name).write_bytes(build())
+        legacy = name[:-1]
+        subprocess.run(
+            [
+                soffice,
+                f"-env:UserInstallation=file://{directory}/profile",
+                "--headless",
+                "--convert-to",
+                legacy.rsplit(".", 1)[1],
+                "--outdir",
+                str(directory),
+                str(directory / name),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+    return (directory / "notes.doc").read_bytes(), (directory / "slides.ppt").read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "which"),
+    [
+        pytest.param("notes.doc", "application/msword", 0, id="doc"),
+        pytest.param("slides.ppt", "application/vnd.ms-powerpoint", 1, id="ppt"),
+    ],
+)
+def test_a_legacy_office_document_is_read(make_user, legacy_office, filename, content_type, which):
+    with make_user().client() as client:
+        content = _upload_and_read(client, filename, legacy_office[which], content_type)
+
+    assert MARKER in content, f"{filename} was read as {content!r}"
+
+
+@pytest.fixture(scope="module")
+def without_soffice(instance_with, tmp_path_factory):
+    """An instance on a host without LibreOffice: nothing on its PATH."""
+    return instance_with({"PATH": str(tmp_path_factory.mktemp("empty-path"))})
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    ("filename", "build", "content_type"),
+    [
+        pytest.param("notes.doc", _docx, "application/msword", id="docx-as-doc"),
+        pytest.param("slides.ppt", _pptx, "application/vnd.ms-powerpoint", id="pptx-as-ppt"),
+    ],
+)
+def test_a_modern_office_file_under_a_legacy_name_is_read_by_its_content(
+    without_soffice, filename, build, content_type
+):
+    # only a file taken for legacy Office needs LibreOffice
+    with create_user(without_soffice).client() as client:
+        content = _upload_and_read(client, filename, build(), content_type)
+
+    assert MARKER in content, f"{filename} was read as {content!r}"
+
+
+def test_an_outlook_message_is_read_as_its_body(make_user):
+    message = outlook_message(
+        subject="Harbour budget",
+        body=f"{SENTENCE}\nRegards, Ingrid",
+        sender_name="Ingrid Holm",
+        sender_address="ingrid@harbour.example",
+    )
+    with make_user().client() as client:
+        content = _upload_and_read(client, "budget.msg", message, "application/vnd.ms-outlook")
+
+    assert content == f"{SENTENCE}\n\nRegards, Ingrid", content
+
+
 # ---------------------------------------------------------------- without unstructured
 
 
@@ -496,6 +614,39 @@ def test_without_unstructured_an_xls_is_read_by_pandas_on_xlrd(without_unstructu
 
     assert content.startswith("Sheet: Budget\n"), content
     assert MARKER in content
+
+
+@pytest.mark.slow
+def test_without_unstructured_a_legacy_workbook_is_read_sheet_by_sheet(without_unstructured):
+    with create_user(without_unstructured).client() as client:
+        content = _upload_and_read(client, "ledger.xls", _ledger_xls(), "application/vnd.ms-excel")
+
+    sheets = content.split("\n\n")
+    assert [sheet.splitlines()[0] for sheet in sheets] == ["Sheet: Budget", "Sheet: Crew"]
+    budget_rows = [line.split() for line in sheets[0].splitlines()[2:]]
+    assert budget_rows == [
+        ["lighthouse", "1250.0", "2024-03-15"],
+        ["ferry", "80.5", "2024-11-02"],
+    ]
+    assert "Mara keeper" in sheets[1]
+
+
+def _without_first_bof(workbook: bytes) -> bytes:
+    """The workbook with its first BIFF8 beginning-of-file record blanked, its container intact."""
+    start = workbook.index(b"\x09\x08\x10\x00\x00\x06")
+    return workbook[:start] + b"\x00\x00" + workbook[start + 2 :]
+
+
+@pytest.mark.slow
+def test_without_unstructured_a_legacy_workbook_xlrd_cannot_parse_is_refused(without_unstructured):
+    with create_user(without_unstructured).client() as client:
+        uploaded = _upload(
+            client, "ledger.xls", _without_first_bof(_ledger_xls()), "application/vnd.ms-excel"
+        )
+        stored = client.get(f"/api/v1/files/{uploaded}").json()
+
+    assert stored["data"].get("status") == "failed", stored["data"]
+    assert "Expected BOF record" in stored["data"].get("error", ""), stored["data"]
 
 
 @pytest.mark.slow

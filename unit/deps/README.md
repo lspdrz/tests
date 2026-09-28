@@ -64,11 +64,12 @@ OPEN_WEBUI_SOURCE_DIR=../open-webui/backend pytest -m depcheck unit/deps integra
 
 | Library | Feature smoke test |
 |---|---|
-| pypdf, docx2txt, unstructured with python-pptx, pandas on pyarrow, openpyxl, xlrd and msoffcrypto, pypandoc, beautifulsoup4, chardet, ftfy | `integration/deps/test_document_extraction.py` (one upload per format, PDF pages, labels, metadata and locks, pandoc missing, and a password-protected workbook) and `e2e/retrieval/test_attached_document_warnings.py` |
+| pypdf, docx2txt, unstructured with python-pptx, pandas on pyarrow, openpyxl, xlrd and msoffcrypto, pypandoc, beautifulsoup4, chardet, ftfy | `integration/deps/test_document_extraction.py` (one upload per format, legacy Word, PowerPoint and Excel files, an Outlook message, PDF pages, labels, metadata and locks, pandoc missing, and a password-protected workbook) and `e2e/retrieval/test_attached_document_warnings.py` |
 | azure-ai-documentintelligence | `integration/deps/test_document_extraction.py` (a PDF read by a local stand-in of the analyze API) |
 | rapidocr with onnxruntime, OpenCV and Pillow | `integration/deps/test_document_extraction.py` (PDF image OCR) |
 | pandas, openpyxl, xlrd and python-pptx without unstructured | `integration/deps/test_document_extraction.py` (an instance installed without the extra) |
-| langchain-text-splitters, langchain-core, langchain-classic, tiktoken, rank-bm25 | `integration/deps/test_chunking_and_search.py` |
+| langchain-text-splitters, langchain-core, langchain-classic, tiktoken, transformers (`AutoTokenizer`), rank-bm25 | `integration/deps/test_chunking_and_search.py` |
+| transformers, datasets, sentencepiece, soundfile (local text-to-speech on a tiny voice) | `integration/deps/test_local_text_to_speech.py`, `e2e/audio/test_local_read_aloud.py` |
 | langchain-core | `integration/deps/test_tool_specs.py` (a workspace tool's spec) |
 | Pillow | `integration/deps/test_image_validation.py` (model backgrounds, linked images, image edits) |
 | bcrypt, argon2-cffi, PyJWT, pytz, authlib, itsdangerous, cryptography | `integration/deps/test_auth_stack.py` (and the back-channel logout token in `integration/auth/test_sso_account_sync.py`) |
@@ -86,6 +87,7 @@ OPEN_WEBUI_SOURCE_DIR=../open-webui/backend pytest -m depcheck unit/deps integra
 | sentence-transformers (local embedding, tokenizer and `CrossEncoder` reranking) | `integration/deps/test_local_models.py` |
 | sentencepiece | `integration/deps/test_chunking_and_search.py` (the transformers splitter on a `spiece.model`) |
 | pyxlsb | `integration/deps/test_document_extraction.py` (a binary workbook) |
+| weaviate-client | `integration/deps/test_weaviate_store.py` |
 | elasticsearch | `integration/deps/test_elasticsearch_store.py` |
 | ddgs, fake-useragent | `integration/deps/test_web_search_stack.py`, `e2e/retrieval/test_duckduckgo_web_search.py` |
 | fastapi | `integration/deps/test_web_framework.py` and every instance boot and request |
@@ -96,22 +98,26 @@ OPEN_WEBUI_SOURCE_DIR=../open-webui/backend pytest -m depcheck unit/deps integra
 | alembic | `integration/migrations/test_lifecycle.py` |
 | requests | `integration/retrieval/test_web_loaders.py` (a linked document fetched through the SSRF-guarded session), `integration/security/test_remote_file_download_limits.py` (streamed under the size limit), `integration/retrieval/test_v0114_source_text_and_docling.py` (Tika) |
 | sqlalchemy | `integration/deps/test_database_stack.py` (JSON columns, search, counts and pages, SQLite PRAGMAs) and every request |
-| uvicorn, httpx | every instance boot and request |
+| starsessions | `integration/deps/test_server_sessions.py`, `e2e/security/test_sso_sign_in_on_redis_sessions.py` (SSO sign-in state in Redis) |
+| uvicorn | `integration/deps/test_server_launch.py` (`open-webui serve` and `dev`), `integration/config/test_start_sh.py` |
+| youtube-transcript-api | `integration/deps/test_video_transcripts.py`, `integration/retrieval/test_youtube_transcripts.py` |
+| httpx | every instance boot and request |
 
 The .rst, .epub and .odt uploads skip without a `pandoc` binary (the test of
-the missing-pandoc message skips with one), the pydub tests skip without
-ffmpeg (the conversion test also without ffprobe), and the token splitter
-skips when its tiktoken BPE file is not cached, since none of them may be
-downloaded during a run. The local Whisper tests build their model with torch,
-transformers and CTranslate2 and skip without them. Libraries for services the
-integration suite has no local stand-in for (Weaviate, Oracle) keep their unit
-contracts only, as do libraries no Open WebUI feature calls (accelerate, the
-anthropic SDK). The openai SDK is pinned but Open WebUI never calls it (every
-provider request is its own), so it has no contract; nor has PyMySQL, which
-nothing imports and whose MySQL URL the async database engine cannot use (Open
-WebUI supports SQLite and Postgres). pyarrow is reached through pandas, PyJWT
-keeps its sweep over the source and python-multipart its pinned security
-floor. A contract kept next to its feature smoke test says in its docstring
-which part no request reaches. The Postgres cases need `pgserver`, whose
-vector extension predates pgvector's `halfvec` and whose server has no SSL, so
-those two paths keep a unit contract as well.
+the missing-pandoc message skips with one), legacy .doc and .ppt without
+LibreOffice (`soffice`), the pydub tests skip without ffmpeg (the conversion
+test also without ffprobe), and the token splitter skips when its tiktoken BPE
+file is not cached, since none of them may be downloaded during a run. The
+local Whisper tests build their model with torch, transformers and CTranslate2
+and skip without them. Libraries for services the integration suite has no
+local stand-in for (Oracle) keep their unit contracts only, as do libraries no
+Open WebUI feature calls (accelerate, the anthropic SDK). The openai SDK is
+pinned but Open WebUI never calls it (every provider request is its own), so
+it has no contract; nor has PyMySQL, which nothing imports and whose MySQL URL
+the async database engine cannot use (Open WebUI supports SQLite and
+Postgres). pyarrow is reached through pandas, PyJWT keeps its sweep over the
+source and python-multipart its pinned security floor. A contract kept next to
+its feature smoke test says in its docstring which part no request reaches.
+The Postgres cases need `pgserver`, whose vector extension predates pgvector's
+`halfvec` and whose server has no SSL, so those two paths keep a unit contract
+as well.
