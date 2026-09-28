@@ -9,6 +9,7 @@ key under the same `kid`, the way an IdP rotates without renaming its key.
 The token endpoint also takes `grant_type=refresh_token`: a live refresh token gets new tokens
 and is spent (rotation), a spent, revoked or unknown one answers `invalid_grant`. Setting
 `token_lifetime` shortens the `expires_in` of the tokens it issues next,
+`id_token_lifetime` gives the ID token of the next sign-in a lifetime of its own,
 `revoke_refresh_tokens()` withdraws every refresh token issued so far and `refresh_delay` holds
 each refresh answer back that many seconds after the token was spent, so concurrent refreshes
 overlap.
@@ -75,6 +76,7 @@ class OidcProvider:
     refresh_tokens: dict[str, dict] = field(default_factory=dict)  # live ones only
     issued: list[dict] = field(default_factory=list)  # every token response, newest last
     token_lifetime: int = 3600  # seconds, for access tokens and ID tokens issued from now on
+    id_token_lifetime: int | None = None  # seconds, for ID tokens only when set
     refresh_delay: float = 0.0  # seconds a refresh answer waits after spending the token
 
     @property
@@ -91,6 +93,7 @@ class OidcProvider:
             self.requests.clear()
             self.issued.clear()
             self.token_lifetime = 3600
+            self.id_token_lifetime = None
             self.refresh_delay = 0.0
         self.sign_in_as()
 
@@ -223,11 +226,14 @@ class OidcProvider:
         person = grant["claims"]
         now = int(time.time())
         id_claims = grant["id_token_claims"] if grant["id_token_claims"] is not None else person
+        id_lifetime = (
+            self.token_lifetime if self.id_token_lifetime is None else self.id_token_lifetime
+        )
         id_payload = {
             "iss": self.issuer,
             "aud": self.client_id,
             "iat": now,
-            "exp": now + self.token_lifetime,
+            "exp": now + id_lifetime,
         }
         id_payload.update(id_claims)
         if grant["nonce"]:

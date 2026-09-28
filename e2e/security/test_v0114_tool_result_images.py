@@ -9,8 +9,6 @@ In native function calling, the default, tool images go to the model only. With 
 calling set to legacy (a user setting) they are attached to the reply, so a user who picks the
 tool from the Integrations menu sees the chart under the answer.
 
-Twin of unit/security/test_v0114_tool_result_images.py.
-
 Discriminates: passes on bbfa876af with its built frontend; with `afda09454` reverted in the
 backend no image appears, with `d372bec70` reverted the image is an inline data URL.
 """

@@ -14,11 +14,11 @@ open-webui 0.11.4, PR #29665 (issue #29208), two commits in `utils/middleware.py
 
 An admin's Python tool, readable by every account, returns the images; the scripted model calls
 it (native function calling, the default) and a fresh user checks what the provider is sent
-next, what the chat keeps and which files were stored.
+next, what the chat keeps and which files were stored. The tool types whose results arrive in
+their own shape get the same check: an OpenAPI tool server and a terminal answer with a JSON
+body, an MCP server with a text content item holding the JSON.
 
-Twin of unit/security/test_v0114_tool_result_images.py.
-
-Discriminates: passes on bbfa876af. With `afda09454` reverted every test fails except the bare
+Discriminates: passes on ef67cc3fa. With `afda09454` reverted every test fails except the bare
 screenshot row and the deliberate-limits test (base64 in the tool message, nothing attached);
 with `d372bec70` reverted the saved chat test and the three broad rows fail (the image stays
 inline, no file is stored). Dropping the fallback on a storage error, the fallback on an empty
@@ -37,7 +37,15 @@ import pytest
 
 from harness import upstream as reply
 from harness.chat import ChatTurn, ask, send_message
+from harness.listener import json_answer
+from harness.mcp_server import TOOL_SERVERS, mcp_connection, serving_mcp
 from harness.python_tools import python_tool
+from harness.terminal_server import (
+    TERMINAL_SERVERS_CONFIG,
+    configure_terminals,
+    read_grant,
+    serving_terminal,
+)
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
 
@@ -286,3 +294,85 @@ def test_an_image_refused_by_the_file_size_limit_stays_inline(
     [image_url] = kept_image_urls(message)
     assert image_url.startswith("data:image/png;base64,")
     assert files == []
+
+
+# --- Tool types whose results arrive in their own shape ---
+
+GRAPH = {"graph": PNG}
+GRAPH_WITHOUT_IMAGE = {"graph": "[image]"}
+
+
+def openapi_spec(operation_id: str, path: str) -> dict:
+    operation = {"operationId": operation_id, "responses": {"200": {"description": "ok"}}}
+    return {
+        "openapi": "3.0.0",
+        "info": {"title": operation_id, "version": "1"},
+        "paths": {path: {"post": operation}},
+    }
+
+
+def assert_image_attached_not_serialised(upstream, tool_type: str) -> None:
+    sent = request_after_the_tool(upstream)
+    assert payload_of(PNG) not in tool_message(sent), f"the {tool_type} image reached the model"
+    assert json.loads(tool_message(sent)) == GRAPH_WITHOUT_IMAGE
+    assert attached_images(sent) == [PNG]
+
+
+def test_an_image_in_a_tool_servers_json_body_is_attached(
+    admin, make_user, upstream, preserve, listener
+):
+    preserve(TOOL_SERVERS)
+    listener.route("GET", "/graphs/openapi.json", json_answer(openapi_spec("make_graph", "/graph")))
+    listener.route("POST", "/graphs/graph", json_answer(GRAPH))
+    grants = [read_grant("*")]
+    connection = {
+        "url": f"{listener.base_url}/graphs",
+        "path": "openapi.json",
+        "type": "openapi",
+        "auth_type": "none",
+        "key": "",
+        "config": {"enable": True, "access_grants": grants},
+        "info": {"id": "graphs", "name": "Graphs"},
+    }
+    with admin.client() as client:
+        saved = client.post(TOOL_SERVERS[1], json={"TOOL_SERVER_CONNECTIONS": [connection]})
+    assert saved.status_code == 200, saved.text
+
+    upstream.queue(reply.tool_call("make_graph", {}), reply.text("done"))
+    with make_user().client() as client:
+        ask(client, "draw the graph", tool_ids=["server:graphs"])
+
+    assert_image_attached_not_serialised(upstream, "tool server")
+
+
+def test_an_image_in_a_terminals_json_body_is_attached(admin, make_user, upstream, preserve):
+    preserve(TERMINAL_SERVERS_CONFIG)
+    with serving_terminal() as terminal:
+        terminal.route("GET", "/openapi.json", json_answer(openapi_spec("run_command", "/execute")))
+        terminal.route("POST", "/execute", json_answer(GRAPH))
+        connection = terminal.connection(config={"access_grants": [read_grant("*")]})
+        with admin.client() as client:
+            configure_terminals(client, connection)
+
+        upstream.queue(reply.tool_call("run_command", {}), reply.text("done"))
+        with make_user().client() as client:
+            ask(client, "plot it in the terminal", terminal_id=connection["id"])
+
+    assert_image_attached_not_serialised(upstream, "terminal")
+
+
+def test_an_image_in_an_mcp_tools_json_text_is_attached(admin, make_user, upstream, preserve):
+    preserve(TOOL_SERVERS)
+    with serving_mcp() as url:
+        connection = mcp_connection(url, "graphs_mcp", [read_grant("*")])
+        with admin.client() as client:
+            saved = client.post(TOOL_SERVERS[1], json={"TOOL_SERVER_CONNECTIONS": [connection]})
+        assert saved.status_code == 200, saved.text
+
+        upstream.queue(
+            reply.tool_call("graphs_mcp_echo", {"text": json.dumps(GRAPH)}), reply.text("done")
+        )
+        with make_user().client() as client:
+            ask(client, "echo the graph", tool_ids=["server:mcp:graphs_mcp"])
+
+    assert_image_attached_not_serialised(upstream, "MCP")

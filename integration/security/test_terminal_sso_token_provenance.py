@@ -5,10 +5,13 @@ Before 0.11.0 a `system_oauth` terminal connection took its token from the calle
 token, so any signed-in user could present a token that was never issued to them. Fix
 `3a9b9a1a7` (PR #26719) resolves the token server-side from the caller's own OAuth session
 and ignores the header. Each test proxies one request through a fake terminal server and
-reads what it received. Twin of unit/security/test_terminal_sso_token_provenance.py.
+reads what it received. The positive half runs on an instance that signs in through a fake
+OpenID Connect provider, so the caller holds a real OAuth session whose access token the
+terminal must get.
 
-Discriminates: passes on dev bbfa876af, fails with 3a9b9a1a7 reverted (the forged header
-reaches the terminal server as `Authorization: Bearer forged-by-the-caller`).
+Discriminates: passes on dev ef67cc3fa, fails with 3a9b9a1a7 reverted (the forged header
+reaches the terminal server as `Authorization: Bearer forged-by-the-caller`, and the SSO
+caller's own session token never does).
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 from harness.listener import json_answer
+from harness.oidc_provider import oauth_settings, shared_provider, sign_in, sso_env
 from harness.terminal_server import (
     TERMINAL_SERVERS_CONFIG,
     TerminalRequest,
@@ -112,3 +116,41 @@ def test_cookies_reach_the_terminal_only_when_the_connection_opts_in(
     )
     expected = {"oauth_session_id": "caller-session", "theme": "dark"} if forward_cookies else {}
     assert received.cookies == expected
+
+
+# A caller signed in through single sign-on, whose own session token the terminal gets.
+
+
+@pytest.fixture
+def idp():
+    return shared_provider()
+
+
+@pytest.fixture
+def sso(instance_with, idp):
+    return instance_with(sso_env(idp))
+
+
+@pytest.mark.slow
+def test_the_callers_own_oauth_session_token_reaches_the_terminal(sso, idp, preserve, terminal):
+    preserve(TERMINAL_SERVERS_CONFIG, on=sso)
+    with oauth_settings(sso, ENABLE_OAUTH_ROLE_MANAGEMENT=True):
+        idp.sign_in_as(roles=["admin"])
+        signed_in = sign_in(sso)
+    assert signed_in.token, f"the sign-in failed: {signed_in.error}"
+    connection = terminal.connection(auth_type="system_oauth")
+    with sso.client() as admin:
+        configure_terminals(admin, connection)
+    terminal.clear()
+
+    response = signed_in.browser.get(
+        f"/api/v1/terminals/{connection['id']}/probe", headers={"x-oauth-access-token": FORGED}
+    )
+
+    assert response.status_code == 200, response.text
+    [received] = terminal.received
+    session_token = idp.issued[-1]["access_token"]
+    assert received.headers.get("authorization") == f"Bearer {session_token}", (
+        "single sign-on to the terminal broke: the token of the caller's own OAuth session "
+        "never reached it (#26719)"
+    )

@@ -6,13 +6,19 @@ fix refuses a disabled connection on every entry point. `867006acc` (PR #27581, 
 and #27064): with BYPASS_ADMIN_ACCESS_CONTROL off, a connection without access grants, which is
 every connection right after it is added, was refused to everyone including the admin who
 created it; the fix makes it admin-only. Each entry point is driven against a fake terminal
-server that records whether anything reached it. Twin of
-unit/security/test_terminal_connection_gating.py.
+server that records whether anything reached it.
+
+A chat with a terminal selected is the fourth entry point. Without Redis every chat rebuilds the
+terminal list from the saved connections and leaves disabled ones out, so the gate only shows on
+an instance backed by Redis whose cached list still names the terminal: the admin switches it
+off through a config import, which saves the connection without rebuilding the cache.
 
 Discriminates: passes on dev bbfa876af; with the proxy and WebSocket `enabled` checks of
 753798923 removed the disabled-terminal proxy and session tests fail (the fake terminal gets the
-request and the shell; the list filtered before the fix), and with 867006acc reverted the admin
-tests on the no-bypass instance fail on every entry point (403, a 4003 close, not listed).
+request and the shell; the list filtered before the fix), with the `enabled` check removed from
+`get_terminal_tools` the chat on the disabled terminal is offered its tools, and with 867006acc
+reverted the admin tests on the no-bypass instance fail on every entry point (403, a 4003 close,
+not listed).
 """
 
 from __future__ import annotations
@@ -22,7 +28,9 @@ from typing import Callable, Iterator
 import pytest
 from websockets.exceptions import ConnectionClosed
 
+from harness import upstream as reply
 from harness.actors import Actor, admin_of, create_user
+from harness.chat import ask
 from harness.listener import json_answer
 from harness.terminal_server import (
     TERMINAL_SERVERS_CONFIG,
@@ -33,6 +41,7 @@ from harness.terminal_server import (
     serving_terminal,
     terminal_session,
 )
+from integration.stateful_redis import StatefulRedis
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
 
@@ -210,3 +219,80 @@ def test_a_user_needs_a_grant_of_their_own(strict_admin, strict_member, terminal
     _save(strict_admin, terminal, granted_elsewhere, granted_to_member)
     assert not _proxied(strict_member, granted_elsewhere, terminal)
     assert _proxied(strict_member, granted_to_member, terminal)
+
+
+# A chat on a terminal, on an instance whose terminal list is cached in Redis.
+
+RUN_COMMAND_SPEC = {
+    "openapi": "3.0.0",
+    "info": {"title": "Terminal", "version": "1"},
+    "paths": {
+        "/execute": {
+            "post": {"operationId": "run_command", "responses": {"200": {"description": "ok"}}}
+        }
+    },
+}
+
+
+@pytest.fixture(scope="module")
+def redis():
+    store = StatefulRedis()
+    yield store
+    store.close()
+
+
+@pytest.fixture
+def cached_terminal(instance_with, redis, preserve):
+    """(instance, member, terminal, connection): a terminal granted to the member and cached."""
+    launched = instance_with({"REDIS_URL": redis.url})
+    preserve(TERMINAL_SERVERS_CONFIG, on=launched)
+    member = create_user(launched)
+    with serving_terminal() as terminal:
+        terminal.route("GET", "/openapi.json", json_answer(RUN_COMMAND_SPEC))
+        connection = terminal.connection(config=_granted_to(member))
+        _save(admin_of(launched), terminal, connection)
+        yield launched, member, terminal, connection
+
+
+def _switch_off_by_import(launched, connection: dict) -> None:
+    with launched.client() as client:
+        imported = client.post(
+            "/api/v1/configs/import",
+            json={"config": {"terminal_server.connections": [{**connection, "enabled": False}]}},
+        )
+    assert imported.status_code == 200, imported.text
+
+
+def _chat_on_terminal(launched, member: Actor, connection: dict) -> tuple[dict, list[str]]:
+    """The stored reply and the tools the model was offered; none if it was never asked."""
+    launched.upstream.queue(reply.text("ready"))
+    with member.client() as client:
+        _, message = ask(client, "list my files", terminal_id=connection["id"])
+    requests = launched.upstream.chat_requests()
+    offered = [
+        tool["function"]["name"] for request in requests for tool in request.get("tools", [])
+    ]
+    return message, offered
+
+
+@pytest.mark.slow
+def test_a_chat_gets_no_tools_from_a_disabled_terminal_still_cached(cached_terminal):
+    launched, member, terminal, connection = cached_terminal
+    _switch_off_by_import(launched, connection)
+
+    message, offered = _chat_on_terminal(launched, member, connection)
+
+    assert "run_command" not in offered, "a switched-off terminal still hands its tools to a chat"
+    assert terminal.received == [], "the chat reached the switched-off terminal"
+    assert "disabled" in (message.get("error") or {}).get("content", ""), message
+
+
+@pytest.mark.slow
+def test_a_chat_gets_the_tools_of_an_enabled_cached_terminal(cached_terminal):
+    launched, member, terminal, connection = cached_terminal
+
+    message, offered = _chat_on_terminal(launched, member, connection)
+
+    assert message["content"] == "ready", message
+    assert "run_command" in offered
+    assert terminal.requests_to("/openapi.json") == [], "the cached list was not used"
