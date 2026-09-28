@@ -5,11 +5,16 @@ its protected-resource metadata and the authorization server's metadata, then re
 as a client. A user connects through `/oauth/clients/{id}/authorize` and the callback with a
 PKCE S256 code, and the model's tool call reaches the server with that user's token. A token
 about to expire is refreshed first, spending and rotating the refresh token; once the refresh
-token is revoked the connection is dropped and no tool is offered.
+token is revoked the connection is dropped and no tool is offered. Registering the server again
+replaces its client: authlib keeps every client it built by name, so saving the connection has to
+drop the old one from authlib's registry, or the next connect still signs in as the old client
+(twin of the registry case in unit/deps/test_authlib.py).
 
 Discriminates: in a backend copy, never adding the S256 code challenge fails every test at the
 connect (the authorization server refuses the authorize), and returning the stored token without
-checking its expiry fails the refresh and the revoked-token tests (no refresh is tried).
+checking its expiry fails the refresh and the revoked-token tests (no refresh is tried). On dev
+ef67cc3fa, `remove_client` leaving authlib's `_clients` entry in place fails the registration
+test (the connect uses the first client).
 """
 
 from __future__ import annotations
@@ -44,11 +49,8 @@ def person(make_user):
     return make_user()
 
 
-@pytest.fixture
-def server_id(admin, preserve, mcp, person) -> str:
-    """The MCP server, registered by the admin and readable by `person`."""
-    preserve(TOOL_SERVERS)
-    server_id = f"oauth_mcp_{secrets.token_hex(4)}"
+def register(admin, mcp, person, server_id: str) -> None:
+    """Register the server as the admin panel does and save the connection to it."""
     with admin.client() as client:
         registered = client.post(
             "/api/v1/configs/oauth/clients/register",
@@ -71,6 +73,14 @@ def server_id(admin, preserve, mcp, person) -> str:
         }
         saved = client.post(TOOL_SERVERS[1], json={"TOOL_SERVER_CONNECTIONS": [connection]})
     assert saved.status_code == 200, saved.text
+
+
+@pytest.fixture
+def server_id(admin, preserve, mcp, person) -> str:
+    """The MCP server, registered by the admin and readable by `person`."""
+    preserve(TOOL_SERVERS)
+    server_id = f"oauth_mcp_{secrets.token_hex(4)}"
+    register(admin, mcp, person, server_id)
     return server_id
 
 
@@ -153,3 +163,19 @@ def test_a_revoked_refresh_token_drops_the_connection(instance, upstream, mcp, p
     offered = upstream.chat_requests()[-1].get("tools") or []
     assert not [tool for tool in offered if server_id in str(tool)], "the tool was still offered"
     assert disconnected.status_code == 404, "the failed refresh left the session behind"
+
+
+def test_registering_the_server_again_connects_with_the_new_client(
+    instance, admin, upstream, mcp, person, server_id
+):
+    earlier_clients = set(mcp.auth_server.clients)
+    register(admin, mcp, person, server_id)
+    [replacement] = set(mcp.auth_server.clients) - earlier_clients
+
+    connect(instance, person, server_id)
+
+    authorize = mcp.auth_server.requests_to("/authorize")[-1]
+    assert authorize.query["client_id"] == replacement, (
+        "the connection still signs in with the client it was first registered as"
+    )
+    assert echo_through_chat(person, upstream, server_id) == PHRASE

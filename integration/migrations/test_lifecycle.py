@@ -17,16 +17,20 @@ something in every feature area, the server restarts on that database (a second 
 every container restart runs) and it all reads back, while accounts are still added, renamed
 and deleted. The operator's manual commands from the migration guide then run on an empty
 database of their own: upgrade to head, the key tables it lists, a second upgrade, a step back
-and forward again, and `alembic downgrade base` unwinding every table. Postgres runs on the
-embedded server (`pgserver`) in either database mode of the suite.
+and forward again, and `alembic downgrade base` unwinding every table. The guide's SQL preview
+(`alembic upgrade head --sql`) must print the schema without a database: it fails on dev
+ef67cc3fa, because the first migration inspects the live connection, which the preview does not
+have. Postgres runs on the embedded server (`pgserver`) in either database mode of the suite.
 
-Twin of unit/migrations/test_lifecycle.py.
+Twin of unit/migrations/test_lifecycle.py and of unit/deps/test_alembic.py.
 Discriminates: passes on dev ef67cc3fa on both engines; a module-scope
 `from open_webui.config import ENABLE_SIGNUP` in a copy's `models/calendar.py` (the #29280
 cycle) fails every test on both; a `downgrade()` of `56359461a091` (calendar tables) that no
 longer drops `calendar_event_attendee` fails the downgrade test on both; a column added to
 the note model with no migration behind it fails the install on SQLite (saving a note answers
-400).
+400); a batch alteration of `4ace53fd72c8` told not to recreate its table (`recreate='never'`)
+fails the install and the manual commands on SQLite, as does an `env.py` that never calls
+`run_migrations()`.
 """
 
 from __future__ import annotations
@@ -287,3 +291,13 @@ def test_downgrade_to_base_unwinds_every_table(empty_database):
 
     leftover = database.tables() - {"alembic_version"}
     assert not leftover, f"a migration's downgrade() leaves tables behind: {sorted(leftover)}"
+
+
+def test_the_sql_preview_of_the_upgrade_prints_the_schema(empty_database):
+    # Red on dev ef67cc3fa: the first migration inspects the live database, which `--sql` has not
+    preview = empty_database.alembic("upgrade", "head", "--sql")
+
+    for table in ("user", "chat", "config"):
+        assert f"CREATE TABLE {table} " in preview or f'CREATE TABLE "{table}" ' in preview, (
+            f"the SQL preview does not create the {table} table"
+        )

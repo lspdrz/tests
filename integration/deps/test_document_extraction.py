@@ -7,7 +7,10 @@ msoffcrypto encryption check; pypandoc and the pandoc binary), .html to Beautifu
 through chardet's encoding hint, and every result through ftfy. With `PDF_EXTRACT_IMAGES` on, a
 PDF's images are opened by Pillow and read by rapidocr on onnxruntime and OpenCV. A dependency
 bump that breaks one of those paths fails the upload or loses the text, which
-`GET /api/v1/files/{id}/data/content` shows. The library contracts are in unit/deps/.
+`GET /api/v1/files/{id}/data/content` shows. With the Azure Document Intelligence engine a PDF
+goes to azure-ai-documentintelligence instead, here against a local stand-in of the analyze API:
+the key header, the markdown output format and the polled result are what it relies on (twin of
+unit/deps/test_azure_ai_documentintelligence.py). The library contracts are in unit/deps/.
 
 Windows-1251 Cyrillic is decoded with the codec chardet names, which ftfy could not repair
 after a latin-1 fallback.
@@ -23,6 +26,8 @@ and `chardet.detect`; another broke rapidocr's `RapidOCR`, the pptx, xml and odt
 BeautifulSoup's `get_text` and `ftfy.fix_text`. Each copy turned exactly its own formats red and
 left the others green. Mapping cp949 in a third copy makes the EUC-KR case pass. A fourth copy
 whose `chardet.detect` names no encoding fails the Big5, EUC-KR, Shift-JIS and Windows-1251 cases.
+On dev ef67cc3fa, dropping `output_content_format='markdown'` from the Document Intelligence
+loader fails its test.
 """
 
 from __future__ import annotations
@@ -33,6 +38,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from harness.listener import json_answer
 
 pytestmark = [pytest.mark.depcheck, pytest.mark.api, pytest.mark.requires_source]
 
@@ -352,3 +359,53 @@ def test_without_image_extraction_a_scan_yields_no_text(retrieval_settings, make
         read = client.get(f"/api/v1/files/{file_id}/data/content")
 
     assert OCR_WORD not in read.json()["content"]
+
+
+# ---------------------------------------------------------------- Azure Document Intelligence
+
+AZURE_MODEL = "prebuilt-layout"
+AZURE_KEY = "document-intelligence-key"
+AZURE_ANALYZE_PATH = f"/documentintelligence/documentModels/{AZURE_MODEL}:analyze"
+AZURE_RESULT_PATH = f"/documentintelligence/documentModels/{AZURE_MODEL}/analyzeResults/one"
+AZURE_MARKDOWN = f"# Harbour review\n\n{SENTENCE}\n"
+
+
+def _serve_document_intelligence(listener) -> None:
+    """Azure's analyze call: accepted with an operation to poll, which has already succeeded."""
+    operation = f"{listener.base_url}{AZURE_RESULT_PATH}?api-version=2024-11-30"
+    accepted = {"Operation-Location": operation, "Retry-After": "0"}
+    listener.route("POST", AZURE_ANALYZE_PATH, (202, accepted, b""))
+    result = {
+        "status": "succeeded",
+        "createdDateTime": "2026-01-01T00:00:00Z",
+        "lastUpdatedDateTime": "2026-01-01T00:00:01Z",
+        "analyzeResult": {
+            "apiVersion": "2024-11-30",
+            "modelId": AZURE_MODEL,
+            "content": AZURE_MARKDOWN,
+            "contentFormat": "markdown",
+            "pages": [],
+        },
+    }
+    listener.route("GET", AZURE_RESULT_PATH, json_answer(result))
+
+
+def test_document_intelligence_reads_a_pdf_as_markdown(retrieval_settings, make_user, listener):
+    _serve_document_intelligence(listener)
+    retrieval_settings(
+        CONTENT_EXTRACTION_ENGINE="document_intelligence",
+        DOCUMENT_INTELLIGENCE_ENDPOINT=listener.base_url,
+        DOCUMENT_INTELLIGENCE_KEY=AZURE_KEY,
+        DOCUMENT_INTELLIGENCE_MODEL=AZURE_MODEL,
+    )
+    pdf = _text_pdf()
+
+    with make_user().client() as client:
+        content = _upload_and_read(client, "review.pdf", pdf, "application/pdf")
+
+    assert content.strip() == AZURE_MARKDOWN.strip()
+    [analyze] = listener.requests_to(AZURE_ANALYZE_PATH)
+    assert analyze.headers["Ocp-Apim-Subscription-Key"] == AZURE_KEY
+    assert "outputContentFormat=markdown" in analyze.path
+    assert analyze.body == pdf
+    assert listener.requests_to(AZURE_RESULT_PATH), "the analysis result was never polled"

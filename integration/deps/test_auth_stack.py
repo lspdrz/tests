@@ -5,12 +5,18 @@ bcrypt stores each password as a salted `$2b$` hash at its default cost of 12, a
 file shows, and takes at most 72 bytes: a longer new password is refused and a sign-in compares
 only the first 72 bytes, which bcrypt 5 would otherwise refuse with an error. A changed password
 is hashed afresh and the old one stops working.
+Switching `PASSWORD_HASH_ALGORITHM` only changes how new passwords are hashed: every stored
+hash names its algorithm, so accounts keep signing in across a switch in either direction. Two
+accounts with one password get different argon2 hashes (a salt each), and an argon2 hash that
+cannot be parsed refuses the sign-in like a wrong password.
 PyJWT signs and checks the session token, whose `iat` and `exp` come from pytz's UTC clock.
 authlib builds the SSO redirect and completes the code exchange, while itsdangerous signs the
 `owui-session` cookie that carries its state from one to the other. The completed SSO sign-in
 also verifies the provider's RS256 ID token and encrypts the stored OAuth session, which is
 what cryptography does on this path (the OAuth twins under integration/security complete many
-more). A bump that breaks one of them fails a sign-in here, not only an API check in unit/deps.
+more). When the provider refuses the code exchange, authlib's `OAuthError` carries its
+reason into the server log. A bump that breaks one of them fails a sign-in here, not only an
+API check in unit/deps. Twin of unit/deps/test_argon2_cffi.py and unit/deps/test_authlib.py.
 
 The argon2 instance runs in a zone far from UTC, so a clock that is not UTC shows in the token.
 
@@ -20,7 +26,10 @@ a password update that stores nothing keeps the old password working, dropping t
 fails the long sign-in, argon2 verification answering True does the same on its instance,
 `jwt.decode` without signature and expiry checks accepts the flipped and the expired token, a
 naive `datetime.now()` for `exp` stretches the lifetime by the zone's 5 h 45 min and dropping
-`SessionMiddleware` fails the SSO sign-in at its first step.
+`SessionMiddleware` fails the SSO sign-in at its first step. On dev ef67cc3fa,
+`verify_password` sending every hash to bcrypt fails the switch test, argon2's
+`InvalidHashError` left uncaught answers a hash of an unknown argon2 variant with a 500 and a
+callback error reported by its class name alone drops `invalid_grant` from the log.
 """
 
 from __future__ import annotations
@@ -35,10 +44,13 @@ import uuid
 
 import httpx
 import pytest
+import sqlalchemy
 
-from harness.actors import sign_in
+from harness.actors import create_user, sign_in
+from harness.backends import write_rows
 from harness.instance import ADMIN_EMAIL, ADMIN_PASSWORD, LaunchedInstance
 from harness.oidc_provider import browser_for, session_user, shared_provider, sso_env
+from harness.prepared_data import RunningBackend, serving
 
 pytestmark = [
     pytest.mark.depcheck,
@@ -53,6 +65,13 @@ ARGON2_OFF_UTC = {"PASSWORD_HASH_ALGORITHM": "argon2", "TZ": "Asia/Kathmandu"}
 # past bcrypt's 72 bytes, so only a hash of the whole password tells the last byte apart
 LONG_PASSWORD = "argon2-" + "x" * 72 + "!"
 FOUR_WEEKS = 4 * 7 * 24 * 3600
+ARGON2 = {"PASSWORD_HASH_ALGORITHM": "argon2"}
+FIRST_PASSWORD = "bcrypt-first-password"
+# argon2 raises InvalidHashError for the unknown variant and VerificationError for the rest
+DAMAGED_ARGON2_HASHES = {
+    "unknown-variant": "$argon2x$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaGhhc2g",
+    "undecodable": "$argon2id$v=19$m=65536,t=3,p=4$not-a-salt$not-a-hash",
+}
 
 
 @pytest.fixture
@@ -258,3 +277,101 @@ def test_a_forged_session_cookie_fails_the_sso_callback_and_an_intact_one_signs_
     token = _finish(callback_url, session_cookie).cookies.get("token")
     assert token, "the SSO sign-in with the intact session cookie failed"
     assert session_user(sso, token)["email"] == person["email"]
+
+
+def _hashes_by_email(data_dir) -> dict[str, str]:
+    engine = sqlalchemy.create_engine(f"sqlite:///{data_dir / 'webui.db'}")
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(sqlalchemy.text("SELECT email, password FROM auth"))
+            return {email: password for email, password in rows}
+    finally:
+        engine.dispose()
+
+
+def _signs_in(server: RunningBackend, email: str, password: str) -> bool:
+    with server.client() as client:
+        answer = client.post("/api/v1/auths/signin", json={"email": email, "password": password})
+    assert answer.status_code in (200, 400), f"sign-in answered {answer.status_code}: {answer.text}"
+    return answer.status_code == 200
+
+
+def _add_account(server: RunningBackend, admin_token: str, email: str, password: str) -> None:
+    with server.client(admin_token) as client:
+        added = client.post(
+            "/api/v1/auths/add",
+            json={"name": "Hashed", "email": email, "password": password, "role": "user"},
+        )
+    assert added.status_code == 200, added.text
+
+
+@pytest.mark.slow
+def test_accounts_keep_signing_in_when_the_hash_algorithm_switches(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    email = "switch@example.com"
+    with serving(data_dir) as bcrypt_server, bcrypt_server.client() as client:
+        signed_up = client.post(
+            "/api/v1/auths/signup",
+            json={"name": "Switch", "email": email, "password": FIRST_PASSWORD},
+        )
+        assert signed_up.status_code == 200, signed_up.text
+    assert _hashes_by_email(data_dir)[email].startswith("$2b$")
+
+    with serving(data_dir, ARGON2) as argon2_server:
+        assert _signs_in(argon2_server, email, FIRST_PASSWORD), "the bcrypt account was refused"
+        token = sign_in(argon2_server, email, FIRST_PASSWORD)
+        with argon2_server.client(token) as client:
+            changed = client.post(
+                "/api/v1/auths/update/password",
+                json={"password": FIRST_PASSWORD, "new_password": LONG_PASSWORD},
+            )
+        assert changed.status_code == 200 and changed.json() is True, changed.text
+        _add_account(argon2_server, token, "twin-a@example.com", LONG_PASSWORD)
+        _add_account(argon2_server, token, "twin-b@example.com", LONG_PASSWORD)
+    hashes = _hashes_by_email(data_dir)
+    assert all(hashes[who].startswith("$argon2") for who in (email, "twin-a@example.com"))
+    assert hashes["twin-a@example.com"] != hashes["twin-b@example.com"], "the hash has no salt"
+
+    # bcrypt refuses to set a password this long, so only the argon2 hash can let it in
+    with serving(data_dir) as bcrypt_again:
+        assert _signs_in(bcrypt_again, email, LONG_PASSWORD), "the argon2 account was refused"
+        assert not _signs_in(bcrypt_again, email, LONG_PASSWORD[:-1] + "?")
+
+
+@pytest.mark.parametrize("damage", DAMAGED_ARGON2_HASHES)
+def test_a_damaged_argon2_hash_refuses_the_sign_in(argon2_instance, damage):
+    account = create_user(argon2_instance)
+    write_rows(
+        argon2_instance,
+        "UPDATE auth SET password = :password WHERE email = :email",
+        [{"password": DAMAGED_ARGON2_HASHES[damage], "email": account.email}],
+    )
+
+    refused = _sign_in(argon2_instance, account.email, account.password)
+
+    assert refused.status_code == 400, f"HTTP {refused.status_code}: {refused.text}"
+
+
+def test_a_refused_code_exchange_logs_the_reason_the_provider_gave(sso, idp):
+    idp.sign_in_as()
+    callback_url, session_cookie = _approved_callback(sso)
+    code = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(callback_url).query))["code"]
+    spent = httpx.post(
+        f"{idp.base_url}/token",
+        data={"grant_type": "authorization_code", "code": code},
+        timeout=30.0,
+    )
+    assert spent.status_code == 200, spent.text
+    offset = sso.log_size()
+
+    refused = _finish(callback_url, session_cookie)
+
+    assert "token" not in refused.cookies, "a spent code still signed someone in"
+    reported = [
+        line
+        for line in sso.log_since(offset).splitlines()
+        if "authorize_access_token for provider oidc" in line
+    ]
+    assert reported, "the refused code exchange was not logged"
+    assert "invalid_grant" in reported[0], reported[0]

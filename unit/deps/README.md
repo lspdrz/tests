@@ -65,23 +65,30 @@ OPEN_WEBUI_SOURCE_DIR=../open-webui/backend pytest -m depcheck unit/deps integra
 | Library | Feature smoke test |
 |---|---|
 | pypdf, docx2txt, unstructured with python-pptx, pandas, openpyxl, xlrd and msoffcrypto, pypandoc, beautifulsoup4, chardet, ftfy | `integration/deps/test_document_extraction.py` (one upload per format) |
+| azure-ai-documentintelligence | `integration/deps/test_document_extraction.py` (a PDF read by a local stand-in of the analyze API) |
 | rapidocr with onnxruntime, OpenCV and Pillow | `integration/deps/test_document_extraction.py` (PDF image OCR) |
 | langchain text splitters, tiktoken, rank-bm25 | `integration/deps/test_chunking_and_search.py` |
 | Pillow | `integration/deps/test_image_validation.py` |
 | bcrypt, argon2-cffi, PyJWT, pytz, authlib, itsdangerous, cryptography | `integration/deps/test_auth_stack.py` |
 | starlette-compress, Brotli, zstandard, Markdown, beautifulsoup4, brotlicffi, python-socketio, pycrdt | `integration/deps/test_transport_stack.py` |
-| python-mimeparse, aiofiles, pydub | `integration/deps/test_audio_stack.py` |
+| python-mimeparse, aiofiles, pydub, av (local Whisper on a tiny model) | `integration/deps/test_audio_stack.py` |
 | mcp, validators, black, beautifulsoup4, opentelemetry, requests | `integration/deps/test_outbound_stack.py` |
 | boto3 (S3), azure-storage-blob, azure-identity | `integration/deps/test_object_storage.py` (uploads kept in a bucket or container) |
 | azure-identity, azure-search-documents | `integration/deps/test_azure_services.py` (Entra ID sign-in to Azure OpenAI, Azure AI Search) |
 | chromadb (embedded and server), boto3 (S3 Vectors) | `integration/deps/test_vector_stores.py` |
 | redis | `integration/security/test_signin_session_expiry_and_revocation_fallback.py` (a signed-out token is refused) |
-| aiocache | `integration/security/test_cache_key_builder.py` (a repeat model listing never reaches the provider) |
+| aiocache | `integration/security/test_cache_key_builder.py` (a repeat model listing never reaches the provider) and `integration/deps/test_connection_stack.py` (until the TTL runs out) |
+| aiohttp, aiodns | `integration/deps/test_connection_stack.py` (the model list timeout, a provider reached by name through c-ares) |
+| aiosqlite | `integration/deps/test_database_stack.py` |
+| alembic | `integration/migrations/test_lifecycle.py` |
 | requests (Tika) | `integration/retrieval/test_v0114_source_text_and_docling.py` (a binary upload is extracted by Tika) |
-| sqlalchemy, aiosqlite, alembic, fastapi, uvicorn, httpx, aiohttp | every instance boot and request |
+| sqlalchemy, fastapi, uvicorn, httpx | every instance boot and request |
 
 The .rst, .epub and .odt uploads skip without a `pandoc` binary, pydub skips
 without ffmpeg, and the token splitter skips when its tiktoken BPE file is not
-cached, since none of them may be downloaded during a run. Libraries for
-services the integration suite has no local stand-in for (Milvus, Weaviate,
-OpenSearch, Google Cloud, Oracle, Pinecone) keep their unit contracts only.
+cached, since none of them may be downloaded during a run. The local Whisper
+tests build their model with torch, transformers and CTranslate2 and skip
+without them. Libraries for services the integration suite has no local
+stand-in for (Milvus, Weaviate, OpenSearch, Google Cloud, Oracle, Pinecone)
+keep their unit contracts only, as do libraries no Open WebUI feature calls
+(accelerate, the anthropic SDK).
