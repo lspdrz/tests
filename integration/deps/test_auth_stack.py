@@ -1,6 +1,10 @@
 """Dependency smoke: the sign-in stack, each library driven through the feature that uses it.
 
 bcrypt (the default) and argon2-cffi hash the password at sign-up and check it at sign-in.
+bcrypt stores each password as a salted `$2b$` hash at its default cost of 12, as the database
+file shows, and takes at most 72 bytes: a longer new password is refused and a sign-in compares
+only the first 72 bytes, which bcrypt 5 would otherwise refuse with an error. A changed password
+is hashed afresh and the old one stops working.
 PyJWT signs and checks the session token, whose `iat` and `exp` come from pytz's UTC clock.
 authlib builds the SSO redirect and completes the code exchange, while itsdangerous signs the
 `owui-session` cookie that carries its state from one to the other. The completed SSO sign-in
@@ -11,7 +15,9 @@ more). A bump that breaks one of them fails a sign-in here, not only an API chec
 The argon2 instance runs in a zone far from UTC, so a clock that is not UTC shows in the token.
 
 Discriminates: passes on dev bbfa876af; in a backend copy, `bcrypt.checkpw` answering True lets
-the wrong password in, argon2 verification answering True does the same on its instance,
+the wrong password in, hashing with `bcrypt.gensalt(4, prefix=b"2a")` fails the stored-hash test,
+a password update that stores nothing keeps the old password working, dropping the 72-byte cut
+fails the long sign-in, argon2 verification answering True does the same on its instance,
 `jwt.decode` without signature and expiry checks accepts the flipped and the expired token, a
 naive `datetime.now()` for `exp` stretches the lifetime by the zone's 5 h 45 min and dropping
 `SessionMiddleware` fails the SSO sign-in at its first step.
@@ -20,7 +26,9 @@ naive `datetime.now()` for `exp` stretches the lifetime by the zone's 5 h 45 min
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
+import sqlite3
 import time
 import urllib.parse
 import uuid
@@ -106,6 +114,60 @@ def test_bcrypt_checks_the_password_at_sign_in(instance, make_user):
 
     assert _sign_in(instance, account.email, "bcrypt-password-1").status_code == 200
     assert _sign_in(instance, account.email, "bcrypt-password-2").status_code == 400
+
+
+def _stored_hashes(instance: LaunchedInstance, *emails: str) -> list[str]:
+    """The password column of each account, read from the instance's database file."""
+    if not instance.database_url.startswith("sqlite"):
+        pytest.skip("reads the SQLite database file")
+    location = f"file:{instance.data_dir / 'webui.db'}?mode=ro"
+    with contextlib.closing(sqlite3.connect(location, uri=True)) as database:
+        return [
+            database.execute("SELECT password FROM auth WHERE email = ?", (email,)).fetchone()[0]
+            for email in emails
+        ]
+
+
+def test_bcrypt_stores_every_password_salted_at_cost_12(instance, make_user):
+    first = make_user(password="the-same-password")
+    second = make_user(password="the-same-password")
+
+    hashes = _stored_hashes(instance, first.email, second.email)
+
+    assert all(stored.startswith("$2b$12$") and len(stored) == 60 for stored in hashes), hashes
+    assert hashes[0] != hashes[1], "two accounts with one password share a hash"
+
+
+def test_a_password_past_72_bytes_is_refused_and_a_sign_in_compares_72(instance, make_user):
+    longest = "b" * 71 + "!"
+    account = make_user(password=longest)
+    with instance.client() as client:
+        too_long = client.post(
+            "/api/v1/auths/add",
+            json={
+                "name": "Long",
+                "email": f"long-{uuid.uuid4().hex[:8]}@example.com",
+                "password": longest + "x",
+                "role": "user",
+            },
+        )
+
+    assert too_long.status_code == 400, too_long.text
+    assert _sign_in(instance, account.email, longest + " and more").status_code == 200
+    assert _sign_in(instance, account.email, "b" * 71 + "?").status_code == 400
+
+
+def test_a_changed_password_replaces_the_old_one(instance, make_user):
+    account = make_user(password="old-harbour-password")
+    with account.client() as client:
+        changed = client.post(
+            "/api/v1/auths/update/password",
+            json={"password": "old-harbour-password", "new_password": "new-harbour-password"},
+        )
+
+    assert changed.status_code == 200, changed.text
+    assert _sign_in(instance, account.email, "new-harbour-password").status_code == 200
+    assert _sign_in(instance, account.email, "old-harbour-password").status_code == 400
 
 
 def test_argon2_hashes_the_whole_password_at_sign_up(argon2_instance, preserve):

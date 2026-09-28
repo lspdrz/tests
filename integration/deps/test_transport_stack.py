@@ -1,17 +1,22 @@
 """Dependency smoke: how responses and live updates travel, each library through its feature.
 
 starlette-compress compresses a response in the encoding the client asks for, with Brotli,
-gzip and zstandard doing the work. /api/changelog is a large public response that shows it, and
-its body is CHANGELOG.md turned into HTML by Markdown and split into versions by BeautifulSoup.
+gzip and zstandard doing the work: a response sent whole goes through `brotli.compress`, a file
+streamed in parts through a `brotli.Compressor`. /api/changelog is a large public response that
+shows it, and its body is CHANGELOG.md turned into HTML by Markdown and split into versions and
+items by BeautifulSoup, each item cut at its first ": " into a title and its text.
 aiohttp decodes a Brotli-encoded provider reply with brotlicffi (Brotli when that is absent).
 python-socketio carries the chat events to the browser, and pycrdt merges the live edits two tabs
 make to one note.
 
 Discriminates: passes on dev bbfa876af; in a backend copy, dropping `CompressMiddleware` fails
-every encoding, skipping `markdown.markdown` empties the changelog, a provider session with
-`auto_decompress=False` hands the Brotli bytes to the stream parser, emitting chat events to a
-room other than `user:{id}` starves the socket of them and not applying the stored updates before
-`ydoc.get_update()` sends the second tab an empty document.
+every encoding, a `brotli.Compressor` that emits nothing (patched in at import) fails the
+streamed download and the Brotli changelog, skipping `markdown.markdown` empties the changelog,
+an item whose content is its raw HTML fails the changelog test, a provider session with
+`auto_decompress=False` hands the Brotli bytes to the stream parser (as does a brotlicffi
+`Decompressor` patched to garble), emitting chat events to a room other than `user:{id}` starves
+the socket of them and not applying the stored updates before `ydoc.get_update()` sends the
+second tab an empty document.
 """
 
 from __future__ import annotations
@@ -58,6 +63,26 @@ def test_the_changelog_is_compressed_in_the_encoding_asked_for(instance, encodin
     assert compressed.json() == plain.json()
 
 
+def test_a_large_file_download_is_streamed_brotli_compressed(make_user):
+    # past one 64 KiB read, so the file leaves in several parts
+    logbook = "".join(f"Tide {index}: high water at the harbour mouth.\n" for index in range(8000))
+    with make_user().client() as client:
+        uploaded = client.post(
+            "/api/v1/files/",
+            params={"process": "false"},
+            files={"file": ("logbook.txt", logbook.encode(), "text/plain")},
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        downloaded = client.get(
+            f"/api/v1/files/{uploaded.json()['id']}/content", headers={"Accept-Encoding": "br"}
+        )
+
+    assert downloaded.status_code == 200, downloaded.text
+    assert downloaded.headers.get("content-encoding") == "br"
+    assert downloaded.num_bytes_downloaded < len(logbook) // 5
+    assert downloaded.text == logbook
+
+
 def _changelog_source() -> str:
     """The CHANGELOG.md the server reads: the checkout's, else the one packaged with it."""
     backend = resolve_backend()
@@ -84,6 +109,11 @@ def test_the_changelog_is_read_from_the_markdown(instance):
     items = [item for name in sections for item in newest[name]]
     assert items and all(item["raw"].startswith("<li>") for item in items)
     assert any("<strong>" in item["raw"] for item in items), "the bold markdown was not rendered"
+    # each item's text is split at its first ": " into a title and the rest
+    assert all("<strong>" not in item["title"] + item["content"] for item in items)
+    titled = [item for item in items if item["title"]]
+    assert titled, "no item was split into a title and its text"
+    assert all(item["content"] and ": " not in item["title"] for item in titled)
 
 
 @pytest.fixture

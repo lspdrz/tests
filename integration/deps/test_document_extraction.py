@@ -9,6 +9,9 @@ PDF's images are opened by Pillow and read by rapidocr on onnxruntime and OpenCV
 bump that breaks one of those paths fails the upload or loses the text, which
 `GET /api/v1/files/{id}/data/content` shows. The library contracts are in unit/deps/.
 
+Windows-1251 Cyrillic is decoded with the codec chardet names, which ftfy could not repair
+after a latin-1 fallback.
+
 EUC-KR and Shift-JIS text were decoded as GB18030 mojibake (issue #31352, fix 3c47f0d7e, PR
 #31356): chardet 7.4.3 says CP949 for EUC-KR, which the codec map in `_detect_text_encoding`
 lacked, and Shift-JIS was missing from its try order. Both cases pass on dev efe63bd34 and fail
@@ -18,7 +21,8 @@ Discriminates: passes on dev bbfa876af (.rst, .epub and .odt with a pandoc binar
 backend copy broke pypdf's `extract_text`, `docx2txt.process`, the xlsx, rst and epub partitions
 and `chardet.detect`; another broke rapidocr's `RapidOCR`, the pptx, xml and odt partitions,
 BeautifulSoup's `get_text` and `ftfy.fix_text`. Each copy turned exactly its own formats red and
-left the others green. Mapping cp949 in a third copy makes the EUC-KR case pass.
+left the others green. Mapping cp949 in a third copy makes the EUC-KR case pass. A fourth copy
+whose `chardet.detect` names no encoding fails the Big5, EUC-KR, Shift-JIS and Windows-1251 cases.
 """
 
 from __future__ import annotations
@@ -295,6 +299,15 @@ def test_a_cjk_text_file_is_decoded(make_user, codec, text):
         content = _upload_and_read(client, "notes.txt", document.encode(codec), "text/plain")
 
     assert content == document, f"{codec} was decoded as {content[:40]!r}"
+
+
+def test_a_cyrillic_windows_1251_file_is_decoded_by_chardets_guess(make_user):
+    # no CJK codec reads it, so the loader takes chardet's own answer before latin-1
+    document = "Смотритель маяка записывает приливы и погоду в судовой журнал. " * 4
+    with make_user().client() as client:
+        content = _upload_and_read(client, "notes.txt", document.encode("cp1251"), "text/plain")
+
+    assert content == document, f"cp1251 was decoded as {content[:40]!r}"
 
 
 def test_mojibake_is_repaired_and_a_literal_entity_is_kept(make_user):
