@@ -204,16 +204,6 @@ def builtin_tools_module(owui_module):
 
 
 @pytest.fixture(scope="session")
-def retrieval_utils_module(owui_module):
-    """`open_webui.retrieval.utils`.
-
-    Heavy: pulls langchain, huggingface_hub, the vector-DB clients, the
-    whole open_webui model layer, and triggers alembic setup on first load.
-    """
-    return owui_module("open_webui.retrieval.utils")
-
-
-@pytest.fixture(scope="session")
 def retrieval_web_utils_module(owui_module):
     """`open_webui.retrieval.web.utils`.
 

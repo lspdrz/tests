@@ -1,17 +1,16 @@
-"""Guard: the i18n locale catalogs must stay loadable and in sync.
+"""Guard: every locale catalog is offered in the picker and parses.
 
-The frontend picks a language from src/lib/i18n/locales/languages.json and
-then fetches locales/<code>/translation.json. The two sides are maintained by
-hand and by `npm run i18n:parse`, so they drift in both directions: a
-contributor adds a locale directory and forgets languages.json (the language
-never appears in the picker), or an entry is listed with no directory behind
-it (choosing it loads nothing and the UI falls back to raw translation keys).
+The frontend picks a language from src/lib/i18n/locales/languages.json and then loads
+locales/<code>/translation.json. A contributor who adds a locale directory and forgets
+languages.json leaves a translation nobody can select, and a trailing comma or an unescaped quote
+in any translation.json breaks that catalog. A built page cannot see a catalog the manifest does
+not name, and a broken one fails before any page loads, so both stay a data lint over the JSON
+files. That every offered language has a name, is listed once and loads its catalog, and
+that English shows no raw keys, is covered in the browser by
+e2e/frontend/test_locale_catalog_integrity.py.
 
-A trailing comma or an unescaped quote in any translation.json is the same
-class of accident and breaks that language outright.
-
-A data lint over the JSON files, so it runs without node or the frontend's dependencies.
-A missing locales directory or manifest fails and names what to retarget.
+Discriminates: passes on ef67cc3fa; a locale directory missing from languages.json fails the
+picker test, and a catalog with a trailing comma fails the JSON test.
 """
 
 from __future__ import annotations
@@ -45,30 +44,6 @@ def declared_languages(locales_dir: Path) -> list[dict]:
     return json.loads(manifest.read_text(encoding="utf-8"))
 
 
-def test_languages_manifest_entries_have_a_code_and_a_title(declared_languages: list[dict]) -> None:
-    incomplete = [
-        entry for entry in declared_languages if not entry.get("code") or not entry.get("title")
-    ]
-    assert not incomplete, f"languages.json entries missing code or title: {incomplete}"
-
-
-def test_no_language_is_declared_twice(declared_languages: list[dict]) -> None:
-    codes = [entry["code"] for entry in declared_languages]
-    duplicates = sorted({code for code in codes if codes.count(code) > 1})
-    assert not duplicates, f"languages.json lists these codes more than once: {duplicates}"
-
-
-def test_every_declared_language_has_a_catalog(
-    declared_languages: list[dict], locale_dirs: list[str]
-) -> None:
-    """Picking one of these in the UI would load nothing and leave the whole
-    interface showing raw translation keys."""
-    orphans = sorted(
-        entry["code"] for entry in declared_languages if entry["code"] not in locale_dirs
-    )
-    assert not orphans, f"languages.json codes with no locales/<code>/ directory: {orphans}"
-
-
 def test_every_catalog_is_offered_in_the_picker(
     declared_languages: list[dict], locale_dirs: list[str]
 ) -> None:
@@ -93,10 +68,3 @@ def test_every_catalog_is_valid_json(locales_dir: Path, locale_dirs: list[str]) 
         if not isinstance(parsed, dict):
             broken.append((code, f"top level is {type(parsed).__name__}, expected an object"))
     assert not broken, f"unusable translation catalogs: {broken}"
-
-
-def test_the_source_locale_is_present_and_populated(locales_dir: Path) -> None:
-    """en-US is the fallback every other language falls back to."""
-    catalog = locales_dir / "en-US" / "translation.json"
-    assert catalog.is_file(), f"no en-US catalog at {catalog}"
-    assert json.loads(catalog.read_text(encoding="utf-8")), "the en-US catalog is empty"

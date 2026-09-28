@@ -3,7 +3,9 @@
 `serving_qdrant()` yields a `FakeQdrant` speaking the REST API `qdrant-client` uses: collections,
 payload indexes, upserts, deletes, counts, scrolls and vector queries with payload filters, with
 cosine scores worked out in Python. Set `max_query_limit` to act like strict mode: a scroll or
-query asking for more points than that is refused with Qdrant's "Limit exceeded" error.
+query asking for more points than that is refused with Qdrant's "Limit exceeded" error. A
+collection whose name contains one of `unavailable` answers every vector query with a 503, as a
+shard that is down does.
 `qdrant_env(fake, multitenancy)` is the environment of an instance that stores its vectors there.
 """
 
@@ -27,6 +29,7 @@ class FakeQdrant:
     collections: dict[str, dict[Any, dict]] = field(default_factory=dict)
     max_query_limit: int | None = None
     refused_limits: list[int] = field(default_factory=list)
+    unavailable: set[str] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -151,6 +154,8 @@ class _Api:
             if action == "/points/scroll":
                 return self._scroll(name, body)
             if action == "/points/query":
+                if any(part in name for part in fake.unavailable):
+                    return 503, f"Service unavailable: {name} has no active replica"
                 return self._query(name, body)
         return 404, None
 
