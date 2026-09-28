@@ -1,43 +1,34 @@
-"""The orjson codec's options and the stream line reader's limit settings, both fixed in v0.11.1.
+"""The orjson codec's options, fixed in v0.11.1 (commit 78ed5a0235).
 
-* Commit 78ed5a0235: `ORJSONCodec.dumps` and `loads` swallowed their options, so `indent`,
-  `sort_keys`, `ensure_ascii`, `separators` and `object_hook` had no effect. Any option outside
-  orjson's own defaults now falls back to engineio's stdlib-backed codec.
-* Commit a33fa05adc: `stream_chunks_handler` handed back aiohttp's raw reader when
-  `CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE` meant "no limit", whose own line limit then aborted
-  long lines. It now always assembles lines itself.
+`ORJSONCodec.dumps` and `loads` swallowed their options, so `indent`, `sort_keys`, `ensure_ascii`,
+`separators` and `object_hook` had no effect. Any option outside orjson's own defaults now falls
+back to engineio's stdlib-backed codec.
 
-The integration twin pins what users see (a note's JSON, a separator in a streamed reply, one
-oversized line on default settings). This file covers what it cannot reach: every option
-spelling, `loads` options, which no route passes, and the "no limit" spellings other than unset.
-The codec picks its implementation at import, so it is probed in a child interpreter booted with
-`ENABLE_ORJSON=true` rather than by re-executing the module here.
+The integration twin pins what users see: a note's indented JSON (`indent`), a tag search over
+data stored by stdlib json (`ensure_ascii`), the stream line reader's limit settings. This file
+keeps the options no route passes to the codec (`sort_keys`, other `separators`, `object_hook`)
+and the fallback for what orjson rejects. The codec picks its implementation at import, so it is
+probed in a child interpreter booted with `ENABLE_ORJSON=true` rather than by re-executing the
+module here.
 
 Discriminates: passes on bbfa876af; dropping the option fallback from `ORJSONCodec` fails the
-option and `object_hook` tests, and returning the raw reader for a disabled limit fails the
-disabled-limit tests.
+option and `object_hook` tests.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import subprocess
 import sys
-from unittest import mock
 
-import aiohttp
 import pytest
-from aiohttp.base_protocol import BaseProtocol
 
 pytestmark = pytest.mark.regression
 
 PAYLOAD = {"b": [1, {"z": "é", "a": None}], "a": True}
 OPTIONS = {
-    "indent": {"indent": 4},
     "sort_keys": {"sort_keys": True},
-    "ensure_ascii": {"ensure_ascii": True},
     "separators": {"separators": (" | ", " -> ")},
     "indent_and_sort_keys": {"indent": 2, "sort_keys": True},
 }
@@ -98,40 +89,3 @@ def test_dumps_without_options_stays_compact_raw_utf8(orjson_codec):
 def test_what_orjson_rejects_still_falls_back_to_stdlib(orjson_codec):
     assert orjson_codec["int_keys"] == {"1": "int key"}
     assert orjson_codec["with_default"] == '{"x": [1, 2]}'
-
-
-def _read_lines(misc_module, monkeypatch, chunks: list[bytes], max_buffer_size) -> list[bytes]:
-    """Feed a real aiohttp reader, whose own line limit is 64 bytes, through the handler."""
-    monkeypatch.setattr(misc_module, "CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE", max_buffer_size)
-
-    async def read() -> list[bytes]:
-        loop = asyncio.get_running_loop()
-        protocol = mock.create_autospec(BaseProtocol, instance=True)
-        reader = aiohttp.StreamReader(protocol, limit=64, loop=loop)
-        for chunk in chunks:
-            reader.feed_data(chunk)
-        reader.feed_eof()
-        return [line async for line in misc_module.stream_chunks_handler(reader)]
-
-    return asyncio.run(read())
-
-
-@pytest.mark.parametrize("max_buffer_size", [None, 0, -1])
-def test_a_long_line_survives_every_spelling_of_no_limit(misc_module, monkeypatch, max_buffer_size):
-    long_line = b"data: " + b"y" * 500 + b"\n"
-
-    lines = _read_lines(
-        misc_module, monkeypatch, [long_line[:200], long_line[200:]], max_buffer_size
-    )
-
-    assert lines == [long_line]
-
-
-def test_a_configured_limit_drops_only_the_oversized_line(misc_module, monkeypatch):
-    chunks = [b"small\n", b"data: " + b"z" * 200 + b"\n", b"after\n"]
-
-    assert _read_lines(misc_module, monkeypatch, chunks, 50) == [b"small\n", b"after\n"]
-
-
-def test_an_empty_stream_yields_nothing(misc_module, monkeypatch):
-    assert _read_lines(misc_module, monkeypatch, [], None) == []

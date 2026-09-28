@@ -16,34 +16,60 @@ open-webui 0.11.0 fixes, each read where an operator reads it:
   refusal never reached the server log.
 * Feedback events (commit 300302d): the event read `feedback.rating`, an attribute the model does
   not have, so every feedback event said the rating was None.
+* Values in error logs (commit 6aebfd8, #26814): loguru's `diagnose` was left at its default, so
+  every logged traceback printed the local variables beside each frame, a user's chat message
+  among them. `LOGURU_DIAGNOSE` now switches it on, off by default.
+* Transcription chunk order (#27417, issue #27143): a recording over the 20 MB upload limit of
+  speech-to-text engines is split into chunks, and their transcripts were joined in the order the
+  engine finished them, not the order they were spoken. Splitting runs ffmpeg and ffprobe, so
+  that test skips on a host without them.
+* Licensed startup (commits 8f77533, 0c7ddbd): the lifespan fetched the license inline, so an
+  instance with a `LICENSE_KEY` was not ready until the license server answered or timed out,
+  and an unreachable license host raised out of the fetch instead of falling through to the next.
+  The license hosts are fixed, so the instance reaches them through a local HTTPS proxy that
+  refuses the first host and holds the connection to the second.
 
 The header, audit and webhook tests run on an instance of their own, booted with security
 headers, request-and-response auditing, an emptied exclusion list and a legacy `WEBHOOK_URL` on
 loopback, which the webhook sender refuses.
 
 Twin of unit/config/test_observability_middleware.py; the pure-ASGI audit of the middleware
-stack, the log diagnose default, transcription order and licensed startup stay there.
+stack stays there.
 
 Discriminates: passes on bbfa876af; formatting the process time with `int()` fails the process
 time test, reverting 2ef6c76 the audit tests, registering audit after compression the gzip test,
-reverting 0671b7a the webhook test, dropping the rejection log line the provider tests and
-reading `feedback.rating` again the feedback test. The header, GET and sign-in tests pass on both.
+reverting 0671b7a the webhook test, dropping the rejection log line the provider tests, reading
+`feedback.rating` again the feedback test, joining chunks with `asyncio.as_completed` the
+transcription test, defaulting `LOGURU_DIAGNOSE` to true the traceback
+test, fetching the license inline (or awaiting it without a timeout) the readiness test and
+letting the first host's error escape the fetch the fall-through test. The header, GET, sign-in
+and opted-in diagnose tests pass on both.
 """
 
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import socket
+import subprocess
+import threading
 import time
 import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
 
 import pytest
 
 from harness import upstream as reply
 from harness.actors import admin_of, create_user
+from harness.audio_engine import serve_audio_engine, using_audio_engine
 from harness.chat import ask
 from harness.instance import ADMIN_EMAIL, ADMIN_PASSWORD
-from harness.listener import json_answer
+from harness.listener import ReceivedRequest, json_answer
 from harness.plugins import installed_function
+from harness.prepared_data import serving
 from harness.upstream import MOCK_MODEL_ID
 
 pytestmark = [
@@ -274,3 +300,224 @@ def test_feedback_events_carry_the_rating(admin, user, listener):
         f"model does not have: {created_events[0]['data']}"
     )
     assert updated_events and updated_events[0]["data"]["rating"] == -1, updated_events
+
+
+# tracebacks in the server log
+
+# Short enough to fall inside loguru's truncated rendering of the chat body.
+PRIVATE_MESSAGE = "pw hunter2"
+
+FAILING_OUTLET = """
+class Filter:
+    def outlet(self, body):
+        raise RuntimeError("the outlet filter broke")
+"""
+
+
+def _outlet_failure_log(target, admin) -> str:
+    offset = target.log_size()
+    with installed_function(admin, FAILING_OUTLET, is_global=True), admin.client() as client:
+        ask(client, PRIVATE_MESSAGE)
+        _eventually(lambda: "the outlet filter broke" in target.log_since(offset))
+    logged = target.log_since(offset)
+    assert "Traceback" in logged, f"the failing filter logged no traceback:\n{logged[-2000:]}"
+    return logged
+
+
+def test_a_logged_traceback_does_not_print_the_users_message(instance, admin, upstream):
+    logged = _outlet_failure_log(instance, admin)
+
+    assert PRIVATE_MESSAGE not in logged, (
+        "a logged traceback printed the local variables beside its frames, the user's chat "
+        f"message among them (#26814):\n{logged[-3000:]}"
+    )
+
+
+def test_an_operator_who_opts_in_sees_the_values(instance_with):
+    diagnosing = instance_with({"LOGURU_DIAGNOSE": "true"})
+
+    logged = _outlet_failure_log(diagnosing, admin_of(diagnosing))
+
+    assert PRIVATE_MESSAGE in logged, (
+        "with LOGURU_DIAGNOSE=true the traceback no longer shows the chat body beside its frame; "
+        "retarget the probe message, the test above proves nothing without this"
+    )
+
+
+# transcription of a long recording
+
+# 32 kbit/s for 93 minutes is still over 20 MB after the server's own compression.
+LONG_RECORDING_SECONDS = 5600
+
+
+@pytest.fixture(scope="module")
+def long_recording(tmp_path_factory) -> Path:
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        pytest.skip("splitting a long recording needs ffmpeg and ffprobe on PATH")
+    recording = tmp_path_factory.mktemp("recording") / "meeting.mp3"
+    tone = f"sine=frequency=440:sample_rate=16000:duration={LONG_RECORDING_SECONDS}"
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", tone]
+        + ["-ac", "1", "-b:a", "32k", str(recording)],
+        check=True,
+        timeout=300,
+    )
+    return recording
+
+
+def _chunk_index(request: ReceivedRequest) -> int:
+    match = re.search(rb'filename="[^"]*_chunk_(\d+)\.', request.body)
+    assert match, f"the chunk upload named no chunk: {request.body[:300]!r}"
+    return int(match.group(1))
+
+
+def test_a_long_recording_is_transcribed_in_spoken_order(
+    admin, make_user, listener, long_recording
+):
+    engine = serve_audio_engine(listener)
+    later_chunks_done = threading.Event()
+
+    def later_chunks_answer_first(request: ReceivedRequest):
+        index = _chunk_index(request)
+        if index == 0:
+            later_chunks_done.wait(timeout=60)
+        else:
+            later_chunks_done.set()
+        return json_answer({"text": f"part{index}"})
+
+    listener.route("POST", "/audio/transcriptions", later_chunks_answer_first)
+    with admin.client() as admin_client, using_audio_engine(admin_client, engine):
+        with make_user().client() as client, long_recording.open("rb") as audio:
+            transcribed = client.post(
+                "/api/v1/audio/transcriptions",
+                files={"file": ("meeting.mp3", audio, "audio/mpeg")},
+                timeout=600,
+            )
+
+    assert transcribed.status_code == 200, transcribed.text
+    chunks = len(engine.transcription_requests())
+    assert chunks > 1, "the recording was not split; lengthen it past the upload limit"
+    spoken_order = " ".join(f"part{index}" for index in range(chunks))
+    assert transcribed.json()["text"] == spoken_order, (
+        "the chunks were joined in the order the engine finished them, not the order they were "
+        f"spoken (#27143): {transcribed.json()['text']!r}"
+    )
+
+
+def test_a_chunk_the_engine_fails_fails_the_whole_transcription(
+    admin, make_user, listener, long_recording
+):
+    engine = serve_audio_engine(listener)
+
+    def the_last_chunk_fails(request: ReceivedRequest):
+        if _chunk_index(request) == 0:
+            return json_answer({"text": "part0"})
+        return json_answer({"error": {"message": "the engine is overloaded"}}, status=500)
+
+    listener.route("POST", "/audio/transcriptions", the_last_chunk_fails)
+    with admin.client() as admin_client, using_audio_engine(admin_client, engine):
+        with make_user().client() as client, long_recording.open("rb") as audio:
+            transcribed = client.post(
+                "/api/v1/audio/transcriptions",
+                files={"file": ("meeting.mp3", audio, "audio/mpeg")},
+                timeout=600,
+            )
+
+    assert len(engine.transcription_requests()) > 1
+    assert transcribed.status_code >= 400, (
+        f"a chunk the engine refused still produced a transcript: {transcribed.text}"
+    )
+    assert "part0" not in transcribed.text
+
+
+# licensed startup
+
+REFUSED_LICENSE_HOST = "api.openwebui.com:443"
+HELD_LICENSE_HOST = "licenses.api.openwebui.com:443"
+
+
+class LicenseProxy:
+    """An HTTPS proxy: refuses CONNECT to the first license host, holds the second one open."""
+
+    def __init__(self) -> None:
+        self.server = socket.create_server(("127.0.0.1", 0))
+        self.url = f"http://127.0.0.1:{self.server.getsockname()[1]}"
+        self.targets: list[str] = []
+        self.open_targets: list[str] = []
+        self.lock = threading.Lock()
+
+    def serve(self) -> None:
+        while True:
+            try:
+                connection, _ = self.server.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(connection,), daemon=True).start()
+
+    def _handle(self, connection: socket.socket) -> None:
+        with connection:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                received = connection.recv(4096)
+                if not received:
+                    return
+                request += received
+            target = request.split(b" ")[1].decode()
+            with self.lock:
+                self.targets.append(target)
+            if target == REFUSED_LICENSE_HOST:
+                connection.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                return
+            with self.lock:
+                self.open_targets.append(target)
+            try:
+                while connection.recv(4096):
+                    pass
+            except OSError:
+                pass
+            with self.lock:
+                self.open_targets.remove(target)
+
+    def pending(self) -> list[str]:
+        with self.lock:
+            return list(self.open_targets)
+
+
+@contextmanager
+def license_proxy() -> Iterator[LicenseProxy]:
+    proxy = LicenseProxy()
+    threading.Thread(target=proxy.serve, daemon=True).start()
+    try:
+        yield proxy
+    finally:
+        proxy.server.close()
+
+
+@pytest.fixture(scope="module")
+def licensed_boot(tmp_path_factory) -> dict:
+    """What the license proxy saw by the time a licensed instance first answered `/health`."""
+    with license_proxy() as proxy:
+        env = {
+            "LICENSE_KEY": "test-license-key",
+            "HTTPS_PROXY": proxy.url,
+            "https_proxy": proxy.url,
+            "NO_PROXY": "127.0.0.1,localhost",
+        }
+        with serving(tmp_path_factory.mktemp("licensed"), env) as backend:
+            ready = {"pending": proxy.pending(), "targets": list(proxy.targets)}
+            ready["log"] = backend.log()
+    return ready
+
+
+def test_startup_does_not_wait_on_the_license_server(licensed_boot):
+    assert licensed_boot["pending"] == [HELD_LICENSE_HOST], (
+        "the instance only became ready once the license request had ended, so startup waits "
+        f"on the license server; proxy saw {licensed_boot['targets']}"
+    )
+
+
+def test_an_unreachable_license_host_falls_through_to_the_next(licensed_boot):
+    assert licensed_boot["targets"][:2] == [REFUSED_LICENSE_HOST, HELD_LICENSE_HOST], (
+        "the refused first license host ended the lookup instead of falling through to the "
+        f"second: {licensed_boot['targets']}\n{licensed_boot['log'][-2000:]}"
+    )

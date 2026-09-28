@@ -6,17 +6,21 @@ group permission endpoints validate through. Pydantic drops unknown keys, so an 
 folder sharing had the flag discarded on every save and the setting never took effect. The fix
 adds the field.
 
-Twin of unit/config/test_sharing_permissions_folders.py; the audit that every default permission
-has a schema field stays there.
+The broad test covers every default permission, including ones added later: on an instance where
+nobody has saved yet, users get the built-in defaults as they are, and the admin's first save of
+the default permissions must hand every one of those flags back to them.
 
 Discriminates: passes on bbfa876af, fails with the `folders` field removed from
-`SharingPermissions` (the saved flag reads back without it and the user's session says False); the
-round trip of every other key passes on both.
+`SharingPermissions` (the saved flag reads back without it, the user's session says False and the
+first save drops `sharing.folders` from every user's permissions); the round trip of every other
+key passes on both.
 """
 
 from __future__ import annotations
 
 import pytest
+
+from harness.actors import create_user
 
 pytestmark = [pytest.mark.regression, pytest.mark.api, pytest.mark.requires_source]
 
@@ -79,3 +83,34 @@ def test_every_permission_round_trips_both_ways(admin, permissions):
 
     assert _save_and_reload(admin, flipped) == flipped
     assert _save_and_reload(admin, permissions) == permissions
+
+
+def _flags(permissions: dict) -> dict[str, bool]:
+    return {
+        f"{section}.{key}": enabled
+        for section, flags in permissions.items()
+        for key, enabled in flags.items()
+    }
+
+
+@pytest.mark.slow
+def test_the_first_save_keeps_every_default_permission_users_had(instance_with):
+    unsaved = instance_with({})  # nobody has saved the default permissions here yet
+    member = create_user(unsaved)
+    with member.client() as client:
+        before = _flags(client.get("/api/v1/auths/").json()["permissions"])
+
+    with unsaved.client() as client:
+        shown = client.get(PERMISSIONS)
+        assert shown.status_code == 200, shown.text
+        saved = client.post(PERMISSIONS, json=shown.json())
+        assert saved.status_code == 200, saved.text
+    with member.client() as client:
+        after = _flags(client.get("/api/v1/auths/").json()["permissions"])
+
+    dropped = sorted(set(before) - set(after))
+    assert dropped == [], (
+        f"default permissions {dropped} have no field in the admin's permission form, so the "
+        "first save removed them from every user (#27120)"
+    )
+    assert after == before

@@ -6,32 +6,43 @@ Three open-webui v0.11.1 fixes:
   raw. Python reads all three as line breaks, so under `ENABLE_ORJSON` a chunk the server
   re-serialized (every chunk, once a stream filter is installed) split into lines that no longer
   parse for a consumer reading the stream with `splitlines()`. `dumps` now escapes them.
-* Commit 78ed5a0235: the orjson codec swallowed `dumps` and `loads` options, so a note stored
-  with structured markdown came back as one compact line instead of the indented JSON block the
-  note sanitizer asks for.
-* Commit a33fa05adc: with `CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE` unset (the default) the
-  provider stream was read through aiohttp's own line reader, whose limit aborted any reply that
-  arrived as one line over 128 KiB.
+* Commit 78ed5a0235: the orjson codec swallowed `dumps` and `loads` options. A note stored with
+  structured markdown came back as one compact line instead of the indented JSON block the note
+  sanitizer asks for, and a tag search stopped matching the ASCII-escaped spelling stdlib json
+  had stored, so switching `ENABLE_ORJSON` on hid every model tagged with a non-ASCII name.
+* Commit a33fa05adc: when `CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE` meant "no limit" (unset, 0
+  or negative) the provider stream was read through aiohttp's own line reader, which aborted any
+  reply that arrived as one line over its limit (512 KiB on aiohttp 3.14). A configured limit
+  drops only the line over it.
 
-The codec's option handling across every spelling stays in unit/config/test_json_codec.py.
+The codec options no route passes (`sort_keys`, other `separators`, `object_hook`) stay in
+unit/config/test_json_codec.py.
 
 Twin of unit/config/test_json_codec.py.
 
 Discriminates: passes on bbfa876af; dropping the separator escaping from `ORJSONCodec.dumps` fails
-the separator test, dropping its option fallback fails the note test, and handing back the raw
-reader for an unset buffer size fails the oversized line test. The plain-text test passes on both.
+the separator test, dropping its option fallback fails the note and tag search tests, and handing
+back the raw reader for a disabled limit fails the oversized line tests. The plain-text, configured
+limit and empty stream tests pass on both.
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
+import uuid
+from contextlib import closing
 
 import pytest
 
 from harness import upstream as reply
 from harness.actors import admin_of
 from harness.chat import ask
+from harness.instance import ADMIN_EMAIL, ADMIN_PASSWORD
 from harness.plugins import installed_function
+from harness.prepared_data import serving
+from harness.raw_provider import connect
+from harness.second_provider import OPENAI_CONFIG
 from harness.upstream import MOCK_MODEL_ID
 
 pytestmark = [
@@ -42,6 +53,8 @@ pytestmark = [
 ]
 
 ORJSON = {"ENABLE_ORJSON": "true"}
+BUFFER_SIZE = "CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE"
+OVERSIZED_LINE = 1_000_000  # characters, past any aiohttp line limit
 LINE_SEPARATORS = ("\u2028", "\u2029", "\x85")
 
 # Makes the server parse and re-serialize every streamed chunk.
@@ -128,7 +141,7 @@ def test_a_note_with_structured_markdown_is_stored_as_indented_json(orjson_insta
 
 
 def test_a_reply_arriving_as_one_oversized_line_is_stored_whole(user, upstream):
-    oversized = "x" * 200_000
+    oversized = "x" * OVERSIZED_LINE
     upstream.queue(reply.text(oversized))
 
     with user.client() as client:
@@ -137,4 +150,84 @@ def test_a_reply_arriving_as_one_oversized_line_is_stored_whole(user, upstream):
     assert message["content"] == oversized, (
         "a reply that arrived as one line over aiohttp's limit was cut off on default settings, "
         f"because the stream was read through the raw reader: {len(message['content'])} chars"
+    )
+
+
+@pytest.mark.parametrize("disabled", ["0", "-1"])
+def test_a_reply_arriving_as_one_oversized_line_survives_a_disabled_limit(instance_with, disabled):
+    unlimited = instance_with({BUFFER_SIZE: disabled})
+    oversized = "y" * OVERSIZED_LINE
+    unlimited.upstream.queue(reply.text(oversized))
+
+    with admin_of(unlimited).client() as client:
+        _, message = ask(client, "one very long line please")
+
+    assert message["content"] == oversized, (
+        f"{BUFFER_SIZE}={disabled} means no limit, yet the reply was cut off at aiohttp's own "
+        f"line limit: {len(message['content'])} chars"
+    )
+
+
+def test_a_configured_limit_drops_only_the_oversized_line(instance_with):
+    limited = instance_with({BUFFER_SIZE: "100000"})
+    limited.upstream.queue(reply.text(["before ", "z" * 200_000, "after"]))
+
+    with admin_of(limited).client() as client:
+        _, message = ask(client, "three lines, one too long")
+
+    assert message["content"] == "before after"
+
+
+def test_an_empty_provider_stream_ends_the_reply_quietly(admin, listener, preserve):
+    preserve(OPENAI_CONFIG)
+    provider = connect(admin, listener)
+    provider.stream(b"")
+
+    with admin.client() as client:
+        _, message = ask(client, "anything?", model=provider.model_id)
+
+    assert message["content"] == ""
+    assert not message.get("error"), message
+
+
+def _stored_meta(data_dir, model_id: str) -> str:
+    with closing(sqlite3.connect(data_dir / "webui.db")) as database:
+        row = database.execute("SELECT meta FROM model WHERE id = ?", (model_id,)).fetchone()
+    return row[0]
+
+
+def test_a_non_ascii_tag_stored_by_stdlib_json_is_still_found_under_orjson(tmp_path):
+    tag = f"Café {uuid.uuid4().hex[:6]}"
+    model_id = f"tagged-{uuid.uuid4().hex[:8]}"
+    account = {"name": "Admin", "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+
+    with serving(tmp_path) as stdlib_backend, stdlib_backend.client() as client:
+        signed_up = client.post("/api/v1/auths/signup", json=account)
+        assert signed_up.status_code == 200, signed_up.text
+        client.headers["Authorization"] = f"Bearer {signed_up.json()['token']}"
+        created = client.post(
+            "/api/v1/models/create",
+            json={
+                "id": model_id,
+                "name": "Tagged preset",
+                "base_model_id": MOCK_MODEL_ID,
+                "meta": {"tags": [{"name": tag}]},
+                "params": {},
+            },
+        )
+        assert created.status_code == 200, created.text
+    assert "\\u00e9" in _stored_meta(tmp_path, model_id), "stdlib json no longer escapes the tag"
+
+    with serving(tmp_path, ORJSON) as orjson_backend, orjson_backend.client() as client:
+        signed_in = client.post(
+            "/api/v1/auths/signin", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+        )
+        assert signed_in.status_code == 200, signed_in.text
+        client.headers["Authorization"] = f"Bearer {signed_in.json()['token']}"
+        found = client.get("/api/v1/models/list", params={"tag": tag})
+
+    assert found.status_code == 200, found.text
+    assert [item["id"] for item in found.json()["items"]] == [model_id], (
+        "with ENABLE_ORJSON on, the tag search only looked for the raw spelling: the codec "
+        "ignored ensure_ascii=True, so a tag stored escaped by stdlib json was never found"
     )

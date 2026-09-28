@@ -5,8 +5,6 @@ validated through a schema without `sharing.folders`, so the switch the admin tu
 Admin Panel > Users > Groups > Default permissions was dropped on save and showed off again on
 the next visit. The fix adds the field.
 
-Twin of unit/config/test_sharing_permissions_folders.py.
-
 Discriminates: passes on bbfa876af, fails with the `folders` field removed from
 `SharingPermissions` (the switch is off again after the reload).
 """
