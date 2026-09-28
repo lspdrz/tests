@@ -13,9 +13,12 @@ Discriminates: passes on dev ac00d40e3; in a backend copy, `strict_match_mime_ty
 first supported type without `mimeparse.best_match` lets the text upload through, skipping the
 cache lookup in `speech` asks the engine twice and dropping the `aiofiles` write of the speech
 serves an empty file. On dev ef67cc3fa, an empty read of the upload for the JSON request sends
-the engine no audio and an `av.open` that fails fails both local Whisper recordings. The pydub
-test is unproven on a host without ffmpeg. Twin of unit/deps/test_aiofiles.py and
-unit/deps/test_av.py.
+the engine no audio and an `av.open` that fails fails both local Whisper recordings, as do
+faster-whisper's `transcribe` given `beams` for `beam_size`, a segment read as `txt` for `text`
+and the transcription info read as `lang` for `language`; `WhisperModel` given `model_path` for
+`model_size_or_path` fails the switch to local Whisper. The pydub test is unproven on a host
+without ffmpeg. Twin of unit/deps/test_aiofiles.py, unit/deps/test_av.py and
+unit/deps/test_faster_whisper.py.
 """
 
 from __future__ import annotations

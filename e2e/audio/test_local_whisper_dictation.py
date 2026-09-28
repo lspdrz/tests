@@ -7,7 +7,8 @@ The transcript lands in the chat input, unsent. Twin, in the browser, of the loc
 tests in integration/deps/test_audio_stack.py.
 
 Discriminates: passes on the dev ef67cc3fa build; in a backend copy whose `av.open` fails, the
-recording is never transcribed and the chat input stays empty.
+recording is never transcribed and the chat input stays empty, as it does when faster-whisper's
+`transcribe` is given `beams` for `beam_size` or a segment is read as `txt` for `text`.
 """
 
 from __future__ import annotations
