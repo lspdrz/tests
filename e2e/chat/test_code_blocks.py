@@ -14,7 +14,6 @@ render removed, the matching test goes red.
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 from playwright.sync_api import Locator, Page, expect
@@ -166,19 +165,20 @@ def test_saving_an_edited_block_rewrites_the_reply(page_for, make_user, upstream
     page = page_for(account)
     box = ask_for(page, upstream, fenced("python", "total = 1"))
 
+    chat_id = page.url.rsplit("/", 1)[-1]
     editor_lines(box).first.click()
     page.keyboard.press("End")
     page.keyboard.type(" + 41")
-    button(box, "Save").click()
+    with page.expect_response(
+        lambda r: r.request.method == "POST" and f"/chats/{chat_id}" in r.url
+    ):
+        button(box, "Save").click()
 
     expect(button(box, "Saved")).to_be_visible()
     expect(editor_lines(box).first).to_have_text("total = 1 + 41")
-    chat_id = page.url.rsplit("/", 1)[-1]
-    deadline = time.monotonic() + 15
     with account.client() as client:
-        while "total = 1 + 41" not in (stored := stored_reply_text(client, chat_id)):
-            assert time.monotonic() < deadline, f"the edit was never stored: {stored!r}"
-            time.sleep(0.2)
+        stored = stored_reply_text(client, chat_id)
+    assert "total = 1 + 41" in stored, f"the edit was never stored: {stored!r}"
     # the stored reply keeps the edit in its output items
     assert "```python\\ntotal = 1 + 41\\n```" in stored
     page.reload()
