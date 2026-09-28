@@ -1,36 +1,25 @@
-"""Dependency contract: cryptography.
+"""Dependency contract: cryptography, for the enterprise license check.
 
-Open WebUI uses `cryptography` directly for four security-critical jobs:
+Open WebUI uses `cryptography` for two jobs. Fernet encrypts the stored OAuth sessions and the
+OAuth client info; that path is driven from outside in integration/deps/test_auth_stack.py (a
+session token encrypted at rest, decrypted when forwarded, refused under another key, and a key
+Fernet cannot use stopping the boot). The other job is the license check, which this module
+pins:
 
-  * **Fernet symmetric encryption** (`cryptography.fernet.Fernet`) — encrypts
-    OAuth session tokens at rest in the DB (`models/oauth_sessions.py`) and the
-    OAuth client-info blob (`utils/oauth.py`). Keys are derived as
-    ``base64.urlsafe_b64encode(sha256(secret))`` (a 44-char urlsafe-b64 key).
-  * **AES-GCM AEAD** (`cryptography.hazmat.primitives.ciphers.aead.AESGCM`) —
-    decrypts the enterprise license blob in `utils/auth.py` with a SHA-256
-    key, a 12-byte nonce and ``associated_data=None``.
-  * **Ed25519 signature verification** — the license public key is loaded with
-    ``serialization.load_pem_public_key(...)`` (`env.py`) and the resulting
-    public key's ``.verify(signature, data)`` checks the license signature
-    (`utils/auth.py`, via the imported `asymmetric.ed25519` module).
-  * **PEM key loading** (`cryptography.hazmat.primitives.serialization`) — see
-    above; `env.py` wraps the configured base64 body in PEM armor and parses it.
+  * **AES-GCM AEAD** (`cryptography.hazmat.primitives.ciphers.aead.AESGCM`) decrypts the license
+    blob in `utils/auth.py` with a SHA-256 key, a 12-byte nonce and ``associated_data=None``.
+  * **Ed25519 signature verification**: the license public key is loaded with
+    ``serialization.load_pem_public_key(...)`` (`env.py`) and its ``.verify(signature, data)``
+    checks the license signature (`utils/auth.py`).
 
-This module pins exactly that slice of the API plus the failure modes the
-backend depends on (wrong key / tampered ciphertext / bad signature must
-raise), so a `cryptography` major bump (46 -> 48) that removed, renamed or
-changed any of it fails loudly here instead of as a runtime error deep in an
-auth or OAuth path.
-
-Modelled on the unit/deps/ exemplar: dotted symbol-existence checks (API
-surface) + offline behavioural contracts with locally generated keys (no
-network, no disk fixtures, no running services). Uses the `depcheck` fixture
-from unit/deps/conftest.py.
+Kept as a unit contract: the license check only runs on a license blob signed by the key in
+`LICENSE_PUBLIC_KEY`, and driving it from outside means minting a working license with a key of
+the test's own, which a public suite should not ship. Uses the `depcheck` fixture from
+unit/deps/conftest.py.
 """
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import os
 
@@ -44,9 +33,6 @@ DIST_NAME = "cryptography"
 # Every dotted symbol the Open WebUI backend resolves on `cryptography`.
 # Paths are relative to the top-level `cryptography` package object.
 USED_SYMBOLS = [
-    # Fernet — OAuth token / client-info encryption at rest.
-    "fernet.Fernet",
-    "fernet.InvalidToken",
     # AES-GCM AEAD — license blob decryption.
     "hazmat.primitives.ciphers.aead.AESGCM",
     # PEM public-key loading — license public key.
@@ -60,7 +46,6 @@ USED_SYMBOLS = [
 
 # Submodules the backend imports directly (must be importable as modules).
 USED_SUBMODULES = [
-    "cryptography.fernet",
     "cryptography.hazmat.primitives.serialization",
     "cryptography.hazmat.primitives.asymmetric.ed25519",
     "cryptography.hazmat.primitives.ciphers.aead",
@@ -361,107 +346,3 @@ def test_aesgcm_generate_key_bit_length(depcheck):
     key = aead.AESGCM.generate_key(bit_length=256)
     assert isinstance(key, (bytes, bytearray))
     assert len(key) == 32
-
-
-# --------------------------------------------------------------------------- #
-# Fernet — OAuth token / client-info encryption at rest
-# --------------------------------------------------------------------------- #
-def test_fernet_class_surface(depcheck):
-    """Pin Fernet's instance API: constructed ``Fernet(key)`` then
-    ``.encrypt`` / ``.decrypt`` (+ the ``generate_key`` classmethod)."""
-    fernet = depcheck.load("cryptography.fernet")
-    names = set(dir(fernet.Fernet))
-    for attr in ("encrypt", "decrypt", "generate_key"):
-        assert attr in names, f"Fernet.{attr} missing"
-    assert callable(fernet.Fernet)
-
-
-def test_fernet_init_accepts_key_param(depcheck):
-    """Both call sites do ``Fernet(<key>)`` positionally; pin that the first
-    constructor parameter is `key`."""
-    fernet = depcheck.load("cryptography.fernet")
-    depcheck.assert_params(fernet.Fernet.__init__, ["key"])
-
-
-def test_fernet_encrypt_decrypt_param_names(depcheck):
-    """``.encrypt(data)`` / ``.decrypt(token)`` are how the backend calls them;
-    pin those parameter names."""
-    fernet = depcheck.load("cryptography.fernet")
-    depcheck.assert_params(fernet.Fernet.encrypt, ["data"])
-    depcheck.assert_params(fernet.Fernet.decrypt, ["token"])
-
-
-def test_fernet_accepts_sha256_derived_key(depcheck):
-    """oauth_sessions.py derives the key as
-    ``base64.urlsafe_b64encode(sha256(secret).digest())`` — a 44-byte urlsafe
-    base64 value. Confirm Fernet accepts exactly that shape."""
-    fernet = depcheck.load("cryptography.fernet")
-    key_bytes = hashlib.sha256(b"oauth-encryption-secret").digest()
-    key = base64.urlsafe_b64encode(key_bytes)
-    assert len(key) == 44  # the length check oauth_sessions.py keys off
-    inst = fernet.Fernet(key)
-    assert inst is not None
-
-
-def test_fernet_generate_key_shape(depcheck):
-    """The 44-char urlsafe-b64 key shape (what oauth_sessions.py special-cases)
-    matches ``Fernet.generate_key()`` output length."""
-    fernet = depcheck.load("cryptography.fernet")
-    key = fernet.Fernet.generate_key()
-    assert isinstance(key, bytes)
-    assert len(key) == 44
-
-
-def test_fernet_encrypt_decrypt_roundtrip(depcheck):
-    """Mirror _encrypt_token/_decrypt_token: encrypt JSON bytes, decrypt back.
-
-    The backend does ``fernet.encrypt(s.encode()).decode()`` then later
-    ``fernet.decrypt(s.encode()).decode()``; the token is str-safe and the
-    plaintext round-trips byte-for-byte.
-    """
-    fernet = depcheck.load("cryptography.fernet")
-    key = base64.urlsafe_b64encode(hashlib.sha256(b"k").digest())
-    f = fernet.Fernet(key)
-    plaintext = b'{"access_token":"abc","refresh_token":"def"}'
-
-    token = f.encrypt(plaintext)
-    assert f.decrypt(token) == plaintext
-    # Token is ASCII/urlsafe so the backend's .decode()/.encode() hop is safe.
-    assert token.decode("ascii").encode("ascii") == token
-
-
-def test_fernet_wrong_key_raises_invalid_token(depcheck):
-    """A token encrypted under one key must NOT decrypt under another — this is
-    why oauth_sessions.py deletes sessions on decrypt failure. Pin it raises
-    InvalidToken (the backend catches it as a decrypt failure)."""
-    fernet = depcheck.load("cryptography.fernet")
-    k1 = base64.urlsafe_b64encode(hashlib.sha256(b"key-one").digest())
-    k2 = base64.urlsafe_b64encode(hashlib.sha256(b"key-two").digest())
-
-    token = fernet.Fernet(k1).encrypt(b"secret")
-    with pytest.raises(fernet.InvalidToken):
-        fernet.Fernet(k2).decrypt(token)
-
-
-def test_fernet_garbage_token_raises_invalid_token(depcheck):
-    """Decrypting a non-token (corrupted DB value) raises InvalidToken — the
-    failure mode oauth_sessions.py logs and recovers from."""
-    fernet = depcheck.load("cryptography.fernet")
-    key = base64.urlsafe_b64encode(hashlib.sha256(b"k").digest())
-    with pytest.raises(fernet.InvalidToken):
-        fernet.Fernet(key).decrypt(b"this-is-not-a-fernet-token")
-
-
-def test_fernet_invalid_token_is_exception_subclass(depcheck):
-    """InvalidToken must subclass Exception so the backend's broad
-    ``except Exception`` handlers around decrypt keep catching it."""
-    fernet = depcheck.load("cryptography.fernet")
-    assert issubclass(fernet.InvalidToken, Exception)
-
-
-def test_fernet_rejects_malformed_key(depcheck):
-    """A key that isn't 32 urlsafe-b64 bytes must raise at construction — the
-    backend re-raises this so a misconfigured key fails fast at startup."""
-    fernet = depcheck.load("cryptography.fernet")
-    with pytest.raises(Exception):
-        fernet.Fernet(b"too-short")

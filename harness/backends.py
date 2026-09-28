@@ -8,6 +8,7 @@ SQLite and in-process state, as before.
 
 An instance that brings its own database or Redis keeps it: a `DATABASE_URL`, a `DATA_DIR`
 holding a `webui.db` a test prepared, or any Redis setting (the stand-ins under `integration/`).
+`write_rows` and `read_rows` run one statement on an instance's own database, whichever it is.
 """
 
 from __future__ import annotations
@@ -128,5 +129,18 @@ def write_rows(instance, statement: str, rows: list[dict]) -> None:
     try:
         with engine.begin() as connection:
             connection.execute(sqlalchemy.text(statement), rows)
+    finally:
+        engine.dispose()
+
+
+def read_rows(instance, statement: str, parameters: dict | None = None) -> list[dict]:
+    """Run one read statement with `:name` parameters on the instance's own database."""
+    import sqlalchemy
+
+    engine = sqlalchemy.create_engine(instance.database_url)
+    try:
+        with engine.connect() as connection:
+            result = connection.execute(sqlalchemy.text(statement), parameters or {})
+            return [dict(row._mapping) for row in result]
     finally:
         engine.dispose()

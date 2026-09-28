@@ -4,13 +4,14 @@ An upload with `process=true` runs through `retrieval/loaders/main.py`, which ha
 to a third-party library: .pdf to pypdf, .docx to docx2txt, .pptx, .xlsx, .xls, .xml, .rst, .epub
 and .odt to unstructured's partitioners (python-pptx; pandas on openpyxl or xlrd behind a
 msoffcrypto encryption check; pypandoc and the pandoc binary), .html to BeautifulSoup, plain text
-through chardet's encoding hint, and every result through ftfy. With `PDF_EXTRACT_IMAGES` on, a
-PDF's images are opened by Pillow and read by rapidocr on onnxruntime and OpenCV. A dependency
-bump that breaks one of those paths fails the upload or loses the text, which
-`GET /api/v1/files/{id}/data/content` shows. With the Azure Document Intelligence engine a PDF
-goes to azure-ai-documentintelligence instead, here against a local stand-in of the analyze API:
-the key header, the markdown output format and the polled result are what it relies on (twin of
-unit/deps/test_azure_ai_documentintelligence.py). The library contracts are in unit/deps/.
+through chardet's encoding hint, and every result through ftfy, which repairs mojibake and drops
+control characters. With `PDF_EXTRACT_IMAGES` on, a PDF's images are opened by Pillow and read by
+rapidocr on onnxruntime and OpenCV. A dependency bump that breaks one of those paths fails the
+upload or loses the text, which `GET /api/v1/files/{id}/data/content` shows. With the Azure
+Document Intelligence engine a PDF goes to azure-ai-documentintelligence instead, here against a
+local stand-in of the analyze API: the key header, the markdown output format and the polled
+result are what it relies on (twin of unit/deps/test_azure_ai_documentintelligence.py). The
+library contracts are in unit/deps/.
 
 Windows-1251 Cyrillic is decoded with the codec chardet names, which ftfy could not repair
 after a latin-1 fallback.
@@ -30,7 +31,11 @@ On dev ef67cc3fa, dropping `output_content_format='markdown'` from the Document 
 loader fails its test; msoffcrypto's `OfficeFile` answering "not encrypted" (patched in at import)
 fails the password-protected workbook test, one that accepts any bytes fails the test of a file
 that only claims to be a workbook, and OpenCV's `minAreaRect` answering an empty box or
-onnxruntime refusing to build a session fails the PDF image test.
+onnxruntime refusing to build a session fails the PDF image test. A docx2txt result cut to its
+first paragraph or to ASCII fails the Word paragraphs test, `ftfy.fix_text` left out fails the
+mojibake, smart quote and control character tests, `fix_text` without `unescape_html=False` fails
+the literal entity test and one that fails on empty text fails the blank page test (and the empty
+Word document one).
 """
 
 from __future__ import annotations
@@ -92,16 +97,18 @@ def _saved(document) -> bytes:
     return buffer.getvalue()
 
 
-def _text_pdf() -> bytes:
+def _text_pdf(blank_first_page: bool = False) -> bytes:
     """One page carrying the sentence in Helvetica, the smallest PDF pypdf reads text from."""
     stream = f"BT /F1 12 Tf 72 720 Td ({SENTENCE}) Tj ET".encode()
+    pages = b"[6 0 R 3 0 R] /Count 2" if blank_first_page else b"[3 0 R] /Count 1"
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Pages /Kids %s >>" % pages,
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
         b"/Resources << /Font << /F1 5 0 R >> >> >>",
         b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
     ]
     pdf = bytearray(b"%PDF-1.4\n")
     offsets = []
@@ -320,6 +327,54 @@ def test_a_cyrillic_windows_1251_file_is_decoded_by_chardets_guess(make_user):
     assert content == document, f"cp1251 was decoded as {content[:40]!r}"
 
 
+def test_a_pdf_with_a_blank_page_is_read(make_user):
+    with make_user().client() as client:
+        content = _upload_and_read(
+            client, "notes.pdf", _text_pdf(blank_first_page=True), "application/pdf"
+        )
+
+    assert MARKER in content, f"the PDF was read as {content!r}"
+
+
+# ---------------------------------------------------------------- Word documents
+
+
+WORD_PARAGRAPHS = [
+    "Grüße aus dem Hafen, café au lait am Kai.",
+    "港口灯塔的预算已经批准。",
+    "Маяк работает всю ночь.",
+    "The harbour lighthouse budget was approved.",
+]
+
+
+def test_a_word_document_keeps_every_paragraph_in_order(make_user):
+    import docx
+
+    document = docx.Document()
+    for paragraph in WORD_PARAGRAPHS:
+        document.add_paragraph(paragraph)
+    with make_user().client() as client:
+        content = _upload_and_read(client, "letters.docx", _saved(document), DOCX_TYPE)
+
+    positions = [content.find(paragraph) for paragraph in WORD_PARAGRAPHS]
+    assert -1 not in positions, f"a paragraph was lost or garbled: {content!r}"
+    assert positions == sorted(positions), f"the paragraphs came back out of order: {content!r}"
+
+
+def test_an_empty_word_document_is_reported_as_empty(make_user):
+    import docx
+
+    with make_user().client() as client:
+        file_id = _upload(client, "empty.docx", _saved(docx.Document()), DOCX_TYPE)
+        stored = client.get(f"/api/v1/files/{file_id}").json()
+
+    assert stored["data"]["status"] == "failed", stored["data"]
+    assert "empty" in stored["data"]["error"], stored["data"]
+
+
+# ---------------------------------------------------------------- text repair
+
+
 def test_mojibake_is_repaired_and_a_literal_entity_is_kept(make_user):
     # UTF-8 text once decoded as Windows-1252, so its apostrophe became "â€™".
     garbled = "The harbour lighthouse budget wasnâ€™t cut &amp; the keeper stays."
@@ -328,6 +383,32 @@ def test_mojibake_is_repaired_and_a_literal_entity_is_kept(make_user):
 
     assert "budget wasn't cut" in content, f"the mojibake survived: {content!r}"
     assert "&amp;" in content, f"the literal entity was unescaped: {content!r}"
+
+
+def _straightened(text: str) -> str:
+    return text.translate(str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"}))
+
+
+def test_smart_quotes_read_as_latin_1_are_repaired(make_user):
+    intended = "He said “hello” and ‘goodbye’ to the harbour master."
+    garbled = intended.encode("utf-8").decode("latin-1")
+    with make_user().client() as client:
+        content = _upload_and_read(client, "quotes.txt", garbled.encode(), "text/plain")
+
+    # ftfy also straightens curly quotes by default, which is fine
+    assert _straightened(content) == _straightened(intended), f"not repaired: {content!r}"
+
+
+def test_control_characters_and_terminal_colours_are_removed(make_user):
+    with make_user().client() as client:
+        content = _upload_and_read(
+            client,
+            "log.txt",
+            "The harbour\x00 lighthouse \x1b[31mbudget\x1b[0m was\x07 approved.".encode(),
+            "text/plain",
+        )
+
+    assert content == SENTENCE, f"control characters survived: {content!r}"
 
 
 # ---------------------------------------------------------------- OCR of PDF images

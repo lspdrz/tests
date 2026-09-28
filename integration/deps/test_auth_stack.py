@@ -14,9 +14,12 @@ authlib builds the SSO redirect and completes the code exchange, while itsdanger
 `owui-session` cookie that carries its state from one to the other. The completed SSO sign-in
 also verifies the provider's RS256 ID token and encrypts the stored OAuth session, which is
 what cryptography does on this path (the OAuth twins under integration/security complete many
-more). When the provider refuses the code exchange, authlib's `OAuthError` carries its
-reason into the server log. A bump that breaks one of them fails a sign-in here, not only an
-API check in unit/deps. Twin of unit/deps/test_argon2_cffi.py and unit/deps/test_authlib.py.
+more): the provider's tokens are kept as a Fernet token under a key derived from the secret key,
+decrypted again when a `system_oauth` connection is sent the access token, and a stored token
+that no longer decrypts is not forwarded; a session key Fernet cannot use stops the boot. When
+the provider refuses the code exchange, authlib's `OAuthError` carries its reason into the
+server log. A bump that breaks one of them fails a sign-in or a forwarded token here, not only
+an API check in unit/deps. Twin of unit/deps/test_argon2_cffi.py and unit/deps/test_authlib.py.
 
 The argon2 instance runs in a zone far from UTC, so a clock that is not UTC shows in the token.
 
@@ -29,13 +32,18 @@ naive `datetime.now()` for `exp` stretches the lifetime by the zone's 5 h 45 min
 `SessionMiddleware` fails the SSO sign-in at its first step. On dev ef67cc3fa,
 `verify_password` sending every hash to bcrypt fails the switch test, argon2's
 `InvalidHashError` left uncaught answers a hash of an unknown argon2 variant with a 500 and a
-callback error reported by its class name alone drops `invalid_grant` from the log.
+callback error reported by its class name alone drops `invalid_grant` from the log. Storing the
+session tokens unencrypted fails the encrypted-at-rest test, a `_decrypt_token` that parses the
+stored text without decrypting it fails both stored-token tests and a Fernet that answers a
+token of another key with garbage in place of `InvalidToken` fails the undecryptable one; a
+Fernet that accepts a malformed key lets the instance with the unusable session key boot.
 """
 
 from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import json
 import sqlite3
 import time
@@ -45,12 +53,21 @@ import uuid
 import httpx
 import pytest
 import sqlalchemy
+from cryptography.fernet import Fernet
 
 from harness.actors import create_user, sign_in
-from harness.backends import write_rows
-from harness.instance import ADMIN_EMAIL, ADMIN_PASSWORD, LaunchedInstance
-from harness.oidc_provider import browser_for, session_user, shared_provider, sso_env
-from harness.prepared_data import RunningBackend, serving
+from harness.backends import read_rows, write_rows
+from harness.instance import ADMIN_EMAIL, ADMIN_PASSWORD, WEBUI_SECRET_KEY, LaunchedInstance
+from harness.listener import json_answer
+from harness.oidc_provider import (
+    browser_for,
+    oauth_settings,
+    session_user,
+    shared_provider,
+    sso_env,
+)
+from harness.oidc_provider import sign_in as sso_sign_in
+from harness.prepared_data import RunningBackend, boot_until_settled, serving
 
 pytestmark = [
     pytest.mark.depcheck,
@@ -375,3 +392,96 @@ def test_a_refused_code_exchange_logs_the_reason_the_provider_gave(sso, idp):
     ]
     assert reported, "the refused code exchange was not logged"
     assert "invalid_grant" in reported[0], reported[0]
+
+
+TOOL_SPEC = {"openapi": "3.0.0", "info": {"title": "SSO tools", "version": "1"}, "paths": {}}
+
+
+def _fernet(secret: str) -> Fernet:
+    """The session store's key: the secret key hashed into Fernet's 32 url-safe bytes."""
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
+
+
+def _signed_in_sso_admin(sso, idp) -> tuple[httpx.Client, str]:
+    """The SSO admin's browser and the email the provider signed in."""
+    with oauth_settings(sso, ENABLE_OAUTH_ROLE_MANAGEMENT=True):
+        person = idp.sign_in_as(roles=["admin"])
+        result = sso_sign_in(sso)
+    assert result.token, f"the sign-in failed: {result.error}"
+    return result.browser, person["email"]
+
+
+def _stored_session(sso, email: str) -> dict:
+    [session] = read_rows(
+        sso,
+        'SELECT s.id, s.token FROM oauth_session s JOIN "user" u ON u.id = s.user_id '
+        "WHERE u.email = :email",
+        {"email": email},
+    )
+    return session
+
+
+def _forwarded_token(browser: httpx.Client, listener) -> str | None:
+    """Verify a `system_oauth` tool server; returns the bearer token it was sent."""
+    listener.route("GET", "/openapi.json", json_answer(TOOL_SPEC))
+    before = len(listener.requests_to("/openapi.json"))
+    browser.post(
+        "/api/v1/configs/tool_servers/verify",
+        json={
+            "url": listener.base_url,
+            "path": "openapi.json",
+            "type": "openapi",
+            "auth_type": "system_oauth",
+            "key": "",
+            "config": {},
+        },
+    )
+    fetches = listener.requests_to("/openapi.json")[before:]
+    authorization = fetches[-1].headers.get("Authorization") if fetches else None
+    return authorization.removeprefix("Bearer ") if authorization else None
+
+
+def test_the_provider_token_is_kept_encrypted_and_forwarded_decrypted(sso, idp, listener):
+    browser, email = _signed_in_sso_admin(sso, idp)
+    access_token = idp.issued[-1]["access_token"]
+
+    stored = _stored_session(sso, email)["token"]
+    assert access_token not in stored, "the provider's access token is stored in the clear"
+    decrypted = json.loads(_fernet(WEBUI_SECRET_KEY).decrypt(stored.encode()))
+    assert decrypted["access_token"] == access_token
+    assert _forwarded_token(browser, listener) == access_token
+
+
+def test_a_stored_token_that_no_longer_decrypts_is_not_forwarded(sso, idp, listener):
+    browser, email = _signed_in_sso_admin(sso, idp)
+    offset = sso.log_size()
+    session = _stored_session(sso, email)
+    foreign = _fernet("another-secret").encrypt(json.dumps(idp.issued[-1]).encode()).decode()
+    write_rows(
+        sso,
+        "UPDATE oauth_session SET token = :token WHERE id = :id",
+        [{"token": foreign, "id": session["id"]}],
+    )
+
+    assert _forwarded_token(browser, listener) is None, (
+        "a token encrypted under another key was forwarded"
+    )
+    assert "Error decrypting tokens: InvalidToken" in sso.log_since(offset)
+
+
+@pytest.mark.parametrize(
+    ("session_key", "boots"),
+    [
+        pytest.param(Fernet.generate_key().decode(), True, id="fernet-key"),
+        pytest.param("!" * 44, False, id="not-base64"),
+    ],
+)
+def test_a_session_key_of_fernet_length_must_be_a_fernet_key(tmp_path, session_key, boots):
+    # a 44-character key is taken as a Fernet key as it is; any other length is hashed into one
+    outcome = boot_until_settled(
+        tmp_path, settings={"OAUTH_SESSION_TOKEN_ENCRYPTION_KEY": session_key}
+    )
+
+    assert outcome.healthy is boots, outcome.log[-3000:]
+    if not boots:
+        assert "Error initializing Fernet with provided key" in outcome.log

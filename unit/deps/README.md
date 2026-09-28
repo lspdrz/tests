@@ -72,20 +72,23 @@ OPEN_WEBUI_SOURCE_DIR=../open-webui/backend pytest -m depcheck unit/deps integra
 | Pillow | `integration/deps/test_image_validation.py` |
 | bcrypt, argon2-cffi, PyJWT, pytz, authlib, itsdangerous, cryptography | `integration/deps/test_auth_stack.py` |
 | starlette-compress, Brotli, zstandard, Markdown, beautifulsoup4, brotlicffi, python-socketio, pycrdt | `integration/deps/test_transport_stack.py` |
-| python-mimeparse, aiofiles, pydub, av (local Whisper on a tiny model) | `integration/deps/test_audio_stack.py` |
-| mcp, httpx, validators, black, beautifulsoup4, opentelemetry, requests | `integration/deps/test_outbound_stack.py` |
+| python-mimeparse, aiofiles, pydub, av, faster-whisper (local Whisper on a tiny model) | `integration/deps/test_audio_stack.py`, `e2e/audio/test_local_whisper_dictation.py` |
+| mcp, httpx, validators, black, beautifulsoup4, opentelemetry, requests, googleapis-common-protos | `integration/deps/test_outbound_stack.py` |
 | loguru | `integration/deps/test_logging.py` (the server log and the audit log) |
 | ldap3 | `integration/auth/test_ldap_sign_in.py` (LDAP and LDAPS sign-in) |
 | boto3 (S3), azure-storage-blob, azure-identity, google-cloud-storage | `integration/deps/test_object_storage.py` (uploads kept in a bucket or container) |
 | azure-identity, azure-search-documents | `integration/deps/test_azure_services.py` (Entra ID sign-in to Azure OpenAI, Azure AI Search) |
 | chromadb (embedded and server), boto3 (S3 Vectors) | `integration/deps/test_vector_stores.py` |
+| elasticsearch | `integration/deps/test_elasticsearch_store.py` |
+| ddgs, fake-useragent | `integration/deps/test_web_search_stack.py`, `e2e/retrieval/test_duckduckgo_web_search.py` |
+| fastapi | `integration/deps/test_web_framework.py` and every instance boot and request |
 | redis | `integration/security/test_signin_session_expiry_and_revocation_fallback.py` (a signed-out token is refused) |
 | aiocache | `integration/security/test_cache_key_builder.py` (a repeat model listing never reaches the provider) and `integration/deps/test_connection_stack.py` (until the TTL runs out) |
 | aiohttp, aiodns | `integration/deps/test_connection_stack.py` (the model list timeout, a provider reached by name through c-ares) |
 | aiosqlite | `integration/deps/test_database_stack.py` |
 | alembic | `integration/migrations/test_lifecycle.py` |
 | requests (Tika) | `integration/retrieval/test_v0114_source_text_and_docling.py` (a binary upload is extracted by Tika) |
-| sqlalchemy, fastapi, uvicorn, httpx | every instance boot and request |
+| sqlalchemy, uvicorn, httpx | every instance boot and request |
 
 The .rst, .epub and .odt uploads skip without a `pandoc` binary, pydub skips
 without ffmpeg, and the token splitter skips when its tiktoken BPE file is not
@@ -95,4 +98,5 @@ without them. Libraries for services the integration suite has no local
 stand-in for (Milvus, Weaviate, OpenSearch, Oracle, Pinecone) keep their unit
 contracts only, as do libraries no Open WebUI feature calls (accelerate, the
 anthropic SDK). The openai SDK is pinned but Open WebUI never calls it (every
-provider request is its own), so it has no contract.
+provider request is its own), so it has no contract. A contract kept next to its
+feature smoke test says in its docstring which part no request reaches.

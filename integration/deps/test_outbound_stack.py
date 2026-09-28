@@ -7,8 +7,10 @@ unless `AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL` is off. validators decides which
 accepts, BeautifulSoup reads the fetched page (its text, and the title, description and language
 stored with it; a `.xml` link through its XML parser), black formats code for the code editor, and
 opentelemetry exports request traces to an OTLP/HTTP collector (requests carries them there, as it
-carries a document to Tika). The collector's address is only read at boot, so the tracing test boots
-an instance of its own.
+carries a document to Tika) or, by default, over gRPC, where a busy collector's `RetryInfo`
+(googleapis-common-protos) tells the exporter when to try again. The collector's address is only
+read at boot, so each tracing test boots an instance of its own; the gRPC collector is
+`harness/otlp_collector.py`.
 
 Discriminates: passes on dev bbfa876af; in a backend copy, skipping `session.initialize()` fails the
 MCP verification, building the httpx client without `headers`, with `follow_redirects=False` or with
@@ -17,7 +19,11 @@ result for a success fails the failing tool test, dropping the `validators.url` 
 malformed link through to the fetch, a loader that stores no page title fails the metadata test,
 asking BeautifulSoup for an unknown parser in place of "xml" fails the feed test, returning the code
 unformatted fails the formatter, black without string normalisation fails the wrapping test and
-never adding the span processor leaves the collector empty.
+never adding the span processor leaves the collector empty. On dev ef67cc3fa, a
+`google.rpc.error_details_pb2` whose `RetryInfo` reads no delay, placed ahead of the real one in a
+backend copy (a bump that stops parsing it), fails the retry test: the batch comes back long before
+the delay the collector asked for. Exporting with the HTTP exporter in the gRPC branch fails both
+gRPC tests.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ from harness.mcp_server import (
     mcp_connection,
     serving_mcp,
 )
+from harness.otlp_collector import serving_trace_collector, trace_collector_env
 from harness.terminal_server import read_grant
 from harness.web_retrieval import LOCAL_WEB_FETCH
 
@@ -319,3 +326,52 @@ def test_request_traces_are_exported_over_otlp_http(traced, collector):
     assert b"open-webui" in exported, "the spans do not name the service"
     sent = collector.requests_to("/v1/traces")[-1]
     assert sent.headers["Content-Type"] == "application/x-protobuf"
+
+
+@pytest.fixture(scope="module")
+def grpc_collector():
+    with serving_trace_collector() as service:
+        yield service
+
+
+@pytest.fixture
+def traced_over_grpc(instance_with, grpc_collector):
+    return instance_with(trace_collector_env(grpc_collector))
+
+
+def _wait_for(condition, timeout: float = EXPORT_WAIT) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+
+@pytest.mark.slow
+def test_request_traces_are_exported_over_otlp_grpc(traced_over_grpc, grpc_collector):
+    with traced_over_grpc.client() as client:
+        client.get("/api/version").raise_for_status()
+
+    def version_span_arrived() -> bool:
+        return any("/api/version" in name for name in grpc_collector.span_names())
+
+    _wait_for(version_span_arrived)
+    assert version_span_arrived(), "no span for the request reached the gRPC collector"
+
+
+@pytest.mark.slow
+def test_a_busy_collector_gets_the_batch_again_when_its_retry_info_says(
+    traced_over_grpc, grpc_collector
+):
+    retry_after = 3.0
+    grpc_collector.refuse_next(retry_after)
+    with traced_over_grpc.client() as client:
+        client.get("/api/version").raise_for_status()
+
+    _wait_for(lambda: grpc_collector.refusals)
+    assert grpc_collector.refusals, "the collector was never sent the batch"
+    refused_at = grpc_collector.refusals[-1]
+    _wait_for(lambda: grpc_collector.first_export_after(refused_at) is not None)
+    retried_at = grpc_collector.first_export_after(refused_at)
+
+    assert retried_at is not None, "the refused batch was never sent again"
+    # the exporter's own backoff would have come back after about a second
+    assert retried_at - refused_at >= retry_after - 0.5, retried_at - refused_at

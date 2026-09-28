@@ -15,6 +15,10 @@ transforms that any consumer relies on. It does not assume any particular
 deep-learning backend beyond NumPy (always present in the env).
 
 Pattern mirrors test_requests.py. Uses the ``depcheck`` fixture.
+
+Kept as a unit contract: no Open WebUI feature reaches einops. It is imported only by model code
+that brings its own (remote-code embedding and reranking models such as the nomic and jina
+families), none of which an offline instance can load, so no request exercises it.
 """
 
 from __future__ import annotations

@@ -1,18 +1,14 @@
-"""Dependency contract: fake-useragent (import name ``fake_useragent``).
+"""Dependency contract: fake-useragent, the parts no Open WebUI request reaches.
 
-``fake-useragent`` produces realistic browser ``User-Agent`` strings from
-a *bundled local dataset* (no network at runtime). It is a *declared*
-requirement of the Open WebUI backend (``fake-useragent==2.2.0`` in
-requirements.txt / requirements-min.txt) used to make outbound scraping /
-web-retrieval requests look like a real browser, avoiding naive UA-based
-blocking. The application code does not import it under a stable internal
-chokepoint today, so this module pins the public surface any consumer
-relies on — the ``UserAgent`` class, its ``.random`` / per-browser
-property accessors, the constructor's filter kwargs, and the error type —
-plus offline behavioural contracts proving it yields plausible UA strings
-without touching the network.
+fake-useragent is a declared requirement of the Open WebUI backend that the backend never
+imports itself: ddgs's DuckDuckGo backend draws the User-Agent of every web search from
+``UserAgent().random``. That is driven from outside in integration/deps/test_web_search_stack.py,
+which checks the search goes out under a browser's User-Agent.
 
-Pattern mirrors test_requests.py. Uses ``depcheck`` from conftest.py.
+Kept as a unit contract: the rest of the public surface (the ``FakeUserAgent`` alias, the
+constructor's filters and fallback, the per-browser accessors, the error type) and the promise
+that the bundled data is read without the network, none of which a request reaches. Pattern
+mirrors test_requests.py. Uses ``depcheck`` from conftest.py.
 """
 
 from __future__ import annotations
@@ -22,7 +18,6 @@ import pytest
 pytestmark = pytest.mark.depcheck
 
 IMPORT_NAME = "fake_useragent"
-DIST_NAME = "fake-useragent"
 
 TOP_LEVEL_SYMBOLS = [
     "UserAgent",  # primary public class
@@ -34,37 +29,9 @@ TOP_LEVEL_SYMBOLS = [
 BROWSER_PROPERTIES = ["chrome", "firefox", "safari", "edge", "random"]
 
 
-# ---------------------------------------------------------------------------
-# Import + version
-# ---------------------------------------------------------------------------
-
-
-def test_import(depcheck):
-    """`fake_useragent` must import (skip cleanly if absent)."""
-    mod = depcheck.load(IMPORT_NAME)
-    assert mod.__name__ == "fake_useragent"
-
-
-def test_version_reported(depcheck):
-    """The installed distribution version must resolve."""
-    assert depcheck.dist_version(DIST_NAME) is not None
-
-
-# ---------------------------------------------------------------------------
-# Symbol-existence checks (API surface)
-# ---------------------------------------------------------------------------
-
-
 def test_top_level_symbols_exist(depcheck):
     mod = depcheck.load(IMPORT_NAME)
     depcheck.assert_symbols(mod, TOP_LEVEL_SYMBOLS)
-
-
-def test_useragent_is_class(depcheck):
-    mod = depcheck.load(IMPORT_NAME)
-    import inspect
-
-    assert inspect.isclass(mod.UserAgent)
 
 
 def test_useragent_aliases_fakeuseragent(depcheck):
@@ -93,18 +60,6 @@ def test_error_type_is_exception(depcheck):
 # ---------------------------------------------------------------------------
 # Behavioural contracts (OFFLINE — bundled dataset, never networks).
 # ---------------------------------------------------------------------------
-
-
-def test_behaviour_random_returns_plausible_ua(depcheck):
-    """`UserAgent().random` must return a non-trivial UA string from the
-    bundled data with no network access."""
-    mod = depcheck.load(IMPORT_NAME)
-    ua = mod.UserAgent()
-    value = ua.random
-    assert isinstance(value, str)
-    assert len(value) > 10
-    # Browser UA strings effectively always start with "Mozilla/".
-    assert value.startswith("Mozilla/"), f"implausible UA: {value!r}"
 
 
 def test_behaviour_per_browser_properties_return_strings(depcheck):
@@ -145,15 +100,6 @@ def test_behaviour_fallback_string_preserved(depcheck):
     sentinel = "Mozilla/5.0 (compatible; OWUI-Test/1.0)"
     ua = mod.UserAgent(fallback=sentinel)
     assert ua.fallback == sentinel
-
-
-def test_behaviour_multiple_randoms_are_strings(depcheck):
-    """Repeated .random reads must each return a valid UA string (the generator
-    is stable across calls; no exhaustion / None)."""
-    mod = depcheck.load(IMPORT_NAME)
-    ua = mod.UserAgent()
-    values = [ua.random for _ in range(10)]
-    assert all(isinstance(v, str) and v.startswith("Mozilla/") for v in values)
 
 
 def test_behaviour_no_network_imports(depcheck):

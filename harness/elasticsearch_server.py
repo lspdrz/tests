@@ -3,7 +3,8 @@
 `serving_elasticsearch()` yields a `FakeElasticsearch` speaking the part of the REST API Open
 WebUI's Elasticsearch store uses: index create and exists, `_bulk` index, update-as-upsert and
 delete, `_count`, `_search` (a `bool` filter of `term` and `terms` clauses, optionally inside a
-`script_score` query scored by cosine similarity), `_delete_by_query` and a one-page scroll.
+`script_score` query scored by cosine similarity, with the `_shards` summary the `scan` helper
+reads), `_delete_by_query` and a one-page scroll.
 Every answer carries `X-Elastic-Product: Elasticsearch`, which the client insists on, and
 `searches` holds every search body it got. `elasticsearch_env(fake)` is the environment of an
 instance that stores its vectors there.
@@ -174,7 +175,11 @@ class _Api:
             for name, document_id, source in self._documents(index, query)
         ]
         hits.sort(key=lambda hit: hit["_score"], reverse=True)
-        answer = {"took": 1, "hits": {"total": {"value": len(hits)}, "hits": hits[:size]}}
+        answer = {
+            "took": 1,
+            "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+            "hits": {"total": {"value": len(hits)}, "hits": hits[:size]},
+        }
         if "scroll" in params:
             answer["_scroll_id"] = "done"
         return 200, answer

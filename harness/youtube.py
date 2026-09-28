@@ -16,7 +16,6 @@ lists every `(method, path)` it was sent.
 from __future__ import annotations
 
 import contextlib
-import datetime
 import json
 import socketserver
 import ssl
@@ -29,10 +28,7 @@ from typing import Iterator
 from urllib.parse import parse_qs, urlsplit
 from xml.sax.saxutils import escape
 
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from harness.tls_authority import issue_certificate
 
 YOUTUBE_HOSTS = ["www.youtube.com", "youtube.com"]
 API_KEY = "fake-innertube-key"
@@ -85,73 +81,6 @@ def blocked_page() -> Video:
 
 def rate_limited() -> Video:
     return Video(status=429)
-
-
-def _authority(directory: Path) -> tuple[Path, Path, Path]:
-    """A CA and a leaf certificate for YouTube's hosts; returns (CA, leaf, leaf key) paths."""
-    now = datetime.datetime.now(datetime.timezone.utc)
-    valid = {"not_valid_before": now - datetime.timedelta(days=1)}
-    valid["not_valid_after"] = now + datetime.timedelta(days=7)
-    ca_key = ec.generate_private_key(ec.SECP256R1())
-    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Fake YouTube test authority")])
-    ca_cert = (
-        x509.CertificateBuilder(**valid)
-        .subject_name(ca_name)
-        .issuer_name(ca_name)
-        .public_key(ca_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .add_extension(
-            x509.KeyUsage(
-                digital_signature=True,
-                content_commitment=False,
-                key_encipherment=False,
-                data_encipherment=False,
-                key_agreement=False,
-                key_cert_sign=True,
-                crl_sign=True,
-                encipher_only=False,
-                decipher_only=False,
-            ),
-            critical=True,
-        )
-        .add_extension(
-            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False
-        )
-        .sign(ca_key, hashes.SHA256())
-    )
-    leaf_key = ec.generate_private_key(ec.SECP256R1())
-    leaf_cert = (
-        x509.CertificateBuilder(**valid)
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, YOUTUBE_HOSTS[0])]))
-        .issuer_name(ca_name)
-        .public_key(leaf_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(host) for host in YOUTUBE_HOSTS]),
-            critical=False,
-        )
-        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .add_extension(
-            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
-        )
-        .add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
-            critical=False,
-        )
-        .sign(ca_key, hashes.SHA256())
-    )
-    paths = (directory / "ca.pem", directory / "leaf.pem", directory / "leaf-key.pem")
-    paths[0].write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
-    paths[1].write_bytes(leaf_cert.public_bytes(serialization.Encoding.PEM))
-    paths[2].write_bytes(
-        leaf_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-    )
-    return paths
 
 
 @dataclass
@@ -252,13 +181,13 @@ def _proxy_handler(fake: FakeYouTube, tls: ssl.SSLContext):
 @contextlib.contextmanager
 def serving_youtube() -> Iterator[FakeYouTube]:
     with tempfile.TemporaryDirectory(prefix="fake-youtube-") as directory:
-        ca, leaf, leaf_key = _authority(Path(directory))
+        issued = issue_certificate(Path(directory), "Fake YouTube test authority", YOUTUBE_HOSTS)
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        tls.load_cert_chain(leaf, leaf_key)
+        tls.load_cert_chain(issued.certificate, issued.key)
         server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), None)
         server.daemon_threads = True
         host, port = server.server_address
-        fake = FakeYouTube(proxy_url=f"http://{host}:{port}", ca_bundle=ca)
+        fake = FakeYouTube(proxy_url=f"http://{host}:{port}", ca_bundle=issued.authority)
         server.RequestHandlerClass = _proxy_handler(fake, tls)
         threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
         try:

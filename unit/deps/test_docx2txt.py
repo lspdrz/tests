@@ -1,23 +1,17 @@
-"""Dependency contract: docx2txt.
+"""Dependency contract: docx2txt, the call shapes Open WebUI does not use.
 
-``docx2txt`` is the plain-text extractor the Open WebUI backend uses to
-ingest ``.docx`` uploads: ``DocxLoader`` in ``retrieval/loaders/local.py``
-imports it lazily and calls ``docx2txt.process(Path(file_path))``. So a
-breaking change to that single public entry point would surface as
-empty/failed Word-document ingestion rather than at import time.
+Open WebUI reads a .docx upload with ``docx2txt.process(Path(file_path))`` in
+``retrieval/loaders/local.py``; that is driven from outside in
+integration/deps/test_document_extraction.py (every paragraph in order, non-Latin text intact,
+an empty document reported as empty).
 
-This module pins that one load-bearing function and its signature, then
-exercises the real extraction path offline by building minimal but valid
-``.docx`` packages in memory (a ``.docx`` is a zip of OOXML parts) and
-asserting the text comes back. No network, no temp-file dependence for the
-core contract.
-
-Pattern mirrors test_requests.py. Uses ``depcheck`` from conftest.py.
+Kept as a unit contract: `process` also takes a file-like object or a plain string path, which
+no Open WebUI request passes it. The .docx packages are built in memory (a .docx is a zip of
+OOXML parts). Uses ``depcheck`` from conftest.py.
 """
 
 from __future__ import annotations
 
-import inspect
 import zipfile
 from io import BytesIO
 
@@ -71,80 +65,6 @@ def _make_docx(paragraphs: list[str]) -> BytesIO:
     return buf
 
 
-# ---------------------------------------------------------------------------
-# Import + version
-# ---------------------------------------------------------------------------
-
-
-def test_import(depcheck):
-    """`docx2txt` must import (skip cleanly if absent)."""
-    mod = depcheck.load(IMPORT_NAME)
-    assert mod.__name__ == "docx2txt"
-
-
-def test_version_reported(depcheck):
-    """The installed distribution version must resolve."""
-    assert depcheck.dist_version(DIST_NAME) is not None
-
-
-# ---------------------------------------------------------------------------
-# Symbol-existence + signature (the single public entry point).
-# ---------------------------------------------------------------------------
-
-
-def test_process_exists_and_callable(depcheck):
-    """`docx2txt.process` is what the backend's DocxLoader calls; it must
-    exist and be callable."""
-    mod = depcheck.load(IMPORT_NAME)
-    assert hasattr(mod, "process")
-    assert callable(mod.process)
-
-
-def test_process_signature(depcheck):
-    """process(docx, img_dir=None) — the loader calls process(path). The first
-    positional parameter (the docx source) must remain; img_dir stays optional."""
-    mod = depcheck.load(IMPORT_NAME)
-    sig = inspect.signature(mod.process)
-    params = list(sig.parameters)
-    assert params, "docx2txt.process lost its parameters"
-    assert params[0] in ("docx", "docx_file", "file"), f"unexpected first param: {params}"
-    # img_dir must remain optional (no extra required positional args).
-    required = [
-        n
-        for n, p in sig.parameters.items()
-        if p.default is inspect.Parameter.empty
-        and p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    assert len(required) == 1, f"process now requires extra args: {required}"
-
-
-# ---------------------------------------------------------------------------
-# Behavioural contracts (OFFLINE) — real extraction from in-memory .docx.
-# ---------------------------------------------------------------------------
-
-
-def test_behaviour_extracts_single_paragraph(depcheck):
-    """A one-paragraph .docx must extract exactly that text — the core contract
-    DocxLoader relies on for Word ingestion."""
-    mod = depcheck.load(IMPORT_NAME)
-    docx = _make_docx(["Hello Open WebUI extraction test"])
-    text = mod.process(docx)
-    assert isinstance(text, str)
-    assert "Hello Open WebUI extraction test" in text
-
-
-def test_behaviour_extracts_multiple_paragraphs(depcheck):
-    """Multiple paragraphs must all appear in the extracted text (order
-    preserved), so multi-paragraph documents are fully ingested."""
-    mod = depcheck.load(IMPORT_NAME)
-    paras = ["First paragraph here", "Second paragraph follows", "Third and final"]
-    text = mod.process(_make_docx(paras))
-    for p in paras:
-        assert p in text, f"missing paragraph: {p!r}"
-    # Order: first paragraph appears before the last.
-    assert text.index(paras[0]) < text.index(paras[-1])
-
-
 def test_behaviour_accepts_file_like_object(depcheck):
     """The loader can hand process() a file-like (BytesIO); zip-based reading
     must work on an in-memory stream, not only a path."""
@@ -162,24 +82,3 @@ def test_behaviour_accepts_path(depcheck, tmp_path):
     p.write_bytes(_make_docx(["Path based content"]).getvalue())
     text = mod.process(str(p))
     assert "Path based content" in text
-
-
-def test_behaviour_empty_document_returns_string(depcheck):
-    """A .docx with no text paragraphs must still return a (possibly empty)
-    string, not raise — so empty uploads don't crash ingestion."""
-    mod = depcheck.load(IMPORT_NAME)
-    docx = _make_docx([])
-    text = mod.process(docx)
-    assert isinstance(text, str)
-
-
-def test_behaviour_unicode_content_preserved(depcheck):
-    """Non-ASCII text (the common case for real documents) must survive
-    extraction intact."""
-    mod = depcheck.load(IMPORT_NAME)
-    sample = "Grüße café — 日本語 текст"
-    text = mod.process(_make_docx([sample]))
-    # Each distinctive token should survive; em-dash handling can vary so check
-    # the surrounding unicode words.
-    for token in ("Grüße", "café", "日本語", "текст"):
-        assert token in text, f"unicode token lost: {token!r}"

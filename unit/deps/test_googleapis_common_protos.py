@@ -1,23 +1,15 @@
-"""Dependency contract: googleapis-common-protos.
+"""Dependency contract: googleapis-common-protos, the messages no Open WebUI request reaches.
 
-``googleapis-common-protos`` ships the *compiled* common Protocol Buffer
-message types that the wider Google/gRPC ecosystem builds on — the
-``google.rpc`` (Status / Code / error-details), ``google.api`` (HTTP
-annotations), ``google.longrunning`` (Operations) and ``google.type``
-families. It is a *transitive* dependency of the Open WebUI backend, pulled
-in by gRPC-based clients (e.g. the ChromaDB / vector-store stack and
-anything speaking a Google API surface). The application code does not
-import it directly, and there is no stable internal chokepoint, so this
-module pins the *core public surface* — the canonical ``*_pb2`` modules
-and the ``Status`` round-trip — so a breaking bump (these protos being
-removed, renamed, or recompiled incompatibly) is caught here.
+``googleapis-common-protos`` ships the compiled common Protocol Buffer messages of the Google and
+gRPC ecosystem (``google.rpc``, ``google.api``, ``google.longrunning``, ``google.type``). Open
+WebUI does not import it itself; the OTLP gRPC trace exporter it uses reads
+``google.rpc.RetryInfo`` from a busy collector, which is driven from outside in
+integration/deps/test_outbound_stack.py.
 
-The package contributes to the implicit ``google`` *namespace* package, so
-the contract is expressed as submodule imports (``from google.rpc import
-status_pb2``) plus an offline protobuf serialise/parse round-trip. Pure
-in-memory protobuf — no network, no gRPC channel.
-
-Pattern mirrors test_requests.py. Uses ``depcheck`` from conftest.py.
+Kept as a unit contract: the other messages (``Status``, the ``Code`` enum, ``HttpRule``,
+``Operation``, ``LatLng``), which Open WebUI never uses, so no request reaches them. The package
+adds to the implicit ``google`` namespace, so the contract is submodule imports plus in-memory
+protobuf round-trips. Pattern mirrors test_requests.py. Uses ``depcheck`` from conftest.py.
 """
 
 from __future__ import annotations
@@ -35,7 +27,6 @@ DIST_NAME = "googleapis-common-protos"
 PROTO_MODULES = [
     "google.rpc.status_pb2",  # Status (code, message, details) — gRPC errors
     "google.rpc.code_pb2",  # canonical Code enum (OK, NOT_FOUND, ...)
-    "google.rpc.error_details_pb2",  # rich error detail messages
     "google.api.http_pb2",  # HttpRule (REST<->gRPC transcoding)
     "google.api.annotations_pb2",  # method http annotations
     "google.longrunning.operations_pb2",  # Operation / long-running ops
@@ -148,13 +139,3 @@ def test_behaviour_operation_message_constructs(depcheck):
     parsed.ParseFromString(payload)
     assert parsed.name == "operations/abc123"
     assert parsed.done is True
-
-
-def test_behaviour_protobuf_runtime_available(depcheck):
-    """These compiled protos require the protobuf runtime; confirm it is present
-    (a missing/incompatible runtime is the usual failure mode of a bad bump)."""
-    pb = depcheck.try_load("google.protobuf")
-    if pb is None:
-        pytest.skip("google.protobuf runtime not importable; proto tests cover usage")
-    # The descriptor machinery the *_pb2 modules build against must exist.
-    assert depcheck.has(pb, "message.Message")
