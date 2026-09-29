@@ -2,12 +2,15 @@
 
 A fresh account adds a memory through the Actions menu and sees it listed, edits it and sees the
 new text, and a chat then sends the model the edited memory as context. Deleting it empties the
-list, and it stays gone after the settings are opened again.
+list, and it stays gone after the settings are opened again. Switching Memory off in the same tab
+keeps a stored memory out of the next chat, and stays off after a reload, while another account's
+memory still reaches the model.
 
 Discriminates: passes on dev ac00d40e3; in a backend copy, with
 `POST /api/v1/memories/{id}/update` answering without storing the new text the edited memory
 never shows, and with `DELETE /api/v1/memories/{id}` answering true without deleting the memory
-is listed again once the settings are reopened.
+is listed again once the settings are reopened; in a frontend copy, a chat sending the memory
+feature whatever the account's Memory switch says turns the switch test red.
 """
 
 from __future__ import annotations
@@ -71,3 +74,41 @@ def test_a_memory_is_added_edited_used_and_deleted(page_for, make_user, upstream
     settings = _personalization(page)
     expect(settings.get_by_text("Memories accessible by LLMs will be shown here.")).to_be_visible()
     expect(settings.get_by_text(EDITED)).to_have_count(0)
+
+
+def _memory_switch(page: Page) -> Locator:
+    return _personalization(page).locator("#tab-personalization").get_by_role("switch").first
+
+
+def _account_remembering(make_user, memory: str):
+    account = make_user()
+    with account.client() as client:
+        added = client.post("/api/v1/memories/add", json={"content": memory, "type": "user"})
+    added.raise_for_status()
+    return account
+
+
+def _sent_for(page: Page, upstream, question: str) -> str:
+    upstream.queue(reply.text("Noted.", match=reply.answering(question)))
+    page.goto("/")
+    send(page, question)
+    expect_reply(page, "Noted.")
+    return json.dumps(next(filter(reply.answering(question), upstream.chat_requests())))
+
+
+def test_switching_memory_off_keeps_memories_out_of_the_chat(page_for, make_user, upstream):
+    page = page_for(_account_remembering(make_user, FIRST))
+    switch = _memory_switch(page)
+    expect(switch).to_have_attribute("aria-checked", "true")
+    with page.expect_response(lambda response: "/user/settings/update" in response.url):
+        switch.click()
+    expect(switch).to_have_attribute("aria-checked", "false")
+
+    sent = _sent_for(page, upstream, "where are the bees?")
+    assert FIRST not in sent, "a switched-off memory was sent to the model"
+
+    page.reload()
+    expect(_memory_switch(page)).to_have_attribute("aria-checked", "false")
+
+    other = page_for(_account_remembering(make_user, FIRST))
+    assert FIRST in _sent_for(other, upstream, "where are my bees?")
