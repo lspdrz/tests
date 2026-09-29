@@ -9,9 +9,10 @@ is meant to behave differently. Every test here runs once with the toggle off an
 both to the same expectations: the stored reply, every delta a browser tab is sent and the history
 the provider gets on the next turn. Each case lands at least two pieces in one field, since the
 first piece is never appended. The cases cover the web chat path: text of every size, reasoning
-in each form the handler detects, tool calls, usage, errors, a stream cut off, stopping, deltas
-batched per chat or per model, continuing, regenerating, a llama.cpp connection that gets its
-reasoning back and two models answering one message at once.
+in each form the handler detects, tool calls, the code interpreter by tag and as a tool, usage,
+errors, a stream cut off, stopping, the reply read while it streams, deltas batched per chat, per
+model or by the operator, continuing, regenerating, a llama.cpp connection that gets its reasoning
+back and two models answering one message at once.
 
 Discriminates: in a backend copy, prefixing each piece the in-place branch appends with `|` fails
 every case with the toggle on and none with it off; the same edit to the copying branch fails every
@@ -797,3 +798,143 @@ def _wait_until_done(socket, *message_ids: str, timeout: float = 30.0) -> None:
             return
         assert time.monotonic() < deadline, f"only {finished} finished"
         time.sleep(0.05)
+
+
+# --- the reply so far, read while it streams ------------------------------------------------
+
+
+def _in_progress(client, turn) -> dict:
+    stored = client.get(f"/api/v1/chats/{turn.chat_id}")
+    stored.raise_for_status()
+    return stored.json()["chat"]["history"]["messages"].get(turn.assistant_message_id, {})
+
+
+def test_a_chat_read_mid_stream_shows_whole_pieces_so_far(streaming, owner):
+    thoughts = [f"t{index} " for index in range(8)]
+    answer = [f"a{index} " for index in range(12)] + ["end."]
+    pieces = ["<think>", *thoughts, "</think>", *answer]
+    streaming.upstream.queue(
+        reply.text(pieces, chunk_delay=0.1, match=reply.answering("show your work"))
+    )
+    thought_prefixes = {"".join(thoughts[:count]).strip() for count in range(len(thoughts) + 1)}
+    answer_prefixes = {"".join(answer[:count]) for count in range(len(answer) + 1)}
+    snapshots = []
+    with owner.client() as client:
+        turn = send_message(client, "show your work")
+        while not (message := _in_progress(client, turn)).get("done"):
+            if message.get("output"):
+                snapshots.append(message)
+            time.sleep(0.05)
+        final = wait_for_reply(client, turn)
+
+    assert len(snapshots) >= 5, "the reply was never read while it streamed"
+    for snapshot in snapshots:
+        reasoning = [_text(item).strip() for item in _items(snapshot, "reasoning")]
+        texts = [_text(item) for item in _items(snapshot, "message")]
+        assert all(text in thought_prefixes for text in reasoning), reasoning
+        assert all(text in answer_prefixes for text in texts), texts
+    assert _text(_items(final, "reasoning")[0]) == "".join(thoughts).strip()
+    assert final["content"] == "".join(answer)
+
+
+# --- an operator's batch size for every chat ----------------------------------------------------
+
+
+@pytest.fixture(params=["false", "true"], ids=["append-copies", "append-in-place"])
+def batching(request, instance_with):
+    """An instance whose operator batches socket deltas by four, with the toggle off, then on."""
+    return instance_with(
+        {INPLACE_APPEND: request.param, "CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE": "4"}
+    )
+
+
+def test_an_operators_batch_size_merges_every_chats_deltas(batching):
+    pieces = ["<think>", "t0 ", "t1 ", "t2 ", "t3 ", "t4 ", "</think>"]
+    pieces += [f"a{index} " for index in range(9)] + ["end."]
+    batching.upstream.queue(reply.text(pieces, match=reply.answering("batch everything")))
+    _, message, deltas = _ask_watched(create_user(batching), "batch everything")
+
+    assert deltas == [
+        ("reasoning_text", "t0 t1 t2 t3 "),
+        ("reasoning_text", "t4 "),
+        ("output_text", "a0 a1 a2 a3 "),
+        ("output_text", "a4 a5 a6 a7 "),
+        ("output_text", "a8 end."),
+    ]
+    assert _text(_items(message, "reasoning")[0]) == "t0 t1 t2 t3 t4"
+    assert message["content"] == "a0 a1 a2 a3 a4 a5 a6 a7 a8 end."
+
+
+# --- the code interpreter -------------------------------------------------------------------
+
+CODE_EXECUTION_CONFIG = ("/api/v1/configs/code_execution", "/api/v1/configs/code_execution")
+TAG_FORMAT = '<code_interpreter type="code" lang="python">'
+
+
+@pytest.fixture
+def kernel(streaming, preserve):
+    """The code interpreter on, running cells on a stand-in Jupyter."""
+    from harness.code_interpreter import fake_jupyter
+
+    preserve(CODE_EXECUTION_CONFIG, on=streaming)
+    with fake_jupyter() as jupyter, streaming.client() as client:
+        current = client.get(CODE_EXECUTION_CONFIG[0]).json()
+        on_kernel = {
+            **current,
+            "ENABLE_CODE_INTERPRETER": True,
+            "CODE_INTERPRETER_ENGINE": "jupyter",
+            "CODE_INTERPRETER_JUPYTER_URL": jupyter.base_url,
+            "CODE_INTERPRETER_JUPYTER_AUTH": "",
+        }
+        client.post(CODE_EXECUTION_CONFIG[1], json=on_kernel).raise_for_status()
+        yield jupyter
+
+
+def test_code_in_interpreter_tags_runs_and_the_text_around_it_is_kept(streaming, owner, kernel):
+    pieces = ["Let me ", "work it out.\n", TAG_FORMAT, "print(", "6 * 7)", "</code_interpreter>"]
+    streaming.upstream.queue(
+        reply.text(pieces, match=reply.answering("compute it")),
+        reply.text(["The answer ", "is 42."], match=reply.answering("compute it")),
+    )
+    _, message, _ = _ask_watched(
+        owner,
+        "compute it",
+        features={"code_interpreter": True},
+        params={"function_calling": "legacy"},
+    )
+
+    assert kernel.executed_cells()[-1].strip().endswith("print(6 * 7)")
+    [cell] = _items(message, "open_webui:code_interpreter")
+    assert cell["code"].strip() == "print(6 * 7)"
+    assert "42" in json.dumps(cell.get("output"))
+    texts = [_text(item) for item in _items(message, "message")]
+    assert texts[0].strip() == "Let me work it out."
+    assert texts[-1] == "The answer is 42."
+
+
+def test_code_the_model_runs_as_a_tool_gets_its_whole_source(
+    streaming, owner, second_provider, kernel
+):
+    code = "total = sum(range(1, 11))\nprint(f'total={total}')"
+    arguments = {"code": code}
+    pieces = _split(arguments, size=5)
+    call = [_call(0, "call_code", "execute_code", pieces[0])] + [
+        _call(0, arguments=p) for p in pieces[1:]
+    ]
+    _script(
+        second_provider,
+        sse(*call, finish_reason="tool_calls"),
+        sse({"content": "The total "}, {"content": "is 55."}),
+    )
+    _, message, _ = _ask_watched(
+        owner,
+        "sum it",
+        model=SECOND_MODEL,
+        features={"code_interpreter": True},
+        params={"function_calling": "native"},
+    )
+
+    assert kernel.executed_cells()[-1].strip().endswith(code)
+    assert _tool_calls_sent_back(_sent(second_provider)[1]) == [("execute_code", arguments)]
+    assert "total=55" in _tool_results_sent_back(_sent(second_provider)[1])[0]
+    assert message["content"].endswith("The total is 55.")
