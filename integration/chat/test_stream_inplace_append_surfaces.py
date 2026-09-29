@@ -53,7 +53,7 @@ def streaming(request, instance_with):
 
 
 @pytest.fixture
-def boss(streaming):
+def instance_admin(streaming):
     return admin_of(streaming)
 
 
@@ -149,11 +149,16 @@ REDACTING_STREAM = source(
 )
 
 
-def test_a_stream_filter_redacts_a_word_in_the_pieces_of_a_saved_reply(boss, person, streaming):
+def test_a_stream_filter_redacts_a_word_in_the_pieces_of_a_saved_reply(
+    instance_admin, person, streaming
+):
     streaming.upstream.queue(
         reply.text(["The password is ", "swordfish", " so ", "keep it quiet."])
     )
-    with installed_function(boss, REDACTING_STREAM, is_global=True), person.client() as client:
+    with (
+        installed_function(instance_admin, REDACTING_STREAM, is_global=True),
+        person.client() as client,
+    ):
         _, message = ask(client, "what is the password?")
 
     assert message["content"] == "The password is [redacted] so keep it quiet."
@@ -164,14 +169,14 @@ def edit_of(message: dict) -> dict | None:
 
 
 def test_an_outlet_filter_sees_the_whole_reply_and_its_edit_is_saved(
-    boss, person, streaming, listener
+    instance_admin, person, streaming, listener
 ):
     listener.route("POST", "/audit", lambda _: (200, {}, b""))
     outlet = audit_source(
         f"{listener.base_url}/audit", 'body["messages"][-1]["content"] += " [checked]"'
     )
     streaming.upstream.queue(reply.text(["Tea is ", "ready ", "in five ", "minutes."]))
-    with installed_function(boss, outlet, is_global=True), person.client() as client:
+    with installed_function(instance_admin, outlet, is_global=True), person.client() as client:
         turn, _ = ask(client, "when is the tea ready?")
         edited = wait_for(
             lambda: edit_of(stored_message(client, turn.chat_id, turn.assistant_message_id)),
@@ -194,8 +199,11 @@ TEXT_PIPE = source(
 )
 
 
-def test_a_pipe_generator_of_text_pieces_makes_one_saved_reply(boss):
-    with installed_function(boss, TEXT_PIPE) as pipe_id, boss.client() as client:
+def test_a_pipe_generator_of_text_pieces_makes_one_saved_reply(instance_admin):
+    with (
+        installed_function(instance_admin, TEXT_PIPE) as pipe_id,
+        instance_admin.client() as client,
+    ):
         client.get("/api/models", params={"refresh": "true"}).raise_for_status()
         _, message = ask(client, "recite", model=pipe_id)
 
@@ -222,8 +230,11 @@ CHUNK_PIPE = source(
 )
 
 
-def test_a_pipe_yielding_chunks_and_sse_lines_with_reasoning_keeps_both_texts(boss):
-    with installed_function(boss, CHUNK_PIPE) as pipe_id, boss.client() as client:
+def test_a_pipe_yielding_chunks_and_sse_lines_with_reasoning_keeps_both_texts(instance_admin):
+    with (
+        installed_function(instance_admin, CHUNK_PIPE) as pipe_id,
+        instance_admin.client() as client,
+    ):
         client.get("/api/models", params={"refresh": "true"}).raise_for_status()
         _, message = ask(client, "greet me", model=pipe_id)
 
@@ -247,11 +258,13 @@ ECHO_ACTION = source(
 )
 
 
-def test_an_action_run_on_a_streamed_reply_sees_all_of_its_text(boss, streaming, listener):
+def test_an_action_run_on_a_streamed_reply_sees_all_of_its_text(
+    instance_admin, streaming, listener
+):
     listener.route("POST", "/action", lambda _: (200, {}, b""))
     streaming.upstream.queue(reply.text(["Pack ", "the ", "tent, ", "the ", "stove."]))
     action = ECHO_ACTION.format(url=f"{listener.base_url}/action")
-    with installed_function(boss, action) as action_id, boss.client() as client:
+    with installed_function(instance_admin, action) as action_id, instance_admin.client() as client:
         turn, message = ask(client, "what do I pack?")
         history = [
             {"id": turn.user_message_id, "role": "user", "content": "what do I pack?"},
@@ -280,12 +293,12 @@ def test_an_action_run_on_a_streamed_reply_sees_all_of_its_text(boss, streaming,
 
 
 def test_an_api_client_gets_the_stream_and_the_outlet_filter_sees_the_rebuilt_reply(
-    boss, person, streaming, listener
+    instance_admin, person, streaming, listener
 ):
     listener.route("POST", "/audit", lambda _: (200, {}, b""))
     outlet = audit_source(f"{listener.base_url}/audit", "pass")
     streaming.upstream.queue(reply.text(["Trains ", "leave ", "at ", "noon."]))
-    with installed_function(boss, outlet, is_global=True), person.client() as client:
+    with installed_function(instance_admin, outlet, is_global=True), person.client() as client:
         events = direct_stream(client)
         wait_for(lambda: listener.requests_to("/audit"), "the outlet filter's audit")
 
@@ -295,13 +308,13 @@ def test_an_api_client_gets_the_stream_and_the_outlet_filter_sees_the_rebuilt_re
 
 
 @pytest.fixture
-def raw(boss, preserve, listener, streaming) -> raw_provider.RawProvider:
+def raw(instance_admin, preserve, listener, streaming) -> raw_provider.RawProvider:
     preserve(OPENAI_CONFIG, on=streaming)
-    return raw_provider.connect(boss, listener)
+    return raw_provider.connect(instance_admin, listener)
 
 
 def test_an_api_client_with_reasoning_deltas_gets_them_and_the_outlet_sees_the_reply(
-    boss, listener, raw
+    instance_admin, listener, raw
 ):
     listener.route("POST", "/audit", lambda _: (200, {}, b""))
     outlet = audit_source(f"{listener.base_url}/audit", "pass")
@@ -315,7 +328,10 @@ def test_an_api_client_with_reasoning_deltas_gets_them_and_the_outlet_sees_the_r
             chunk({}, "stop"),
         )
     )
-    with installed_function(boss, outlet, is_global=True), boss.client() as client:
+    with (
+        installed_function(instance_admin, outlet, is_global=True),
+        instance_admin.client() as client,
+    ):
         events = direct_stream(client, RAW_MODEL_ID)
         wait_for(lambda: listener.requests_to("/audit"), "the outlet filter's audit")
 
@@ -397,9 +413,9 @@ def client_has_no_chat(person, chat_id: str) -> bool:
 
 
 @pytest.fixture
-def channels_on(boss, preserve, streaming):
+def channels_on(instance_admin, preserve, streaming):
     preserve("admin_config", on=streaming)
-    enable_channels(boss)
+    enable_channels(instance_admin)
 
 
 def channel_updates(session, channel_id: str) -> list[dict]:
@@ -463,9 +479,9 @@ SCHEDULE = "DTSTART:20990101T090000\nRRULE:FREQ=DAILY"
 
 
 @pytest.fixture
-def subagents_on(boss, preserve, streaming):
+def subagents_on(instance_admin, preserve, streaming):
     preserve(SUBAGENTS, on=streaming)
-    with boss.client() as client:
+    with instance_admin.client() as client:
         current = client.get(SUBAGENTS[0]).json()
         client.post(SUBAGENTS[1], json={**current, "ENABLE_SUBAGENTS": True}).raise_for_status()
 
