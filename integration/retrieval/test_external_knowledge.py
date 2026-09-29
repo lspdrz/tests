@@ -17,11 +17,13 @@ dropping the in-use check from the connection delete turns its test red, and swi
 `test_external_knowledge_source` to `get_verified_user` turns the user test red (Qdrant is
 queried for the user). With the Milvus search leaving out the database name the Milvus retrieval
 test goes red, with its output fields emptied the Milvus chat test does, and with the vector field
-no longer required for Milvus the refusal test does.
+no longer required for Milvus the refusal test does, and with the source's column names ignored
+the custom-columns test does.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 
 import pytest
@@ -32,6 +34,7 @@ from harness.external_knowledge import (
     CONNECTIONS,
     EMBEDDING,
     MILVUS_SOURCE_CONFIG,
+    MILVUS_TOKEN,
     QDRANT_API_KEY,
     SOURCE_CONFIG,
     external_connection,
@@ -285,7 +288,8 @@ def test_the_admin_retrieval_test_searches_a_milvus_collection(admin, milvus_ser
     assert (vector_field, limit) == ("vector", 2)
     assert set(output_fields) == {"data", "metadata", "id"}
     assert any(call.get("dbname") == "harbour" for call in milvus_service.call_metadata)
-    assert any("authorization" in call for call in milvus_service.call_metadata)
+    token = base64.b64encode(MILVUS_TOKEN.encode()).decode()
+    assert any(call.get("authorization") == token for call in milvus_service.call_metadata)
 
 
 def test_a_chat_with_a_milvus_knowledge_base_attached_gets_its_rows(
@@ -333,3 +337,39 @@ def test_a_milvus_source_without_a_vector_field_is_refused(admin, milvus_service
     assert tried.status_code == 400, tried.text
     assert "Vector field is required" in tried.text
     assert searches_of(milvus_service, MILVUS_COLLECTION) == []
+
+
+def test_a_milvus_source_is_searched_on_the_columns_it_names(admin, milvus_service):
+    rows = [
+        {"id": "a", "embedding": EMBEDDING, "body": {"text": "Berth 9 is free."}, "tags": {"n": 1}},
+        {
+            "id": "b",
+            "embedding": [0.3, -0.2, 0.1],
+            "body": {"text": "Berth 4 is full."},
+            "tags": {},
+        },
+    ]
+    config = {
+        "content_field": "body.text",
+        "vector_field": "embedding",
+        "metadata_field": "tags",
+        "document_id_field": "id",
+    }
+    form = serve_milvus(milvus_service, "berths", rows)
+    with admin.client() as client, external_connection(client, form) as connection:
+        tried = client.post(
+            f"{CONNECTIONS}/{connection}/retrieve-test",
+            json={
+                "query": "which berth?",
+                "count": 1,
+                "source": {"name": "berths", "config": config},
+            },
+        )
+
+    assert tried.status_code == 200, tried.text
+    found = tried.json()
+    assert found["documents"] == ["Berth 9 is free."]
+    assert found["metadatas"][0]["n"] == 1
+    [(_, vector_field, _, output_fields)] = searches_of(milvus_service, "berths")
+    assert vector_field == "embedding"
+    assert set(output_fields) == {"body", "tags", "id"}

@@ -8,8 +8,10 @@ expressions are the conjunctions Open WebUI writes: `field == value`, `field in 
 `metadata['key'] == value`, joined by `and`.
 
 `hold_collection(name, rows)` fills a collection with rows written as an admin's own data (a string
-`id`, a `vector`, JSON `data` and `metadata`), the way external knowledge finds it, and `searches`
-lists every vector search as `(collection, vector field, limit, output fields)`.
+`id`, float lists as vectors and dicts as JSON columns, named as the admin likes), the way external
+knowledge finds it, and `searches` lists every vector search as `(collection, vector field, limit,
+output fields)`. A search on a column the collection lacks or with a vector of the wrong size is
+refused, as Milvus does.
 
 `index_requests` lists every `(collection, field, index type)` the server was asked to build;
 an empty type is a request that leaves the choice to the server. `index_settings` holds the
@@ -194,12 +196,13 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
         self.lock = threading.Lock()
 
     def hold_collection(self, name: str, rows: list[dict]) -> None:
-        """Hold `name` with `rows`, each an `id`, a `vector` and JSON `data` and `metadata`."""
+        """Hold `name` with `rows`: a string `id`, float lists for vectors and dicts for JSON."""
+        kinds = {str: schema_pb2.VarChar, list: schema_pb2.FloatVector, dict: schema_pb2.JSON}
         fields = [
-            schema_pb2.FieldSchema(name="id", data_type=schema_pb2.VarChar, is_primary_key=True),
-            schema_pb2.FieldSchema(name="vector", data_type=schema_pb2.FloatVector),
-            schema_pb2.FieldSchema(name="data", data_type=schema_pb2.JSON),
-            schema_pb2.FieldSchema(name="metadata", data_type=schema_pb2.JSON),
+            schema_pb2.FieldSchema(
+                name=column, data_type=kinds[type(cell)], is_primary_key=column == "id"
+            )
+            for column, cell in rows[0].items()
         ]
         collection = Collection(schema=schema_pb2.CollectionSchema(name=name, fields=fields))
         collection.rows = {row["id"]: row for row in rows}
@@ -394,6 +397,13 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
         vector_field = params.get("anns_field") or next(
             field.name for field in collection.schema.fields if field.data_type in VECTOR_TYPES
         )
+        columns = {column.name: column for column in collection.schema.fields}
+        missing = [name for name in [vector_field, *request.output_fields] if name not in columns]
+        if missing:
+            return milvus_pb2.SearchResults(status=_failed(f"field not found: {missing[0]}"))
+        dims = {len(row[vector_field]) for row in rows}
+        if any(len(vector) not in dims for vector in vectors) and dims:
+            return milvus_pb2.SearchResults(status=_failed("vector dimension mismatch"))
         candidates = [row for row in rows if matches(row, request.dsl)]
         with self.lock:
             self.searches.append(
