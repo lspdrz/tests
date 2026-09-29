@@ -12,7 +12,10 @@ and a proxy whose own name does not resolve fails every call the same way.
 Discriminates: on dev 176d31d1d, a backend copy whose `env.py` installs a resolver that fails every
 lookup when the flag is on turns every c-ares run but the unresolvable-proxy one red (the proxy's
 own name no longer resolves) and leaves every threaded run green; the same resolver installed for
-the flag off does the reverse.
+the flag off does the reverse. The unresolvable-proxy test stays green under a failing resolver by
+design, and a resolver that takes 20 seconds to refuse an unknown name turns it red; its c-ares run
+skips, naming the reason, on a machine whose DNS server keeps c-ares from refusing an unknown name
+at once (a cached reply with a stale EDNS cookie, c-ares issues 1081 and 1271).
 """
 
 from __future__ import annotations
@@ -135,6 +138,7 @@ def test_a_name_the_proxy_cannot_resolve_fails_the_same_way(resolver, proxied_in
     assert seconds < FAILS_WITHIN, f"the proxy's refusal took {seconds:.1f}s"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_proxy_whose_name_does_not_resolve_fails_every_call_the_same_way(
     resolver, instance_with, preserve
 ):

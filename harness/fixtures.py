@@ -17,6 +17,7 @@ import pytest
 
 from harness import upstream as upstream_module
 from harness.actors import Actor, admin_of, create_user
+from harness.host_names import c_ares_refusal_problem
 from harness.instance import LaunchedInstance, launch
 from harness.listener import Listener, listening
 from harness.upstream import MOCK_MODEL_ID, MockUpstream
@@ -211,6 +212,15 @@ def open_terminal() -> Generator:
 
     with serving_open_terminal() as terminal:
         yield terminal
+
+
+@pytest.fixture
+def refuses_unknown_names(resolver: str) -> None:
+    """Skips a c-ares test of a name that does not resolve where this machine's DNS server keeps
+    c-ares from refusing one at once, naming the reason; the probe runs once per session."""
+    problem = c_ares_refusal_problem() if resolver == "c-ares" else None
+    if problem:
+        pytest.skip(problem)
 
 
 @pytest.fixture

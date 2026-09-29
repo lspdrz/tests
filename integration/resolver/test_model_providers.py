@@ -16,9 +16,11 @@ Discriminates: on dev 176d31d1d, a backend copy whose `env.py` installs a resolv
 lookup when the flag is on turns every c-ares run of the by-name tests and of the liveness test red
 and leaves every threaded run green; the same resolver installed for the flag off does the reverse.
 Dropping the flag's branch from `env.py` (c-ares always) fails the threaded half of the liveness
-test, and reading the flag as always off fails its c-ares half. The unresolvable-name tests go red
-under c-ares on a host whose DNS server replays cached answers with a stale EDNS cookie, which
-c-ares drops (c-ares issues 1081 and 1271): the lookup times out after about 20 seconds.
+test, and reading the flag as always off fails its c-ares half. The unresolvable-name tests stay
+green under a failing resolver by design, and a resolver that takes 20 seconds to refuse an unknown
+name turns it red. Its c-ares runs skip, naming the reason, on a machine whose DNS server keeps
+c-ares from refusing an unknown name at once (a cached reply with a stale EDNS cookie, c-ares issues
+1081 and 1271).
 """
 
 from __future__ import annotations
@@ -217,6 +219,7 @@ def _enable_unresolvable_ollama(client) -> None:
     client.post(OLLAMA_CONFIG[1], json=connection).raise_for_status()
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_an_unresolvable_provider_fails_verification_the_same_way(resolver, resolving_admin):
     with resolving_admin.client() as client:
         openai_verified, openai_seconds = timed(
@@ -240,6 +243,7 @@ def test_an_unresolvable_provider_fails_verification_the_same_way(resolver, reso
     assert slowest < FAILS_WITHIN, f"{resolver} took {slowest:.1f}s to refuse an unknown name"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_an_unresolvable_provider_leaves_the_model_list_and_fails_its_chats(
     resolver, resolving_instance, resolving_admin, preserve
 ):
@@ -262,6 +266,7 @@ def test_an_unresolvable_provider_leaves_the_model_list_and_fails_its_chats(
     assert slowest < FAILS_WITHIN, f"{resolver} took {slowest:.1f}s to refuse an unknown name"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_an_unresolvable_ollama_names_the_host_it_could_not_reach(
     resolver, resolving_instance, resolving_admin, preserve
 ):

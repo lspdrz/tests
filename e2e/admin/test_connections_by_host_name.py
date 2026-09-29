@@ -12,7 +12,10 @@ both resolvers. Twin of integration/resolver/test_model_providers.py.
 Discriminates: on the dev 176d31d1d build, a backend copy whose `env.py` installs a resolver that
 fails every lookup when the flag is on turns every c-ares by-name run red (the verify toast reads
 "OpenAI: Network Problem") and leaves every threaded run green; the same resolver installed for the
-flag off does the reverse.
+flag off does the reverse. The unresolvable-name test's c-ares run skips, naming the reason, on a
+machine whose DNS server keeps c-ares from refusing an unknown name at once (a cached reply with a
+stale EDNS cookie, c-ares issues 1081 and 1271); a resolver that takes 20 seconds to refuse one
+turns it red.
 """
 
 from __future__ import annotations
@@ -63,8 +66,13 @@ def ollama_section(page: Page, settings: Locator) -> Locator:
 
 
 @pytest.fixture(params=list(RESOLVERS))
-def resolving_admin(request, instance_with, preserve):
-    resolving = instance_with(RESOLVERS[request.param])
+def resolver(request) -> str:
+    return request.param
+
+
+@pytest.fixture
+def resolving_admin(resolver, instance_with, preserve):
+    resolving = instance_with(RESOLVERS[resolver])
     preserve(OPENAI_CONFIG, OLLAMA_CONFIG, on=resolving)
     return admin_of(resolving)
 
@@ -110,6 +118,7 @@ def test_an_ollama_connection_added_by_host_name_verifies(page_for, resolving_ad
     assert listener.requests_to("/api/version"), "the Ollama stand-in was never asked"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_host_name_that_does_not_resolve_shows_the_same_error_at_once(page_for, resolving_admin):
     page = page_for(resolving_admin)
     settings = open_admin_connections(page)

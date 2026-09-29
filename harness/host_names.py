@@ -11,18 +11,25 @@ the form's host. `UNRESOLVABLE` is a name no resolver answers (RFC 6761 reserves
 resolver refuses it well inside `FAILS_WITHIN` seconds where the DNS server answers, which
 `timed(call)` measures. `resolver_reason(text)` is the resolver's own wording of that failure, the
 bracketed tail aiohttp ends a connection error with: c-ares words it differently from the OS
-(`C_ARES_REASONS`), which is how a test tells which resolver answered.
+(`C_ARES_REASONS`), which is how a test tells which resolver answered. `c_ares_refusal_problem()`
+probes once per session whether this machine's DNS server lets c-ares refuse `UNRESOLVABLE` at once
+as the OS does; where it does not, the `refuses_unknown_names` fixture skips a c-ares test of that
+name and names the reason.
 """
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import functools
 import ipaddress
 import os
 import re
 import socket
 import sys
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -165,3 +172,61 @@ def resolver_reason(text: str) -> str | None:
 def without_resolver_reason(text: str) -> str:
     """The error text with the resolver's wording replaced, so both resolvers' errors compare."""
     return _BRACKETED_TAIL.sub("[<resolver reason>]", text.strip())
+
+
+# pycares codes for a DNS server that never answered, as against one that said no
+_C_ARES_UNANSWERED = {11, 12}  # ARES_ECONNREFUSED, ARES_ETIMEOUT
+PROBE_TIMEOUT = 1.0  # seconds per query; a working resolver refuses an unknown name in milliseconds
+
+
+async def _c_ares_error_code(host: str) -> int | None:
+    import aiodns
+
+    resolver = aiodns.DNSResolver(timeout=PROBE_TIMEOUT, tries=1)
+    try:
+        await resolver.getaddrinfo(host, family=socket.AF_UNSPEC, port=80, type=socket.SOCK_STREAM)
+    except aiodns.error.DNSError as error:
+        return error.args[0]
+    return None
+
+
+def _c_ares_left_unanswered(host: str, attempts: int) -> bool:
+    """Whether a fresh c-ares channel got no answer, run off any event loop the caller holds."""
+
+    async def ask_until_unanswered() -> bool:
+        for _ in range(attempts):
+            if await _c_ares_error_code(host) in _C_ARES_UNANSWERED:
+                return True
+        return False
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, ask_until_unanswered()).result()
+
+
+@functools.cache
+def c_ares_refusal_problem() -> str | None:
+    """Why c-ares cannot refuse an unknown name at once on this machine while the OS can, or None.
+
+    Two fresh channels ask for one new name, as two processes would: some DNS servers (Tailscale's,
+    some routers) replay a cached answer with the first client's EDNS cookie, which c-ares drops and
+    then times out on (c-ares issues 1081 and 1271), while the OS resolver takes it at once.
+    """
+    try:
+        import aiodns  # noqa: F401
+    except ImportError:
+        return None
+    started = time.monotonic()
+    try:
+        socket.getaddrinfo(UNRESOLVABLE, 80, type=socket.SOCK_STREAM)
+    except OSError:
+        pass
+    if time.monotonic() - started > PROBE_TIMEOUT:
+        return None  # the OS is slow too: not a c-ares problem, so the tests run and show it
+    # a name of its own, so the first channel meets an empty cache and the second a cached reply
+    if not _c_ares_left_unanswered(f"owui-probe-{uuid.uuid4().hex[:12]}.invalid", attempts=2):
+        return None
+    return (
+        "this machine's DNS server leaves c-ares unanswered for a name the OS resolver refuses at "
+        "once (a cached reply with a stale EDNS cookie, c-ares issues 1081 and 1271), so a c-ares "
+        f"lookup of {UNRESOLVABLE} times out instead of failing"
+    )

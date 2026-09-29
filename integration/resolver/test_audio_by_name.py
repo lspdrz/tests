@@ -16,8 +16,10 @@ hardcoded or are only settable in the environment (`ELEVENLABS_API_BASE_URL`) or
 Discriminates: on dev 176d31d1d, a backend copy whose `env.py` installs a resolver that fails every
 lookup when the flag is on turns every c-ares run of a by-name test red and leaves every threaded
 run green; the same resolver installed for the flag off does the reverse. A failure test stays green
-under a failing resolver by design; it goes red under c-ares on a host whose DNS server replays
-cached answers with a stale EDNS cookie, which c-ares drops (the lookup times out).
+under a failing resolver by design, and a resolver that takes 20 seconds to refuse an unknown name
+turns it red. Its c-ares runs skip, naming the reason, on a machine whose DNS server keeps c-ares
+from refusing an unknown name at once (a cached reply with a stale EDNS cookie, c-ares issues 1081
+and 1271).
 """
 
 from __future__ import annotations
@@ -265,6 +267,7 @@ def _unresolvable_settings(engine: str) -> tuple[dict, dict]:
     return _mistral_settings(f"{UNRESOLVABLE_URL}/v1")
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 @pytest.mark.parametrize("engine", ["openai", "azure", "mistral"])
 def test_an_unresolvable_engine_fails_speech_and_transcription_the_same_way(
     resolver, engine, resolving_admin
@@ -282,6 +285,7 @@ def test_an_unresolvable_engine_fails_speech_and_transcription_the_same_way(
     assert max(speech_seconds, transcription_seconds) < FAILS_WITHIN, "the lookup failed slowly"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 @pytest.mark.parametrize("engine", ["openai", "azure", "mistral"])
 def test_an_unresolvable_engine_leaves_the_voice_and_model_lists_at_their_defaults(
     resolver, engine, resolving_admin

@@ -14,8 +14,10 @@ with the same status and message, the resolver's own wording aside.
 Discriminates: on dev 176d31d1d, a backend copy whose `env.py` installs a resolver that fails every
 lookup when the flag is on turns every c-ares run of a by-name test red and leaves every threaded
 run green; the same resolver installed for the flag off does the reverse. A failure test stays green
-under a failing resolver by design; it goes red under c-ares on a host whose DNS server replays
-cached answers with a stale EDNS cookie, which c-ares drops (the lookup times out).
+under a failing resolver by design, and a resolver that takes 20 seconds to refuse an unknown name
+turns it red. Its c-ares runs skip, naming the reason, on a machine whose DNS server keeps c-ares
+from refusing an unknown name at once (a cached reply with a stale EDNS cookie, c-ares issues 1081
+and 1271).
 """
 
 from __future__ import annotations
@@ -284,6 +286,7 @@ def _unresolvable_engine(engine: str) -> dict:
     return build(UNRESOLVABLE_URL)
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 @pytest.mark.parametrize("engine", ENGINES)
 def test_an_unresolvable_engine_fails_generation_the_same_way(
     resolver, engine, image_settings, fetching_admin
@@ -299,6 +302,7 @@ def test_an_unresolvable_engine_fails_generation_the_same_way(
     assert seconds < FAILS_WITHIN, f"the lookup failed only after {seconds:.1f}s"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 @pytest.mark.parametrize("engine", ["openai", "gemini", "comfyui"])
 def test_an_unresolvable_engine_fails_an_edit_the_same_way(
     resolver, engine, image_settings, fetching_admin
@@ -316,6 +320,7 @@ def test_an_unresolvable_engine_fails_an_edit_the_same_way(
     assert seconds < FAILS_WITHIN, f"the lookup failed only after {seconds:.1f}s"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 @pytest.mark.parametrize("engine", ["automatic1111", "comfyui"])
 def test_an_unresolvable_engine_fails_verification_and_listing_the_same_way(
     resolver, engine, image_settings, fetching_admin
@@ -337,6 +342,7 @@ def test_an_unresolvable_engine_fails_verification_and_listing_the_same_way(
     assert max(verify_seconds, model_seconds) < FAILS_WITHIN, "the lookup failed slowly"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_an_unresolvable_link_fails_an_edit_the_same_way(resolver, image_settings, fetching_admin):
     with fetching_admin.client() as client:
         image_settings(**_gemini_settings(UNRESOLVABLE_URL))

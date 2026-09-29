@@ -15,8 +15,10 @@ call of automations is never reached, so neither is covered here.
 Discriminates: on dev 176d31d1d, a backend copy whose `env.py` installs a resolver that fails every
 lookup when the flag is on turns every c-ares run of a by-name test red and leaves every threaded
 run green; the same resolver installed for the flag off does the reverse. A failure test stays green
-under a failing resolver by design; it goes red under c-ares on a host whose DNS server replays
-cached answers with a stale EDNS cookie, which c-ares drops (the lookup times out).
+under a failing resolver by design, and a resolver that takes 20 seconds to refuse an unknown name
+turns it red. Its c-ares runs skip, naming the reason, on a machine whose DNS server keeps c-ares
+from refusing an unknown name at once (a cached reply with a stale EDNS cookie, c-ares issues 1081
+and 1271).
 """
 
 from __future__ import annotations
@@ -146,6 +148,7 @@ def test_an_openapi_tool_server_is_verified_loaded_and_called_by_name(
     assert server.requests_to("/pets/openapi.json"), "the spec was never fetched"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_an_unresolvable_openapi_tool_server_fails_verification_the_same_way(
     resolver, resolving_admin
 ):
@@ -158,6 +161,7 @@ def test_an_unresolvable_openapi_tool_server_fails_verification_the_same_way(
     assert seconds < FAILS_WITHIN, f"the lookup failed only after {seconds:.1f}s"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_chat_with_an_unresolvable_openapi_tool_server_still_answers(
     resolver, resolving_instance, resolving_admin, preserve
 ):
@@ -177,6 +181,7 @@ def test_a_chat_with_an_unresolvable_openapi_tool_server_still_answers(
     assert seconds < FAILS_WITHIN, f"the lookup failed only after {seconds:.1f}s"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_tool_call_to_an_unresolvable_server_tells_the_model_the_same_error(
     resolver, resolving_instance, resolving_admin, preserve
 ):
@@ -298,6 +303,7 @@ def test_a_terminal_proxies_files_and_sessions_for_the_web_client_by_name(
     assert terminal.auth is not None
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 @pytest.mark.parametrize(
     "path,detail",
     [
@@ -339,6 +345,7 @@ def gone_terminal(resolving_instance, resolving_admin, preserve) -> str:
     return connection["id"]
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_an_unresolvable_terminal_fails_its_proxy_the_same_way(
     resolver, resolving_admin, gone_terminal
 ):
@@ -353,6 +360,7 @@ def test_an_unresolvable_terminal_fails_its_proxy_the_same_way(
     assert seconds < FAILS_WITHIN, f"the lookup failed only after {seconds:.1f}s"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_an_unresolvable_terminal_fails_its_chat_the_same_way(
     resolver, resolving_admin, gone_terminal
 ):
@@ -366,6 +374,7 @@ def test_an_unresolvable_terminal_fails_its_chat_the_same_way(
     assert seconds < FAILS_WITHIN, f"the lookup failed only after {seconds:.1f}s"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_an_unresolvable_terminal_closes_its_session_the_same_way(
     resolver, resolving_instance, resolving_admin, gone_terminal
 ):

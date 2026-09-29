@@ -26,8 +26,10 @@ sign-in, so it is named `localhost` for the instance's life.
 Discriminates: on dev 176d31d1d, a backend copy whose `env.py` installs a resolver that fails every
 lookup when the flag is on turns every c-ares run of a by-name test red and leaves every threaded
 run green; the same resolver installed for the flag off does the reverse. A failure test stays green
-under a failing resolver by design; it goes red under c-ares on a host whose DNS server replays
-cached answers with a stale EDNS cookie, which c-ares drops (the lookup times out).
+under a failing resolver by design, and a resolver that takes 20 seconds to refuse an unknown name
+turns it red. Its c-ares runs skip, naming the reason, on a machine whose DNS server keeps c-ares
+from refusing an unknown name at once (a cached reply with a stale EDNS cookie, c-ares issues 1081
+and 1271).
 """
 
 from __future__ import annotations
@@ -179,6 +181,7 @@ def test_a_new_account_gets_the_picture_fetched_by_name(resolver, name_form, sso
     assert fetch.headers["Host"] == urlsplit(pictures.base_url).netloc
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_picture_that_does_not_resolve_leaves_the_default_avatar(resolver, sso, idp):
     idp.sign_in_as(picture=f"http://{UNRESOLVABLE}/avatar.png")
 
@@ -213,6 +216,7 @@ def test_an_expiring_token_is_refreshed_at_an_endpoint_named_by_host(
     )
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_refresh_endpoint_that_does_not_resolve_forwards_nothing_and_drops_the_session(
     resolver, sso, idp, tool_server
 ):
@@ -380,6 +384,7 @@ def test_a_finished_chat_is_delivered_to_an_always_target_by_name(
     assert delivered.headers["Host"] == _host_of(service)
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_notification_target_that_does_not_resolve_fails_its_test_button(
     resolver, allowed_webhooks
 ):
@@ -395,6 +400,7 @@ def test_a_notification_target_that_does_not_resolve_fails_its_test_button(
     assert seconds < FAILS_WITHIN, f"the delivery took {seconds:.1f}s to fail"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_an_event_webhook_that_does_not_resolve_leaves_account_creation_and_the_next_webhook_alone(
     resolver, allowed_webhooks
 ):

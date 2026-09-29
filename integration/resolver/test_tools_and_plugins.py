@@ -15,10 +15,11 @@ wording aside; that wording, in a pipe's error, proves plugin code gets the reso
 Discriminates: on dev 176d31d1d, a backend copy whose `env.py` installs a resolver that fails every
 lookup when the flag is on turns every c-ares run of a by-name test red and leaves every threaded
 run green; the same resolver installed for the flag off does the reverse. A failure test stays green
-under a failing resolver by design; it goes red under c-ares on a host whose DNS server replays
-cached answers with a stale EDNS cookie, which c-ares drops (the lookup times out). Dropping the
-flag's branch from `env.py` fails the threaded half of the plugin test, reading the flag as always
-off its c-ares half.
+under a failing resolver by design, and a resolver that takes 20 seconds to refuse an unknown name
+turns it red. Its c-ares runs skip, naming the reason, on a machine whose DNS server keeps c-ares
+from refusing an unknown name at once (a cached reply with a stale EDNS cookie, c-ares issues 1081
+and 1271). Dropping the flag's branch from `env.py` fails the threaded half of the plugin test,
+reading the flag as always off its c-ares half.
 """
 
 from __future__ import annotations
@@ -86,6 +87,7 @@ def test_a_tool_and_a_function_are_imported_from_a_url_by_name(
     assert len(server.requests_to(f"/{kind}/named_plugin.py")) == 1
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 @pytest.mark.parametrize(
     "kind,detail",
     [("tools", "Error fetching tool"), ("functions", "Error fetching function")],
@@ -171,6 +173,7 @@ def _stderr_of(message: dict) -> str:
     return json.loads(outcome["output"][0]["text"])["stderr"]
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 @pytest.mark.parametrize("path", ["tag", "tool", "endpoint"])
 def test_an_unresolvable_jupyter_engine_reports_the_same_error(
     resolver, path, resolving_instance, resolving_admin, preserve
@@ -321,6 +324,7 @@ def test_a_pipelines_filter_and_pipe_serve_chats_by_name(
     assert pipe_request.json()["messages"][-1]["content"] == "hello pipe [seen by the filter]"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 @pytest.mark.parametrize(
     "method,path",
     [
@@ -435,6 +439,7 @@ def test_a_tool_a_pipe_and_a_filter_reach_a_service_by_name(
 PLUGIN_ERROR = f"Cannot connect to host {UNRESOLVABLE}:8000 ssl:default [<resolver reason>]"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_tool_reaching_an_unresolvable_name_tells_the_model_the_same_error(
     resolver, resolving_instance, resolving_admin
 ):
@@ -450,6 +455,7 @@ def test_a_tool_reaching_an_unresolvable_name_tells_the_model_the_same_error(
     assert seconds < FAILS_WITHIN, f"the lookup failed only after {seconds:.1f}s"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_pipe_reaching_an_unresolvable_name_fails_the_chat_the_same_way(
     resolver, resolving_admin
 ):
@@ -462,6 +468,7 @@ def test_a_pipe_reaching_an_unresolvable_name_fails_the_chat_the_same_way(
     assert seconds < FAILS_WITHIN, f"the lookup failed only after {seconds:.1f}s"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_filter_reaching_an_unresolvable_name_fails_the_chat_the_same_way(
     resolver, resolving_instance, resolving_admin
 ):

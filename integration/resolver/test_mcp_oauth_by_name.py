@@ -20,8 +20,10 @@ are not affected by the flag.
 Discriminates: on dev 176d31d1d, a backend copy whose `env.py` installs a resolver that fails every
 lookup when the flag is on turns every c-ares run of a by-name test red and leaves every threaded
 run green; the same resolver installed for the flag off does the reverse. A failure test stays green
-under a failing resolver by design; it goes red under c-ares on a host whose DNS server replays
-cached answers with a stale EDNS cookie, which c-ares drops (the lookup times out).
+under a failing resolver by design, and a resolver that takes 20 seconds to refuse an unknown name
+turns it red. Its c-ares runs skip, naming the reason, on a machine whose DNS server keeps c-ares
+from refusing an unknown name at once (a cached reply with a stale EDNS cookie, c-ares issues 1081
+and 1271).
 """
 
 from __future__ import annotations
@@ -201,6 +203,7 @@ def test_static_credentials_discover_a_server_named_by_host(
     assert _aiohttp_requests(discoveries), "the metadata was never fetched by Open WebUI itself"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_token_endpoint_that_does_not_resolve_drops_the_connection(
     resolver, resolving_instance, registered
 ):
@@ -222,6 +225,7 @@ def test_a_token_endpoint_that_does_not_resolve_drops_the_connection(
     assert seconds < FAILS_WITHIN, f"the refresh took {seconds:.1f}s to fail"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_server_that_does_not_resolve_fails_registration_the_same_way(resolver, resolving_admin):
     with resolving_admin.client() as client:
         dynamic, dynamic_seconds = timed(
@@ -270,6 +274,7 @@ def test_a_server_named_by_host_is_verified_with_its_authorization_metadata(
     assert metadata["token_endpoint"] == f"{mcp.auth_server.base_url}/token"
 
 
+@pytest.mark.usefixtures("refuses_unknown_names")
 def test_a_server_that_does_not_resolve_fails_verification_the_same_way(resolver, resolving_admin):
     with resolving_admin.client() as client:
         verified, seconds = timed(

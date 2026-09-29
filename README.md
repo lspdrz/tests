@@ -136,6 +136,7 @@ Tests skip when what they need is absent, so the whole suite runs anywhere and o
 | `preserve(...)` | restores the global settings a test changes |
 | `instance_with({...})` | a further instance for settings that only exist as environment variables |
 | `package_instance_with({...})` | the same, kept for a whole test package whose modules share the env set |
+| `refuses_unknown_names` | skips a c-ares test of a name that does not resolve where the machine's DNS server keeps c-ares from refusing one at once |
 | `listener` | a local HTTP service for the instance to call, recording what it gets |
 | `open_terminal` | a real Open Terminal for the session (`OPEN_TERMINAL_BIN`), skipped where it is not installed |
 
