@@ -5,12 +5,12 @@ The streaming handler builds a reply by appending each piece to the text it alre
 here runs on an instance with the toggle off and one with it on, and asserts the same literal
 outcome for both: the stored reply, the `response:completion` deltas a browser tab receives and
 what the provider is sent on the next turn of the same chat. The pieces arrive from an Ollama
-connection (text, thinking and a tool call in lines), a Responses API connection (text, reasoning
-and function call arguments, also coalesced into fewer socket events), a direct connection served
-by the user's own tab, and tool calls whose arguments are split across deltas for a workspace
-Python tool, an OpenAPI tool server, an MCP server and a knowledge tool whose result carries a
-source. An Anthropic connection has no path of its own here: the messages endpoint only converts
-the handler's stream on the way out.
+connection (text, thinking and a tool call in lines), a Responses API connection (its own events
+are reduced elsewhere, so only the deltas coalesced into fewer socket events reach the append), a
+direct connection served by the user's own tab, and tool calls whose arguments are split across
+deltas for a workspace Python tool, an OpenAPI tool server, an MCP server and a knowledge tool
+whose result carries a source. An Anthropic connection has no path of its own here: the messages
+endpoint only converts the handler's stream on the way out.
 
 Discriminates: with the in-place branch of the append breaking only itself, every append-in-place
 case failed and every append-copies case passed; with the copying branch breaking only itself the
@@ -243,50 +243,11 @@ def responses(streaming, preserve, listener):
         yield provider, client, socket
 
 
-def test_responses_text_and_reasoning_deltas_are_joined(responses):
-    provider, client, socket = responses
-    provider.answer(
-        responses_api.events_stream(
-            *reasoning_in_pieces(["plan ", "the ", "route"], ["the map ", "says north"]),
-            *responses_api.message("Head ", "north ", "now", index=1),
-            responses_api.completed(),
-        ),
-        responses_api.events_stream(*responses_api.message("ok"), responses_api.completed()),
-    )
-
-    replies, deltas = converse(socket, client, RESPONSES_MODEL, ["where to?", "again"])
-
-    assert replies[0]["content"] == "Head north now"
-    [thought, answer] = replies[0]["output"]
-    assert [part["text"] for part in thought["summary"]] == ["plan the route"]
-    assert [part["text"] for part in thought["content"]] == ["the map says north"]
-    assert answer["content"][0]["text"] == "Head north now"
-    assert deltas == [
-        ("response.reasoning_summary_text.delta", "plan "),
-        ("response.reasoning_summary_text.delta", "the "),
-        ("response.reasoning_summary_text.delta", "route"),
-        ("response.reasoning_text.delta", "the map "),
-        ("response.reasoning_text.delta", "says north"),
-        ("response.output_text.delta", "Head "),
-        ("response.output_text.delta", "north "),
-        ("response.output_text.delta", "now"),
-    ]
-    follow_up = provider.sent()[-1]["input"]
-    assert follow_up[-2:] == [
-        {
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": "Head north now"}],
-        },
-        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "again"}]},
-    ]
-
-
 def test_responses_deltas_are_coalesced_into_fewer_socket_events(responses):
     provider, client, socket = responses
     provider.answer(
         responses_api.events_stream(
-            *reasoning_in_pieces(["a", "b", "c", "d"], []),
+            *reasoning_in_pieces(["a", "b", "c", "d"], ["x", "y", "z"]),
             *responses_api.message("1", "2", "3", "4", "5", "6", "7", index=1),
             responses_api.completed(),
         ),
@@ -297,10 +258,14 @@ def test_responses_deltas_are_coalesced_into_fewer_socket_events(responses):
         socket, client, RESPONSES_MODEL, ["count", "again"], params={"stream_delta_chunk_size": 3}
     )
 
-    assert shape(replies[0])[1] == ("message", "1234567")
+    [thought, answer] = replies[0]["output"]
+    assert [part["text"] for part in thought["summary"]] == ["abcd"]
+    assert [part["text"] for part in thought["content"]] == ["xyz"]
+    assert answer["content"][0]["text"] == "1234567"
     assert deltas == [
         ("response.reasoning_summary_text.delta", "abc"),
         ("response.reasoning_summary_text.delta", "d"),
+        ("response.reasoning_text.delta", "xyz"),
         ("response.output_text.delta", "123"),
         ("response.output_text.delta", "456"),
         ("response.output_text.delta", "7"),
@@ -312,7 +277,7 @@ def test_responses_deltas_are_coalesced_into_fewer_socket_events(responses):
     }
 
 
-def test_responses_function_call_arguments_reach_a_python_tool(responses, streaming):
+def test_responses_function_call_arguments_are_coalesced_for_a_python_tool(responses, streaming):
     provider, client, socket = responses
     arguments = {"origin": "Vienna", "stops": 3}
     provider.answer(
@@ -329,7 +294,12 @@ def test_responses_function_call_arguments_reach_a_python_tool(responses, stream
 
     with python_tool(admin_of(streaming), PLAN_ROUTE) as tool_id:
         replies, deltas = converse(
-            socket, client, RESPONSES_MODEL, ["plan it", "again"], tool_ids=[tool_id]
+            socket,
+            client,
+            RESPONSES_MODEL,
+            ["plan it", "again"],
+            tool_ids=[tool_id],
+            params={"stream_delta_chunk_size": 2},
         )
 
     encoded = json.dumps(arguments)
@@ -341,8 +311,7 @@ def test_responses_function_call_arguments_reach_a_python_tool(responses, stream
         ("message", "Three stops."),
     ]
     assert [d for d in deltas if d[0] == "response.function_call_arguments.delta"] == [
-        ("response.function_call_arguments.delta", encoded[: len(encoded) // 2]),
-        ("response.function_call_arguments.delta", encoded[len(encoded) // 2 :]),
+        ("response.function_call_arguments.delta", encoded),
     ]
     second = provider.sent()[1]["input"]
     assert second[-2:] == [
