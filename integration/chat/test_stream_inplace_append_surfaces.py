@@ -7,9 +7,9 @@ runs on an instance of each kind and expects the same literal outcome: a global 
 each chunk, an outlet filter editing the reply and reporting what it saw, a pipe yielding text
 pieces or chunks and SSE lines with reasoning, an action run on the finished reply, an API client
 without a socket session (with and without reasoning), a temporary chat and its follow-up, a
-channel where a model answers and what the members receive, a sub-agent, a timer, an
-automation that streams into a chat and an Anthropic client of the messages endpoint whose reply
-an outlet filter audits.
+channel where a model answers and what the members receive, a sub-agent in the foreground and
+one in the background, a timer, an automation that streams into a chat and an Anthropic client
+of the messages endpoint whose reply an outlet filter audits.
 
 Discriminates: in a backend copy whose in-place branch adds a bar before each piece every
 `append-in-place` case goes red and every `append-copies` case stays green; with the bar in the
@@ -660,3 +660,60 @@ def test_an_anthropic_client_gets_the_stream_and_the_outlet_sees_the_whole_reply
     assert text == "Snow falls softly."
     [audit] = listener.requests_to("/audit")
     assert audit.json()["content"] == "Snow falls softly."
+
+
+# --- a background sub-agent reporting back ------------------------------------------------------
+
+
+@pytest.fixture
+def background_subagents_on(instance_admin, preserve, streaming):
+    preserve(SUBAGENTS, on=streaming)
+    with instance_admin.client() as client:
+        current = client.get(SUBAGENTS[0]).json()
+        switched = {**current, "ENABLE_SUBAGENTS": True, "SUBAGENTS_BACKGROUND_ENABLED": True}
+        client.post(SUBAGENTS[1], json=switched).raise_for_status()
+
+
+def carries_the_report(body: dict) -> bool:
+    users = [entry for entry in body.get("messages", []) if entry.get("role") == "user"]
+    return bool(users) and "[ASYNC SUBAGENT COMPLETE" in str(users[-1].get("content"))
+
+
+def test_a_background_subagent_reports_its_whole_reply_and_the_chat_continues(
+    background_subagents_on, person, streaming
+):
+    task = f"count the crates {uuid.uuid4().hex[:6]}"
+    streaming.upstream.queue(
+        reply.tool_call(
+            "delegate_task",
+            {"task": task, "background": True},
+            match=reply.answering("send someone"),
+        ),
+        reply.text(["Forty ", "crates ", "in ", "bay three."], match=reply.answering(task)),
+        reply.text(["Sent ", "a helper."], match=reply.answering("send someone")),
+        reply.text(["The ", "count ", "is in."], match=carries_the_report),
+    )
+    with person.client() as client:
+        turn, message = ask(client, "send someone to the warehouse")
+
+        def continued():
+            messages = client.get(f"/api/v1/chats/{turn.chat_id}").json()["chat"]["history"]
+            reports = [
+                entry
+                for entry in messages["messages"].values()
+                if (entry.get("meta") or {}).get("type") == "subagent"
+            ]
+            replies = [
+                entry
+                for entry in messages["messages"].values()
+                if reports and entry.get("parentId") == reports[0]["id"] and entry.get("done")
+            ]
+            return (reports[0], replies[0]) if replies else None
+
+        report, follow_up = wait_for(continued, "the reply after the report", timeout=60.0)
+
+    assert message["content"].endswith("Sent a helper.")
+    assert "Forty crates in bay three." in report["content"]
+    assert follow_up["content"] == "The count is in."
+    sent_back = [body for body in streaming.upstream.chat_requests() if carries_the_report(body)]
+    assert "Forty crates in bay three." in str(sent_back[-1]["messages"][-1]["content"])

@@ -141,9 +141,9 @@ def test_a_slow_reply_grows_on_screen_and_is_whole_after_a_reload(chat_page, acc
 def test_accents_emoji_and_cjk_split_across_pieces_stay_whole(chat_page, account, streaming):
     pieces = [
         "cafe",
-        "́ au lait ",
+        "\u0301 au lait ",
         "\U0001f469",
-        "‍",
+        "\u200d",
         "\U0001f4bb at work ",
         "日本",
         "語のテスト",
