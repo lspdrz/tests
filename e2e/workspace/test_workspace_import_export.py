@@ -1,15 +1,15 @@
 """Journey: models, prompts, tools and skills leave the workspace as a JSON file and return.
 
 A fresh admin owns one of each. Exporting from a workspace list downloads a file that holds the
-item; after the item is deleted, importing that file from the same list brings it back, with the
-tool asking for a confirmation first. A file that is not JSON is met with an error message and
-adds nothing.
+item; after the item is deleted, importing that file from the same list brings it back with its
+content intact, with the tool asking for a confirmation first. A file that is not JSON, or is JSON
+but not a list, is met with an error message and adds nothing.
 
-Discriminates: passes on dev 176d31d1d apart from the prompts and tools cases of the bad file
-test, which fail there on purpose: both lists parse the file without a guard, so a file that is
-not JSON is dropped with no message (not yet reported upstream). In a frontend copy with each
-import loop emptied, the models export saving an empty list and the models and skills bad-file
-messages removed, all eight tests fail.
+Discriminates: passes on dev 176d31d1d apart from the prompts and tools cases of the two bad-file
+tests, which fail there on purpose: both lists read the file without a guard, so it is dropped with
+no message (not yet reported upstream). In a frontend copy where the prompts import sends an empty
+content, the skills import a changed content and the models import no base model, only the matching
+round trip goes red.
 """
 
 from __future__ import annotations
@@ -82,6 +82,13 @@ def _import(page: Page, section: str, content: str) -> None:
     )
 
 
+def _fetch(account: Actor, path: str) -> dict:
+    with account.client() as client:
+        fetched = client.get(path)
+    assert fetched.status_code == 200, fetched.text
+    return fetched.json()
+
+
 def _find_in_list(page: Page, label: str, name: str) -> None:
     page.get_by_role("textbox", name=label).fill(name)
     expect(page.get_by_text(name, exact=True)).to_be_visible()
@@ -100,6 +107,9 @@ def test_an_exported_model_is_restored_by_importing_the_file(page_for, keeper):
     _import(page, "models", json.dumps(saved))
 
     _find_in_list(page, "Search Models", name)
+    restored = _fetch(keeper, f"/api/v1/models/model?id={model_id}")
+    assert restored["base_model_id"] == MOCK_MODEL_ID
+    assert restored["name"] == name
 
 
 def test_an_exported_prompt_is_restored_by_importing_the_file(page_for, keeper):
@@ -118,6 +128,10 @@ def test_an_exported_prompt_is_restored_by_importing_the_file(page_for, keeper):
     _import(page, "prompts", json.dumps(saved))
 
     _find_in_list(page, "Search Prompts", name)
+    with keeper.client() as client:
+        listed = client.get("/api/v1/prompts/").json()
+    restored = [entry for entry in listed if entry["command"] == command]
+    assert [entry["content"] for entry in restored] == [f"Say hello, take {suffix}."]
 
 
 def test_an_exported_tool_is_restored_by_importing_the_file(page_for, keeper):
@@ -137,6 +151,7 @@ def test_an_exported_tool_is_restored_by_importing_the_file(page_for, keeper):
 
     expect(page.get_by_text("Tool imported successfully")).to_be_visible()
     _find_in_list(page, "Search Tools", name)
+    assert _fetch(keeper, f"/api/v1/tools/id/{tool_id}")["content"] == TOOL_SOURCE
 
 
 def test_an_exported_skill_is_restored_by_importing_the_file(page_for, keeper):
@@ -153,6 +168,7 @@ def test_an_exported_skill_is_restored_by_importing_the_file(page_for, keeper):
 
     expect(page.get_by_text("Skill imported successfully")).to_be_visible()
     _find_in_list(page, "Search Skills", name)
+    assert _fetch(keeper, f"/api/v1/skills/id/{skill_id}")["content"] == "Be brief."
 
 
 # ---------------------------------------------------------------- nearby
@@ -169,4 +185,17 @@ def test_a_file_that_is_not_json_shows_an_error(page_for, keeper, section):
         ).click()
 
     # prompts and tools parse without a guard, so their file is dropped without a message
+    expect(page.locator("[data-sonner-toast][data-type='error']")).to_be_visible()
+
+
+@pytest.mark.parametrize("section", ["models", "prompts", "tools", "skills"])
+def test_a_json_file_that_is_not_a_list_shows_an_error(page_for, keeper, section):
+    page = page_for(keeper)
+
+    _import(page, section, json.dumps({"note": "an object, not a list"}))
+    if section == "tools":
+        page.get_by_role("dialog", name="Confirm your action").get_by_role(
+            "button", name="Confirm"
+        ).click()
+
     expect(page.locator("[data-sonner-toast][data-type='error']")).to_be_visible()
