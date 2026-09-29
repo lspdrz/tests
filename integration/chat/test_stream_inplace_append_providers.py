@@ -35,7 +35,7 @@ from harness.python_tools import python_tool
 from harness.second_provider import OPENAI_CONFIG, attach, sse
 from harness.socket_client import connected
 
-pytestmark = [pytest.mark.journey, pytest.mark.api, pytest.mark.requires_source]
+pytestmark = [pytest.mark.journey, pytest.mark.api, pytest.mark.requires_source, pytest.mark.slow]
 
 INPLACE_APPEND = "ENABLE_CHAT_RESPONSE_STREAM_INPLACE_APPEND"
 OLLAMA_MODEL = "llama3:latest"
