@@ -97,7 +97,7 @@ def listening(host: str = "127.0.0.1") -> Iterator[Listener]:
             if self.command != "HEAD":
                 self.wfile.write(body)
 
-        do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = _serve
+        do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _serve
 
     server = ThreadingHTTPServer((host, 0), RequestHandler)
     port = server.server_port

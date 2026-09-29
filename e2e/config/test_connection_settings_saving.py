@@ -18,10 +18,10 @@ from __future__ import annotations
 import time
 
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import expect
 
 from harness.second_provider import OPENAI_CONFIG
-from utils.chat_ui import chat_input
+from utils.personal_connections import add_connection_form, open_personal_connections
 from utils.tooltips import tooltip_button
 
 pytestmark = [pytest.mark.regression, pytest.mark.requires_browser, pytest.mark.requires_source]
@@ -42,22 +42,6 @@ def direct_connections_on(admin, preserve) -> None:
 
 def is_settings_save(response) -> bool:
     return "/user/settings/update" in response.url
-
-
-def open_personal_connections(page: Page) -> Locator:
-    expect(chat_input(page)).to_be_visible()
-    page.get_by_role("navigation", name="Chat history").get_by_label("User menu").click()
-    page.get_by_role("button", name="Settings").click()
-    page.get_by_role("tab", name="Connections").click()
-    tab = page.locator("#tab-connections")
-    expect(tab.get_by_role("button", name="Add Connection")).to_be_visible()
-    return tab
-
-
-def add_connection_form(page: Page) -> Locator:
-    form = page.get_by_role("dialog").filter(has=page.get_by_role("heading", name="Add Connection"))
-    expect(form).to_be_visible()
-    return form
 
 
 def saved_direct_connections(account) -> dict:
