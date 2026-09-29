@@ -1,0 +1,375 @@
+"""Journey: building, browsing, sharing and emptying a knowledge base in the workspace.
+
+A fresh admin creates a knowledge base, finds it by name in the list and deletes it from the
+row's menu. Inside a base it uploads several files at once, pastes text as a new file and
+uploads a folder, whose subfolders come along; each file is listed once processed and opening
+one shows its text. The base's search narrows the list to matching file names, and a file
+removed from the base is no longer sent to a chat that attaches the base. The owner renames the
+base, shares it with a group read-only and then with write access, and a group member sees each
+change: the new name, the base marked read only with its controls locked, then editable. An
+account outside the group does not see it. Resetting the base empties it.
+
+Chromium's directory picker cannot be driven by Playwright, so the folder upload test hides it
+and the page takes the file input it offers browsers without one.
+
+Discriminates: passes on dev 176d31d1d. In a frontend copy, uploading only the first of the
+chosen files fails the upload test, uploading a folder's files without their subfolder fails
+the folder test, skipping the file's text fetch fails the preview test, a search input that
+does not search fails the search test, an edit that is never saved fails the rename test, a
+name field left editable for readers fails the read-only test, an access level select that
+changes nothing fails the write test, a reset confirm that resets nothing fails the reset test
+and a delete confirm that deletes nothing fails the create and delete test. In a backend copy,
+leaving a removed file's chunks in the base's collection fails the removal test (the chat is
+still sent its text).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import uuid
+from pathlib import Path
+
+import pytest
+from playwright.sync_api import Locator, Page, expect
+
+from harness import upstream as reply
+from harness.access import make_group
+from harness.actors import Actor
+from harness.chat import ask
+from harness.knowledge_bases import add_text_file
+
+pytestmark = [pytest.mark.journey, pytest.mark.requires_browser, pytest.mark.requires_source]
+
+KNOWLEDGE_USER = {"workspace": {"knowledge": True}}
+DESCRIPTION = "berths, tides and the harbour office"
+
+
+@pytest.fixture
+def curator(make_user):
+    """A fresh admin, whose knowledge bases are deleted afterwards."""
+    account = make_user(role="admin")
+    yield account
+    with account.client() as client:
+        for knowledge in client.get("/api/v1/knowledge/").json().get("items", []):
+            if knowledge["user_id"] == account.id:
+                client.delete(f"/api/v1/knowledge/{knowledge['id']}/delete")
+
+
+def _unique(label: str) -> str:
+    return f"{label} {uuid.uuid4().hex[:6]}"
+
+
+def _create_base(owner: Actor, name: str) -> str:
+    with owner.client() as client:
+        created = client.post(
+            "/api/v1/knowledge/create",
+            json={"name": name, "description": DESCRIPTION, "access_grants": []},
+        )
+    assert created.status_code == 200, created.text
+    return created.json()["id"]
+
+
+def _add_files(owner: Actor, knowledge_id: str, files: dict[str, str]) -> None:
+    with owner.client() as client:
+        for filename, text in files.items():
+            add_text_file(client, knowledge_id, filename, text)
+
+
+def _open_base(page: Page, knowledge_id: str) -> Locator:
+    page.goto(f"/workspace/knowledge/{knowledge_id}")
+    base = page.get_by_role("main")
+    expect(base.get_by_role("textbox", name="Knowledge Name")).to_be_visible()
+    return base
+
+
+def _file_row(base: Locator, filename: str) -> Locator:
+    return base.get_by_role("listitem").filter(has_text=filename)
+
+
+def _add_content(page: Page, base: Locator, item: str) -> None:
+    # the menu's trigger wraps the labelled button
+    base.get_by_role("button", name="Add Content").last.click()
+    page.get_by_role("menu").get_by_role("button", name=item).click()
+
+
+def _stored_file_names(owner: Actor, knowledge_id: str) -> list[str]:
+    with owner.client() as client:
+        listed = client.get(f"/api/v1/knowledge/{knowledge_id}/files")
+    assert listed.status_code == 200, listed.text
+    return sorted(item["filename"] for item in listed.json()["items"])
+
+
+def _search_list(page: Page, name: str) -> None:
+    page.goto("/workspace/knowledge")
+    with page.expect_response(
+        lambda response: "query=" in response.url and "page=1" in response.url
+    ):
+        page.get_by_role("textbox", name="Search Knowledge").fill(name)
+
+
+def _list_row(page: Page, name: str) -> Locator:
+    """The base's row in the list, once the list stopped loading further pages of matches."""
+    _search_list(page, name)
+    row = page.get_by_role("main").get_by_role("button").filter(has_text=name)
+    expect(row).to_be_visible()
+    # a next page loading re-renders the rows, which closes an open menu
+    expect(page.get_by_text("Loading...")).to_have_count(0)
+    return row
+
+
+def test_a_knowledge_base_is_created_found_in_the_list_and_deleted(page_for, curator):
+    name = _unique("Harbour")
+    page = page_for(curator)
+    page.goto("/workspace/knowledge/create")
+    creating = page.get_by_role("dialog")
+    creating.get_by_role("textbox", name="Name your knowledge base").fill(name)
+    creating.get_by_role("textbox", name="Describe your knowledge base and objectives").fill(
+        DESCRIPTION
+    )
+    creating.get_by_role("button", name="Create Knowledge").click()
+    expect(page).to_have_url(re.compile(r"/workspace/knowledge/[0-9a-f-]+$"))
+    knowledge_id = page.url.rsplit("/", 1)[-1]
+    expect(page.get_by_role("textbox", name="Knowledge Name")).to_have_value(name)
+
+    row = _list_row(page, name)
+    expect(row).to_contain_text(DESCRIPTION)
+    # the menu's trigger wraps the labelled button
+    row.get_by_role("button", name="More Options").last.click()
+    page.get_by_role("menu").get_by_role("button", name="Delete").click()
+    page.get_by_role("dialog", name="Confirm your action").get_by_role(
+        "button", name="Confirm"
+    ).click()
+    expect(page.get_by_text("Knowledge deleted successfully.")).to_be_visible()
+    expect(row).to_have_count(0)
+
+    with curator.client() as client:
+        assert client.get(f"/api/v1/knowledge/{knowledge_id}").status_code != 200
+
+
+def test_uploaded_files_and_pasted_text_are_listed_once_processed(page_for, curator):
+    knowledge_id = _create_base(curator, _unique("Harbour"))
+    page = page_for(curator)
+    base = _open_base(page, knowledge_id)
+
+    with page.expect_file_chooser() as chooser:
+        _add_content(page, base, "Upload files")
+    chooser.value.set_files(
+        [
+            {"name": "tides.txt", "mimeType": "text/plain", "buffer": b"High tide at 06:40.\n"},
+            {"name": "berths.txt", "mimeType": "text/plain", "buffer": b"Berth 9 is free.\n"},
+        ]
+    )
+    expect(base.get_by_text("2 files")).to_be_visible()
+
+    _add_content(page, base, "Add text content")
+    writing = page.get_by_role("dialog")
+    writing.get_by_placeholder("Title").fill("office hours")
+    writing.get_by_placeholder("Write something...").fill("The office opens at eight.")
+    writing.get_by_role("button", name="Save").click()
+    expect(base.get_by_text("3 files")).to_be_visible()
+
+    for filename in ("tides.txt", "berths.txt", "office hours.txt"):
+        expect(_file_row(base, filename)).to_have_count(1)
+    assert _stored_file_names(curator, knowledge_id) == [
+        "berths.txt",
+        "office hours.txt",
+        "tides.txt",
+    ]
+
+
+def test_an_uploaded_folder_keeps_its_subfolders(page_for, curator, tmp_path: Path):
+    folder = tmp_path / "harbour"
+    (folder / "moorings").mkdir(parents=True)
+    (folder / "tides.txt").write_text("High tide at 06:40.\n")
+    (folder / "moorings" / "berths.txt").write_text("Berth 9 is free.\n")
+    knowledge_id = _create_base(curator, _unique("Harbour"))
+    page = page_for(curator)
+    page.add_init_script(
+        "delete Window.prototype.showDirectoryPicker; delete window.showDirectoryPicker;"
+    )
+    base = _open_base(page, knowledge_id)
+
+    with page.expect_file_chooser() as chooser:
+        _add_content(page, base, "Upload directory")
+    chooser.value.set_files(str(folder))
+
+    base.get_by_role("button", name="harbour").click()
+    expect(_file_row(base, "tides.txt")).to_be_visible()
+    base.get_by_role("button", name="moorings").click()
+    expect(_file_row(base, "berths.txt")).to_be_visible()
+    expect(_file_row(base, "tides.txt")).to_have_count(0)
+    assert _stored_file_names(curator, knowledge_id) == ["berths.txt", "tides.txt"]
+
+
+def test_opening_a_file_shows_its_text(page_for, curator):
+    knowledge_id = _create_base(curator, _unique("Harbour"))
+    _add_files(curator, knowledge_id, {"tides.txt": "High tide at 06:40, low tide at 12:55."})
+    page = page_for(curator)
+    base = _open_base(page, knowledge_id)
+
+    _file_row(base, "tides.txt").get_by_role("button", name=re.compile("tides.txt")).click()
+
+    expect(page.get_by_role("link", name="tides.txt")).to_be_visible()
+    expect(page.get_by_role("textbox", name="File content")).to_have_value(
+        "High tide at 06:40, low tide at 12:55."
+    )
+
+
+def test_searching_the_base_lists_only_matching_files(page_for, curator):
+    knowledge_id = _create_base(curator, _unique("Harbour"))
+    _add_files(
+        curator,
+        knowledge_id,
+        {"tides.txt": "High tide.", "moorings.txt": "Berth 9.", "fuel.txt": "Cards only."},
+    )
+    page = page_for(curator)
+    base = _open_base(page, knowledge_id)
+    expect(base.get_by_text("3 files")).to_be_visible()
+
+    base.get_by_role("textbox", name="Search Collection").fill("moor")
+
+    expect(_file_row(base, "tides.txt")).to_have_count(0)
+    expect(_file_row(base, "fuel.txt")).to_have_count(0)
+    expect(_file_row(base, "moorings.txt")).to_be_visible()
+
+
+def test_a_removed_file_is_no_longer_sent_to_a_chat(page_for, curator, upstream):
+    knowledge_id = _create_base(curator, _unique("Harbour"))
+    _add_files(
+        curator,
+        knowledge_id,
+        {"gate.txt": "The gate code is 4242.", "fuel.txt": "The fuel dock takes cards only."},
+    )
+    page = page_for(curator)
+    base = _open_base(page, knowledge_id)
+
+    _file_row(base, "gate.txt").get_by_role("button").last.click()
+    page.get_by_role("menu").get_by_role("button", name="Delete").click()
+    expect(page.get_by_text("File removed successfully.")).to_be_visible()
+    expect(_file_row(base, "gate.txt")).to_have_count(0)
+    expect(_file_row(base, "fuel.txt")).to_be_visible()
+
+    question = "what is the gate code?"
+    upstream.queue(reply.text("I cannot tell.", match=reply.answering(question)))
+    with curator.client() as client:
+        ask(client, question, files=[{"type": "collection", "id": knowledge_id}])
+    sent = json.dumps(next(filter(reply.answering(question), upstream.chat_requests())))
+    assert "fuel dock takes cards" in sent
+    assert "4242" not in sent
+
+
+@pytest.fixture
+def team(admin, make_user) -> tuple[Actor, Actor, str]:
+    """A group member and an outsider, both allowed the knowledge workspace, and the group name."""
+    member, outsider = make_user(), make_user()
+    group_id = make_group(admin, [member], KNOWLEDGE_USER)
+    make_group(admin, [outsider], KNOWLEDGE_USER)
+    with admin.client() as client:
+        group = client.get(f"/api/v1/groups/id/{group_id}")
+    assert group.status_code == 200, group.text
+    return member, outsider, group.json()["name"]
+
+
+def _share_with_group(page: Page, base: Locator, group_name: str) -> Locator:
+    base.get_by_role("button", name="Access").click()
+    dialog = page.get_by_role("dialog").filter(has_text="Access Control")
+    dialog.get_by_role("button", name="Add Access").click()
+    picker = page.get_by_role("dialog").filter(has_text="Add Access").last
+    picker.get_by_placeholder("Search").fill(group_name)
+    picker.get_by_role("button", name=group_name).click()
+    picker.get_by_role("button", name="Add", exact=True).click()
+    expect(page.get_by_text("Saved").first).to_be_visible()
+    expect(dialog.get_by_role("combobox", name="Access level")).to_have_value("read")
+    return dialog
+
+
+def test_a_renamed_base_shows_its_new_name_to_a_group_member(page_for, curator, team):
+    member, _, group_name = team
+    knowledge_id = _create_base(curator, _unique("Harbour"))
+    page = page_for(curator)
+    base = _open_base(page, knowledge_id)
+    _share_with_group(page, base, group_name)
+    page.keyboard.press("Escape")
+
+    new_name = _unique("Marina")
+    base.get_by_role("textbox", name="Knowledge Name").fill(new_name)
+    base.get_by_role("textbox", name="Knowledge Description").fill("pontoons and the fuel dock")
+    expect(page.get_by_text("Knowledge updated successfully")).to_be_visible()
+
+    member_page = page_for(member)
+    row = _list_row(member_page, new_name)
+    expect(row).to_contain_text("pontoons and the fuel dock")
+    row.click()
+    expect(member_page.get_by_role("textbox", name="Knowledge Name")).to_have_value(new_name)
+    expect(member_page.get_by_role("textbox", name="Knowledge Description")).to_have_value(
+        "pontoons and the fuel dock"
+    )
+
+
+def test_a_group_with_read_access_sees_the_base_read_only(page_for, curator, team):
+    member, outsider, group_name = team
+    name = _unique("Harbour")
+    knowledge_id = _create_base(curator, name)
+    _add_files(curator, knowledge_id, {"tides.txt": "High tide at 06:40."})
+    page = page_for(curator)
+    _share_with_group(page, _open_base(page, knowledge_id), group_name)
+
+    member_page = page_for(member)
+    expect(_list_row(member_page, name)).to_contain_text("Read Only")
+    base = _open_base(member_page, knowledge_id)
+    expect(base.get_by_role("textbox", name="Knowledge Name")).to_be_disabled()
+    expect(base.get_by_role("textbox", name="Knowledge Description")).to_be_disabled()
+    expect(base.get_by_text("Read Only")).to_be_visible()
+    expect(base.get_by_role("button", name="Add Content")).to_have_count(0)
+    _file_row(base, "tides.txt").get_by_role("button", name=re.compile("tides.txt")).click()
+    content = member_page.get_by_role("textbox", name="File content")
+    expect(content).to_have_value("High tide at 06:40.")
+    expect(content).to_be_disabled()
+
+    outsider_page = page_for(outsider)
+    _search_list(outsider_page, name)
+    expect(outsider_page.get_by_text("No knowledge found")).to_be_visible()
+
+
+def test_granting_write_lets_a_group_member_edit_the_base(page_for, curator, team):
+    member, _, group_name = team
+    name = _unique("Harbour")
+    knowledge_id = _create_base(curator, name)
+    page = page_for(curator)
+    dialog = _share_with_group(page, _open_base(page, knowledge_id), group_name)
+
+    with page.expect_response(lambda response: "/access/update" in response.url) as saved:
+        dialog.get_by_role("combobox", name="Access level").select_option("write")
+    assert saved.value.ok
+
+    member_page = page_for(member)
+    expect(_list_row(member_page, name)).not_to_contain_text("Read Only")
+    base = _open_base(member_page, knowledge_id)
+    expect(base.get_by_role("textbox", name="Knowledge Name")).to_be_enabled()
+    expect(base.get_by_role("button", name="Access")).to_be_visible()
+    with member_page.expect_file_chooser() as chooser:
+        _add_content(member_page, base, "Upload files")
+    chooser.value.set_files(
+        {"name": "fuel.txt", "mimeType": "text/plain", "buffer": b"Cards only.\n"}
+    )
+    expect(member_page.get_by_text("File added successfully.")).to_be_visible()
+    expect(_file_row(base, "fuel.txt")).to_be_visible()
+    assert _stored_file_names(curator, knowledge_id) == ["fuel.txt"]
+
+
+def test_resetting_the_base_empties_it(page_for, curator):
+    knowledge_id = _create_base(curator, _unique("Harbour"))
+    _add_files(curator, knowledge_id, {"tides.txt": "High tide.", "fuel.txt": "Cards only."})
+    page = page_for(curator)
+    base = _open_base(page, knowledge_id)
+    expect(base.get_by_text("2 files")).to_be_visible()
+
+    _add_content(page, base, "Reset")
+    page.get_by_role("dialog", name="Reset knowledge base?").get_by_role(
+        "button", name="Confirm"
+    ).click()
+
+    expect(page.get_by_text("Knowledge base has been reset")).to_be_visible()
+    expect(base.get_by_text("No content found")).to_be_visible()
+    assert _stored_file_names(curator, knowledge_id) == []
