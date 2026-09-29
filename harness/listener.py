@@ -2,7 +2,8 @@
 
 Stands in for whatever outside service the instance calls: a page to fetch, an image engine,
 a tool server, a search provider. `route(method, path, handler)` registers an answer; a handler
-gets the recorded request and returns `(status, headers, body)`. Unrouted paths answer 404.
+gets the recorded request and returns `(status, headers, body)`. Unrouted paths answer 404,
+CORS preflights (`OPTIONS`) included.
 """
 
 from __future__ import annotations
