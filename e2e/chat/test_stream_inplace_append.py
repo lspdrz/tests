@@ -7,7 +7,14 @@ the toggle off and on and asserts the same literal text, thinking and tool call 
 paths are a slowly streamed reply with accents, emoji, CJK and a code fence split across pieces,
 deltas merged by a chunk size, reasoning deltas and `<think>` tags, a tool call whose arguments
 arrive in pieces, Stop, regenerate, continue, edit and resend, two models answering at once, a
-temporary chat and a long reply.
+temporary chat and a long reply. A second page opened mid-stream, thoughts growing live, a model
+answering a channel member, a timer and a background sub-agent replying into the chat, a stream
+filter rewriting a word, a pipe yielding pieces, an Action run on the reply and merged deltas
+with thoughts and a tool call are seen live and after a reload as well.
+
+The open page does not follow a fired timer or a sub-agent report on dev (the chat's stored
+current message still points at the earlier reply), so those two tests read the follow-up after
+a reload for both values.
 
 Discriminates: passes on dev 176d31d1d with the toggle off and on; with the in-place branch
 appending a marker before each piece every append-in-place case turns red and the append-copies
@@ -25,6 +32,9 @@ from playwright.sync_api import Locator, Page, expect
 
 from harness import upstream as reply
 from harness.actors import Actor, admin_of, create_user
+from harness.channel_chat import enable_channels
+from harness.channel_quotes import group_channel, post_message
+from harness.plugins import installed_function
 from harness.second_provider import OPENAI_CONFIG, attach, sse
 from harness.upstream import MOCK_MODEL_ID
 from utils.chat_ui import (
@@ -98,9 +108,9 @@ def stored_messages(account: Actor, chat_id: str, role: str) -> list[dict]:
     return sorted((m for m in messages if m["role"] == role), key=lambda m: m["timestamp"])
 
 
-def stored_replies(account: Actor, chat_id: str, count: int) -> list[str]:
+def stored_replies(account: Actor, chat_id: str, count: int, timeout_ms: int = 30_000) -> list[str]:
     """The saved assistant texts once `count` replies are done."""
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + timeout_ms / 1000
     while True:
         found = [m for m in stored_messages(account, chat_id, "assistant") if m.get("done")]
         if len(found) >= count or time.monotonic() > deadline:
@@ -112,9 +122,15 @@ def thought_button(page: Page) -> Locator:
     return last_reply(page).get_by_role("button", name=THOUGHTS)
 
 
-def expect_whole_reply(page: Page, text: str) -> None:
+def explored_button(page: Page) -> Locator:
+    """The collapsed group holding a tool call and the thoughts that came with it."""
+    return last_reply(page).get_by_text("Explored")
+
+
+def expect_whole_reply(page: Page, text: str, thought: bool = False) -> None:
     """The last reply reads exactly `text`, ignoring the Ask and Explain buttons after it."""
-    shown = re.compile(rf"^\s*{re.escape(text)}(\s+Ask\s+Explain)?\s*$")
+    opening = r"Thought for [^\n]*?\s+" if thought else ""
+    shown = re.compile(rf"^\s*{opening}{re.escape(text)}(\s+Ask\s+Explain)?\s*$")
     expect(last_reply(page)).to_have_text(shown, timeout=REPLY_TIMEOUT_MS)
 
 
@@ -395,3 +411,282 @@ def test_a_long_reply_over_many_pieces_is_shown_in_full(chat_page, account, stre
     reload_and_expect(chat_page, "Paragraph 0399:")
     expect(last_reply(chat_page).locator("p")).to_have_count(400)
     expect(last_reply(chat_page).locator("p").first).to_contain_text("Paragraph 0000:")
+
+
+# --- what a person sees live: a second page, growing thoughts, channels, Functions ---------------
+
+
+def slow_thoughts(prompt: str, thoughts: list[str], answer: list[str], delay: float = 0.5):
+    """A reply that thinks in `<think>` tags over many pieces, then answers over more pieces."""
+    pieces = ["<think>", *thoughts, "</think>", *answer]
+    return reply.text(pieces, chunk_delay=delay, match=reply.answering(prompt))
+
+
+def test_a_chat_opened_on_a_second_page_mid_stream_shows_the_text_so_far_then_all_of_it(
+    chat_page, account, page_for, streaming
+):
+    thoughts = [f"idea-{index} " for index in range(6)]
+    answer = [f"word-{index} " for index in range(8)]
+    streaming.upstream.queue(slow_thoughts("both pages", thoughts, answer))
+    send(chat_page, "both pages")
+    expect(last_reply(chat_page)).to_contain_text("Thinking", timeout=REPLY_TIMEOUT_MS)
+
+    second = page_for(account)
+    second.goto(f"/c/{chat_id_of(chat_page)}")
+    expect(thought_button(second)).to_have_count(1, timeout=REPLY_TIMEOUT_MS)
+    expect(last_reply(second)).to_contain_text("word-", timeout=REPLY_TIMEOUT_MS)
+    assert "word-7" not in last_reply(second).inner_text(), "the reply had already ended"
+
+    whole = "".join(answer).strip()
+    expect_whole_reply(second, whole, thought=True)
+    thought_button(second).click()
+    expect(last_reply(second)).to_contain_text("".join(thoughts).strip())
+    expect_whole_reply(chat_page, whole, thought=True)
+    assert stored_replies(account, chat_id_of(chat_page), 1)[0].endswith(whole)
+
+
+def test_thoughts_grow_while_the_block_still_reads_thinking_then_it_closes_and_answers(
+    chat_page, account, streaming
+):
+    thoughts = [f"idea-{index} " for index in range(8)]
+    answer = ["Done ", "thinking, ", "the answer ", "is ", "seven."]
+    streaming.upstream.queue(slow_thoughts("grow thoughts", thoughts, answer))
+    send(chat_page, "grow thoughts")
+
+    expect(thought_button(chat_page)).to_contain_text("Thinking", timeout=REPLY_TIMEOUT_MS)
+    thought_button(chat_page).click()
+    expect(last_reply(chat_page)).to_contain_text("idea-1", timeout=REPLY_TIMEOUT_MS)
+    assert "idea-7" not in last_reply(chat_page).inner_text(), "the thinking had already ended"
+    expect(last_reply(chat_page)).to_contain_text("idea-7", timeout=REPLY_TIMEOUT_MS)
+
+    expect(thought_button(chat_page)).to_contain_text("Thought for", timeout=REPLY_TIMEOUT_MS)
+    expect_reply(chat_page, "the answer is seven.")
+    assert stored_replies(account, chat_id_of(chat_page), 1)[0].endswith("the answer is seven.")
+
+    reload_and_expect(chat_page, "the answer is seven.")
+    expect(thought_button(chat_page)).to_contain_text("Thought for")
+    thought_button(chat_page).click()
+    expect(last_reply(chat_page)).to_contain_text("".join(thoughts).strip())
+
+
+@pytest.fixture
+def channel_member(streaming, account, preserve, page_for):
+    """A member's page open on a group channel with the owner; channels answer inline."""
+    preserve("admin_config", on=streaming)
+    with account.client() as client:
+        enable_channels(client, reply_mode="channel")
+    member = create_user(streaming)
+    channel_id = group_channel(account, member)
+    page = page_for(member)
+    page.goto(f"/channels/{channel_id}")
+    expect(page.locator("#chat-input")).to_be_visible()
+    return page, channel_id
+
+
+def test_a_model_mentioned_in_a_channel_answers_the_member_whole_and_after_a_reload(
+    channel_member, account, streaming
+):
+    page, channel_id = channel_member
+    pieces = ["Friday ", "works ", "for ", "everyone ", "in ", "the ", "team."]
+    streaming.upstream.queue(
+        reply.text(pieces, chunk_delay=0.2, match=reply.answering("Which day"))
+    )
+    post_message(account, channel_id, f"<@M:{MOCK_MODEL_ID}|{MOCK_MODEL_ID}> Which day?")
+
+    answer = "Friday works for everyone in the team."
+    expect(page.get_by_text(answer)).to_be_visible(timeout=REPLY_TIMEOUT_MS)
+    page.reload()
+    expect(page.get_by_text(answer)).to_be_visible(timeout=REPLY_TIMEOUT_MS)
+
+
+SUBAGENTS = ("/api/v1/configs/subagents", "/api/v1/configs/subagents")
+FIRE_TIMEOUT_MS = 40_000
+
+
+@pytest.fixture
+def subagents_on(streaming, preserve):
+    preserve(SUBAGENTS, on=streaming)
+    with admin_of(streaming).client() as client:
+        current = client.get(SUBAGENTS[0]).json()
+        settings = {**current, "ENABLE_SUBAGENTS": True, "SUBAGENTS_BACKGROUND_ENABLED": True}
+        client.post(SUBAGENTS[1], json=settings).raise_for_status()
+
+
+def test_a_timer_fires_and_its_follow_up_streams_into_the_open_page(
+    subagents_on, chat_page, account, streaming
+):
+    pieces = [f"steeped-{index} " for index in range(8)]
+    streaming.upstream.queue(
+        reply.tool_call(
+            "timer", {"prompt": "The tea has steeped", "at": "3s"}, match=reply.answering("remind")
+        ),
+        reply.text("Timer set.", match=reply.answering("remind")),
+        reply.text(pieces, chunk_delay=0.3, match=reply.answering("The tea has steeped")),
+    )
+    send(chat_page, "remind me shortly")
+    expect_reply(chat_page, "Timer set.")
+
+    whole = "".join(pieces).strip()
+    assert stored_replies(account, chat_id_of(chat_page), 2, FIRE_TIMEOUT_MS)[1] == whole
+    reload_and_expect(chat_page, "steeped-7")
+    expect_whole_reply(chat_page, whole)
+
+
+def test_a_background_subagent_report_and_the_follow_up_reply_show_in_the_open_page(
+    subagents_on, chat_page, account, streaming
+):
+    findings = ["The ledger ", "is ", "balanced ", "for ", "March."]
+    pieces = [f"checked-{index} " for index in range(8)]
+    call = reply.tool_call(
+        "delegate_task",
+        {"task": "check the ledger", "background": True},
+        match=reply.answering("hand over"),
+    )
+
+    def report(body: dict) -> bool:
+        users = [entry for entry in body.get("messages", []) if entry.get("role") == "user"]
+        return "[ASYNC SUBAGENT COMPLETE" in str(users[-1].get("content")) if users else False
+
+    streaming.upstream.queue(
+        call,
+        reply.text(findings, delay=2.0, chunk_delay=0.1, match=reply.answering("check the ledger")),
+        reply.text("It is being checked.", match=reply.answering("hand over")),
+        reply.text(pieces, chunk_delay=0.3, match=report),
+    )
+    send(chat_page, "hand over the books")
+    expect_reply(chat_page, "It is being checked.")
+
+    whole = "".join(pieces).strip()
+    assert stored_replies(account, chat_id_of(chat_page), 2, FIRE_TIMEOUT_MS)[-1] == whole
+    reload_and_expect(chat_page, "checked-7")
+    expect(conversation(chat_page)).to_contain_text("".join(pieces).strip())
+
+
+REDACTING_STREAM = """
+class Filter:
+    def stream(self, event):
+        for choice in event.get("choices", []):
+            content = choice.get("delta", {}).get("content")
+            if isinstance(content, str):
+                choice["delta"]["content"] = content.replace("swordfish", "[redacted]")
+        return event
+"""
+
+
+def test_a_stream_filter_rewriting_a_word_shows_the_rewrite_live_and_after_a_reload(
+    chat_page, account, streaming
+):
+    pieces = ["The password ", "is ", "swordfish", " so ", "keep ", "it ", "quiet ", "please."]
+    streaming.upstream.queue(reply.text(pieces, chunk_delay=0.3, match=reply.answering("secret")))
+    with installed_function(admin_of(streaming), REDACTING_STREAM, is_global=True):
+        send(chat_page, "the secret?")
+        expect(last_reply(chat_page)).to_contain_text("[redacted]", timeout=REPLY_TIMEOUT_MS)
+        assert "please." not in last_reply(chat_page).inner_text(), "the reply had already ended"
+        expect_whole_reply(chat_page, "The password is [redacted] so keep it quiet please.")
+        assert "swordfish" not in conversation(chat_page).inner_text()
+
+    saved = ["The password is [redacted] so keep it quiet please."]
+    assert stored_replies(account, chat_id_of(chat_page), 1) == saved
+    reload_and_expect(chat_page, "quiet please.")
+    expect_whole_reply(chat_page, saved[0])
+
+
+SLOW_PIPE = """
+import time
+
+
+WORDS = ["Roses ", "are ", "red, ", "violets ", "are ", "blue, ", "sugar ", "is sweet."]
+
+
+class Pipe:
+    def pipe(self, body):
+        for piece in WORDS:
+            time.sleep(0.3)
+            yield piece
+"""
+
+
+def test_a_pipe_answering_with_a_generator_of_pieces_fills_the_page_and_stays_after_a_reload(
+    account, page_for, streaming
+):
+    with installed_function(admin_of(streaming), SLOW_PIPE) as pipe_id:
+        with account.client() as client:
+            client.get("/api/models", params={"refresh": "true"}).raise_for_status()
+        choose_models(account, pipe_id)
+        page = page_for(account)
+        send(page, "recite")
+
+        expect(last_reply(page)).to_contain_text("red,", timeout=REPLY_TIMEOUT_MS)
+        assert "sweet." not in last_reply(page).inner_text(), "the reply had already ended"
+        whole = "Roses are red, violets are blue, sugar is sweet."
+        expect_whole_reply(page, whole)
+        assert stored_replies(account, chat_id_of(page), 1) == [whole]
+
+        reload_and_expect(page, "is sweet.")
+        expect_whole_reply(page, whole)
+
+
+LENGTH_ACTION = """
+class Action:
+    async def action(self, body, __event_emitter__=None):
+        reply = body["messages"][-1]["content"]
+        note = {"type": "info", "content": f"The reply has {len(reply)} characters"}
+        await __event_emitter__({"type": "notification", "data": note})
+"""
+
+
+def test_an_action_run_on_a_streamed_reply_reports_the_length_of_the_whole_text(
+    chat_page, account, streaming
+):
+    pieces = ["Pack ", "the ", "tent, ", "the ", "stove."]
+    streaming.upstream.queue(reply.text(pieces, chunk_delay=0.1, match=reply.answering("pack")))
+    with installed_function(admin_of(streaming), LENGTH_ACTION, is_global=True) as action_id:
+        chat_page.reload()
+        send(chat_page, "what do I pack?")
+        expect_whole_reply(chat_page, "Pack the tent, the stove.")
+
+        last_reply(chat_page).hover()
+        conversation(chat_page).get_by_role("button", name=action_id).last.click()
+        expect(chat_page.get_by_text("The reply has 25 characters")).to_be_visible()
+
+
+def test_merged_deltas_with_thoughts_and_a_tool_call_show_the_same_reply_live_and_reloaded(
+    account, page_for, streaming, second_provider
+):
+    thoughts = [{"reasoning_content": part} for part in ("weighing ", "the two ", "options")]
+    header = {"index": 0, "id": "call_1", "type": "function"}
+    opening = {
+        "tool_calls": [{**header, "function": {"name": "calculate_timestamp", "arguments": ""}}]
+    }
+    arguments = ['{"days_', 'ago": 3, ', '"weeks_ago"', ": 1}"]
+    parts = [{"tool_calls": [{"index": 0, "function": {"arguments": part}}]} for part in arguments]
+    rounds = []
+
+    def answer(_request):
+        rounds.append(1)
+        if len(rounds) == 1:
+            return sse(opening, *parts, finish_reason="tool_calls")
+        return sse(*thoughts, {"content": "Ten days "}, {"content": "ago "}, {"content": "it was."})
+
+    second_provider.route("POST", "/v1/chat/completions", answer)
+    choose_models(account, SECOND_MODEL, stream_delta_chunk_size=3)
+    page = page_for(account)
+    send(page, "what was ten days ago?")
+
+    expect_reply(page, "Ten days ago it was.")
+    expect(last_reply(page)).to_contain_text("calculate_timestamp")
+    explored_button(page).click()
+    thought_button(page).click()
+    expect(last_reply(page)).to_contain_text("weighing the two options")
+    sent = [r.json() for r in second_provider.requests_to("/v1/chat/completions")]
+    called = [m for m in sent[1]["messages"] if m.get("tool_calls")]
+    assert json.loads(called[0]["tool_calls"][0]["function"]["arguments"]) == {
+        "days_ago": 3,
+        "weeks_ago": 1,
+    }
+
+    reload_and_expect(page, "Ten days ago it was.")
+    expect(last_reply(page)).to_contain_text("calculate_timestamp")
+    explored_button(page).click()
+    thought_button(page).click()
+    expect(last_reply(page)).to_contain_text("weighing the two options")
