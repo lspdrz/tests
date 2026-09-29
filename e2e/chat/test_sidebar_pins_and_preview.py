@@ -10,7 +10,7 @@ Discriminates: passes on dev 176d31d1d; in a frontend copy each test fails when 
 cut: the pinned model link not naming its model, the unpin button not saving the settings, the
 pinned note link not naming its note, the note's Unpin button not unpinning, the preview showing
 no messages and the preview ignoring the hover-preview setting.
-
+"""
 
 from __future__ import annotations
 
