@@ -1,19 +1,23 @@
-"""External knowledge: a Qdrant collection the admin connects, searched from a test and a chat.
+"""External knowledge: a Qdrant or Milvus collection the admin connects, searched by test and chat.
 
 The admin saves a Qdrant connection, tries a query against a collection and adds that collection
 as a read-only knowledge base; a chat with the knowledge base attached searches it with the
 embedded question and hands the points it found to the model. A local service plays Qdrant, so
-the tests read the vector query it got and the context the model was sent. The admin also reads,
-renames, health-checks and deletes a connection, whose key never comes back and survives an
-update that leaves it out; a connection a knowledge base uses is kept. A user is refused every
-external knowledge route, and Qdrant is never queried for them.
+the tests read the vector query it got and the context the model was sent. A Milvus collection
+is searched the same way through a local gRPC service, from the column names the source names, with
+the connection's token and database; a Milvus source without a vector column is refused. The admin
+also reads, renames, health-checks and deletes a connection, whose key never comes back and
+survives an update that leaves it out; a connection a knowledge base uses is kept. A user is
+refused every external knowledge route, and Qdrant is never queried for them.
 
 Discriminates: fails with the Qdrant branch of `retrieve_external_knowledge_for_connection`
 querying `limit=1` (the connection test and the chat each see one point of two). In a backend
 copy, `_get_external_auth_config` taking an omitted key as none turns the CRUD test red,
 dropping the in-use check from the connection delete turns its test red, and switching
 `test_external_knowledge_source` to `get_verified_user` turns the user test red (Qdrant is
-queried for the user).
+queried for the user). With the Milvus search leaving out the database name the Milvus retrieval
+test goes red, with its output fields emptied the Milvus chat test does, and with the vector field
+no longer required for Milvus the refusal test does.
 """
 
 from __future__ import annotations
@@ -26,12 +30,17 @@ from harness import upstream as reply
 from harness.chat import ask
 from harness.external_knowledge import (
     CONNECTIONS,
+    EMBEDDING,
+    MILVUS_SOURCE_CONFIG,
     QDRANT_API_KEY,
     SOURCE_CONFIG,
     external_connection,
     external_knowledge_base,
+    milvus_row,
     point,
     queries_to,
+    searches_of,
+    serve_milvus,
     serve_qdrant,
 )
 
@@ -41,6 +50,13 @@ COLLECTION = "team_docs"
 POINTS = [
     point(11, "The harbour gate code is 4471.", 0.92, source="gates.md", page=2),
     point(12, "Visitors sign in at the harbour office.", 0.81, source="visitors.md"),
+]
+
+MILVUS_COLLECTION = "dock_docs"
+MILVUS_ROWS = [
+    milvus_row("far", "Cranes are serviced on Mondays.", [0.3, -0.2, 0.1], source="cranes.md"),
+    milvus_row("near", "The dock master sits in cabin 7.", EMBEDDING, source="dock.md", page=4),
+    milvus_row("mid", "Cabin 7 has a red door.", [0.3, 0.2, 0.1], source="cabins.md"),
 ]
 
 
@@ -245,3 +261,75 @@ def test_a_user_is_refused_every_external_knowledge_route(admin, make_user, list
     assert listener.received == [], "Qdrant was queried for a user"
     assert after == before
     assert knowledge["name"] == "Team vectors"
+
+
+def test_the_admin_retrieval_test_searches_a_milvus_collection(admin, milvus_service):
+    form = serve_milvus(milvus_service, MILVUS_COLLECTION, MILVUS_ROWS, db_name="harbour")
+    with admin.client() as client, external_connection(client, form) as connection:
+        tried = client.post(
+            f"{CONNECTIONS}/{connection}/retrieve-test",
+            json={
+                "query": "who sits in the cabin?",
+                "count": 2,
+                "source": {"name": MILVUS_COLLECTION, "config": MILVUS_SOURCE_CONFIG},
+            },
+        )
+
+    assert tried.status_code == 200, tried.text
+    found = tried.json()
+    assert found["documents"] == ["The dock master sits in cabin 7.", "Cabin 7 has a red door."]
+    assert found["distances"][0] == pytest.approx(1.0, abs=1e-4)
+    assert found["distances"][0] > found["distances"][1]
+    assert found["metadatas"][0]["source"] == "dock.md" and found["metadatas"][0]["page"] == 4
+    [(_, vector_field, limit, output_fields)] = searches_of(milvus_service, MILVUS_COLLECTION)
+    assert (vector_field, limit) == ("vector", 2)
+    assert set(output_fields) == {"data", "metadata", "id"}
+    assert any(call.get("dbname") == "harbour" for call in milvus_service.call_metadata)
+    assert any("authorization" in call for call in milvus_service.call_metadata)
+
+
+def test_a_chat_with_a_milvus_knowledge_base_attached_gets_its_rows(
+    admin, milvus_service, upstream
+):
+    form = serve_milvus(milvus_service, MILVUS_COLLECTION, MILVUS_ROWS)
+    upstream.queue(reply.text("Cabin 7.", match=reply.answering("dock master")))
+    with (
+        admin.client() as client,
+        external_connection(client, form) as connection,
+        external_knowledge_base(
+            client, connection, MILVUS_COLLECTION, "Dock vectors", MILVUS_SOURCE_CONFIG
+        ) as kb,
+    ):
+        _, answer = ask(
+            client,
+            "where does the dock master sit?",
+            files=[{"type": "collection", "id": kb, "name": "Dock vectors"}],
+        )
+
+    assert answer["content"] == "Cabin 7."
+    assert searches_of(milvus_service, MILVUS_COLLECTION)
+    [chat_request] = [
+        body for body in upstream.chat_requests() if reply.answering("dock master")(body)
+    ]
+    sent = json.dumps(chat_request["messages"])
+    assert "The dock master sits in cabin 7." in sent
+    assert "Cabin 7 has a red door." in sent
+
+
+def test_a_milvus_source_without_a_vector_field_is_refused(admin, milvus_service):
+    form = serve_milvus(milvus_service, MILVUS_COLLECTION, MILVUS_ROWS)
+    config = {key: value for key, value in MILVUS_SOURCE_CONFIG.items() if key != "vector_field"}
+    with admin.client() as client:
+        tried = client.post(
+            "/api/v1/knowledge/external/source/test",
+            json={
+                "connection": form,
+                "source": {"name": MILVUS_COLLECTION, "config": config},
+                "query": "dock master",
+                "count": 1,
+            },
+        )
+
+    assert tried.status_code == 400, tried.text
+    assert "Vector field is required" in tried.text
+    assert searches_of(milvus_service, MILVUS_COLLECTION) == []

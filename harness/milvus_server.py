@@ -7,6 +7,10 @@ paging a query iterator does) and vector search with cosine scores worked out in
 expressions are the conjunctions Open WebUI writes: `field == value`, `field in [...]` and
 `metadata['key'] == value`, joined by `and`.
 
+`hold_collection(name, rows)` fills a collection with rows written as an admin's own data (a string
+`id`, a `vector`, JSON `data` and `metadata`), the way external knowledge finds it, and `searches`
+lists every vector search as `(collection, vector field, limit, output fields)`.
+
 `index_requests` lists every `(collection, field, index type)` the server was asked to build;
 an empty type is a request that leaves the choice to the server. `index_settings` holds the
 parameters of the last index asked for on each `(collection, field)` (`index_type`,
@@ -184,9 +188,23 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
         self.index_requests: list[tuple[str, str, str]] = []
         self.index_settings: dict[tuple[str, str], dict[str, str]] = {}
         self.call_metadata: list[dict[str, str]] = []
+        self.searches: list[tuple[str, str, int, list[str]]] = []
         self.refuse_untyped_scalar_index = False
         self.address = ""
         self.lock = threading.Lock()
+
+    def hold_collection(self, name: str, rows: list[dict]) -> None:
+        """Hold `name` with `rows`, each an `id`, a `vector` and JSON `data` and `metadata`."""
+        fields = [
+            schema_pb2.FieldSchema(name="id", data_type=schema_pb2.VarChar, is_primary_key=True),
+            schema_pb2.FieldSchema(name="vector", data_type=schema_pb2.FloatVector),
+            schema_pb2.FieldSchema(name="data", data_type=schema_pb2.JSON),
+            schema_pb2.FieldSchema(name="metadata", data_type=schema_pb2.JSON),
+        ]
+        collection = Collection(schema=schema_pb2.CollectionSchema(name=name, fields=fields))
+        collection.rows = {row["id"]: row for row in rows}
+        with self.lock:
+            self.collections[name] = collection
 
     # --- connection ------------------------------------------------------------------------
 
@@ -377,6 +395,10 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
             field.name for field in collection.schema.fields if field.data_type in VECTOR_TYPES
         )
         candidates = [row for row in rows if matches(row, request.dsl)]
+        with self.lock:
+            self.searches.append(
+                (request.collection_name, vector_field, top_k, list(request.output_fields))
+            )
         names = [name for name in request.output_fields] or [collection.primary]
         result = schema_pb2.SearchResultData(num_queries=len(vectors), top_k=top_k)
         hits_all: list[dict] = []

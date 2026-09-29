@@ -181,6 +181,16 @@ def instance_with() -> Generator[Callable[[dict[str, str]], LaunchedInstance], N
 
 
 @pytest.fixture
+def milvus_service() -> Generator:
+    """A Milvus for external knowledge to search, recording every call it gets."""
+    pytest.importorskip("pymilvus", reason="pymilvus not installed in this env")
+    from harness.milvus_server import serving_milvus
+
+    with serving_milvus() as fake:
+        yield fake
+
+
+@pytest.fixture
 def listener() -> Generator[Listener, None, None]:
     """A local service for the instance to call, recording every request it gets."""
     with listening() as service:

@@ -1,17 +1,22 @@
-"""Journey: an admin connects a Qdrant collection in the Integrations settings and a chat uses it.
+"""Journey: an admin connects a Qdrant or Milvus collection in Integrations and a chat uses it.
 
 The admin adds a knowledge connection in Admin Settings > Integrations, which can only be saved
 after its test query returned points, reloads to see it listed, edits it without retyping the
 API key and switches it off. A chat that attaches the resulting knowledge base with `#` is sent
 the points Qdrant found; once the connection is switched off the chat is sent none. A local
 service plays Qdrant, so the tests read the query it got and the context the model was sent.
-The settings offer no way to delete a connection or its source.
+The settings offer no way to delete a connection or its source. For Milvus the admin picks the
+provider, which fills the column names Milvus needs (a vector field among them, without which the
+test does not run), names a database and adds the source; a chat that attaches it is sent the rows
+a local gRPC service played as Milvus found.
 
 Discriminates: passes on dev 176d31d1d; in a frontend copy, with the source form sending an
 empty API key on an edit the edit test fails (Qdrant gets no key), with the Create button enabled
 before a test passed the create and the no-points tests fail, and with the switch sending the
 old enabled state the switch test fails (it stays on). In a backend copy, with the retrieval of
-an external knowledge base skipped the chat test fails (Qdrant is never queried).
+an external knowledge base skipped the chat tests fail (Qdrant and Milvus are never queried), and
+with the Milvus search leaving out the database name the Milvus add test fails. In a frontend copy,
+with the test form no longer asking for a vector field on Milvus the no-vector-field test fails.
 """
 
 from __future__ import annotations
@@ -25,11 +30,17 @@ from playwright.sync_api import Locator, Page, expect
 from harness import upstream as reply
 from harness.external_knowledge import (
     CONNECTIONS,
+    EMBEDDING,
+    MILVUS_SOURCE_CONFIG,
+    MILVUS_TOKEN,
     QDRANT_API_KEY,
     external_connection,
     external_knowledge_base,
+    milvus_row,
     point,
     queries_to,
+    searches_of,
+    serve_milvus,
     serve_qdrant,
 )
 from utils.chat_ui import chat_input, expect_reply, send
@@ -41,6 +52,11 @@ POINTS = [
     point(22, "Oars are counted every Friday.", 0.74, source="oars.md"),
 ]
 QUESTION = "where is the boathouse key?"
+MILVUS_ROWS = [
+    milvus_row("row-a", "The chandlery opens at six.", [0.3, -0.2, 0.1], source="chandlery.md"),
+    milvus_row("row-b", "The fuel dock takes cards only.", EMBEDDING, source="fuel.md"),
+]
+FUEL_QUESTION = "how do I pay at the fuel dock?"
 
 
 @pytest.fixture
@@ -242,3 +258,97 @@ def test_a_switched_off_source_stays_off_after_a_reload_and_a_chat_gets_no_point
     assert queries_to(listener, collection) == []
     [chat_request] = [body for body in upstream.chat_requests() if reply.answering(QUESTION)(body)]
     assert "oar rack" not in json.dumps(chat_request["messages"])
+
+
+def test_a_milvus_source_is_added_with_the_columns_and_database_it_was_given(
+    page_for, curator, milvus_service
+):
+    name = f"Fuelquay {uuid.uuid4().hex[:6]}"
+    collection = "fuel_docs"
+    endpoint = serve_milvus(milvus_service, collection, MILVUS_ROWS)["endpoint"]
+    page = page_for(curator)
+    _add_button(_open_integrations(page)).click()
+    form = _source_form(page, "Add Knowledge Connection")
+    form.get_by_label("Provider").select_option("milvus")
+    expect(form.get_by_label("Content Field")).to_have_value("data.text")
+    expect(form.get_by_label("Vector Field")).to_have_value("vector")
+    expect(form.get_by_label("Metadata Field")).to_have_value("metadata")
+    form.get_by_label("Name", exact=True).fill(name)
+    form.get_by_label("Endpoint").fill(endpoint)
+    form.get_by_label("API Key / Token").fill(MILVUS_TOKEN)
+    form.get_by_label("Database").fill("harbour")
+    form.get_by_label("Collection").fill(collection)
+    form.get_by_label("Test Query").fill(FUEL_QUESTION)
+    expect(form.get_by_role("button", name="Create")).to_be_disabled()
+
+    form.get_by_role("button", name="Verify Connection").click()
+    expect(page.get_by_text("Test succeeded.").first).to_be_visible()
+    form.get_by_role("button", name="Create").click()
+    expect(page.get_by_text("Knowledge source created.").first).to_be_visible()
+
+    settings = _open_integrations(page)
+    expect(settings.get_by_text(name)).to_be_visible()
+    expect(settings.get_by_text(f"milvus · {collection}")).to_be_visible()
+    # the button test and the create each search Milvus, on the vector column
+    assert [search[1:3] for search in searches_of(milvus_service, collection)] == [
+        ("vector", 5),
+        ("vector", 5),
+    ]
+    assert any(call.get("dbname") == "harbour" for call in milvus_service.call_metadata)
+    with curator.client() as client:
+        [saved] = [
+            connection
+            for connection in client.get(CONNECTIONS).json()["items"]
+            if connection["endpoint"] == endpoint
+        ]
+    assert saved["provider"] == "milvus" and saved["config"]["db_name"] == "harbour"
+    assert saved["auth_configured"] is True
+
+
+def test_a_milvus_source_without_a_vector_field_is_not_tried(page_for, curator, milvus_service):
+    collection = "fuel_docs"
+    endpoint = serve_milvus(milvus_service, collection, MILVUS_ROWS)["endpoint"]
+    page = page_for(curator)
+    _add_button(_open_integrations(page)).click()
+    form = _source_form(page, "Add Knowledge Connection")
+    form.get_by_label("Provider").select_option("milvus")
+    form.get_by_label("Name", exact=True).fill(f"Fuel dock {uuid.uuid4().hex[:6]}")
+    form.get_by_label("Endpoint").fill(endpoint)
+    form.get_by_label("Collection").fill(collection)
+    form.get_by_label("Test Query").fill(FUEL_QUESTION)
+    form.get_by_label("Vector Field").fill("")
+
+    form.get_by_role("button", name="Verify Connection").click()
+
+    expect(page.get_by_text("Fill the source fields and test query first.").first).to_be_visible()
+    expect(form.get_by_role("button", name="Create")).to_be_disabled()
+    assert searches_of(milvus_service, collection) == []
+
+
+def test_a_chat_with_the_milvus_source_attached_is_sent_the_rows_milvus_found(
+    page_for, curator, milvus_service, upstream
+):
+    collection = "fuel_docs"
+    name = f"Fuelquay {uuid.uuid4().hex[:6]}"
+    form_data = serve_milvus(milvus_service, collection, MILVUS_ROWS)
+    upstream.queue(reply.text("Cards only.", match=reply.answering(FUEL_QUESTION)))
+    page = page_for(curator)
+    with (
+        curator.client() as client,
+        external_connection(client, form_data) as connection_id,
+        external_knowledge_base(client, connection_id, collection, name, MILVUS_SOURCE_CONFIG),
+    ):
+        page.goto("/")
+        chat_input(page).click()
+        page.keyboard.type("#Fuelquay")
+        page.get_by_role("tooltip").get_by_role("button", name=name).click()
+        send(page, FUEL_QUESTION)
+        expect_reply(page, "Cards only.")
+
+    assert [search[1] for search in searches_of(milvus_service, collection)] == ["vector"]
+    [chat_request] = [
+        body for body in upstream.chat_requests() if reply.answering(FUEL_QUESTION)(body)
+    ]
+    sent = json.dumps(chat_request["messages"])
+    assert "The fuel dock takes cards only." in sent
+    assert "The chandlery opens at six." in sent
