@@ -10,8 +10,8 @@ Files" posts with the message and the other member sees it on the message and ca
 content.
 
 Two tests stay red on dev 176d31d1d for open bugs, each named in its docstring: the toast shows
-the raw mention markup, and a message sent while its file still uploads posts a file nobody can
-open.
+the raw mention markup, and a message sent while its file still uploads is posted with a file
+nobody can open instead of being held back (open-webui/open-webui#31587).
 
 Discriminates: passes on dev 176d31d1d; in a frontend copy, a picker that drops the mention type
 turns the person and thread model tests red, a toast that goes nowhere on click turns the person
@@ -53,7 +53,8 @@ def _open_channel(page_for, account, channel_id: str) -> Page:
 
 
 def _message(page: Page, text: str) -> Locator:
-    return page.locator("[id^='message-']").filter(has_text=text).first
+    posted = page.locator("[id^='message-']:not(#message-input-container)")
+    return posted.filter(has_text=text).first
 
 
 def _mention(page: Page, query: str, label: str) -> None:
@@ -215,11 +216,15 @@ def test_a_file_sent_with_a_message_reaches_the_other_member(people, page_for):
     assert _attached_content(member, channel_id) == ["Ana, Ben and Cleo"]
 
 
-def test_a_message_sent_while_its_file_uploads_still_carries_the_file(people, page_for):
-    """Red on 176d31d1d: the channel input posts the file before the upload has given it an id.
+def test_a_message_cannot_be_sent_while_its_file_uploads_and_carries_the_file_after(
+    people, page_for
+):
+    """Red on 176d31d1d for open-webui/open-webui#31587: a message sent during an upload is posted.
 
-    The chat input holds a message back until its uploads finish; the channel input sends at
-    once, so the stored file has no id and nobody can open it.
+    The chat input holds a message back until its uploads finish; the channel input posts at
+    once, so the stored file has no id and nobody can open it. Expected: Enter during the upload
+    shows "Please wait until all files are uploaded." and posts nothing; once the upload is done
+    Enter posts the message and the other member downloads the file.
     """
     sender, member, channel_id = people
     page = _open_channel(page_for, sender, channel_id)
@@ -228,10 +233,18 @@ def test_a_message_sent_while_its_file_uploads_still_carries_the_file(people, pa
 
     _attach(page, "tide-table.txt", "low tide at six")
     _send(page, "tide table attached")
-    expect(_message(page, "tide table attached")).to_be_visible()
+
+    expect(
+        page.get_by_text("Please wait until all files are uploaded."),
+        "#31587: sending during an upload must be blocked with a toast",
+    ).to_be_visible()
+    assert _stored(sender, channel_id) == [], "#31587: a message was posted during the upload"
     for upload in held_uploads:
         upload.continue_()
+    expect(page.locator("#message-input-container .spinner_ajPY")).to_have_count(0)
+    page.keyboard.press("Enter")
 
+    expect(_message(page, "tide table attached")).to_be_visible()
     member_page = _open_channel(page_for, member, channel_id)
     on_member = _message(member_page, "tide table attached")
     expect(on_member.get_by_text("tide-table.txt")).to_be_visible()
