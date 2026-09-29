@@ -13,20 +13,19 @@ says (and listing a connection whatever its own switch says) turns the three swi
 
 from __future__ import annotations
 
-import re
 import uuid
 
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import expect
 
 from harness import upstream as reply
 from harness.browser_provider import serve
 from utils.chat_ui import chat_input, conversation, expect_reply, send
+from utils.model_selector import model_options, select_model
 from utils.personal_connections import add_connection_form, open_personal_connections
 
 pytestmark = [pytest.mark.journey, pytest.mark.requires_browser, pytest.mark.requires_source]
 
-SELECTOR_BUTTON = re.compile("Select a model|Selected model")
 CONNECTIONS_CONFIG = ("/api/v1/configs/connections", "/api/v1/configs/connections")
 
 
@@ -48,20 +47,6 @@ def save_connections(account, url: str, key: str = "", enabled: bool = True) -> 
         client.post(
             "/api/v1/users/user/settings/update", json={"ui": {"directConnections": connections}}
         ).raise_for_status()
-
-
-def model_options(page: Page, name: str) -> Locator:
-    search = page.get_by_role("textbox", name="Search In Models")
-    if not search.is_visible():
-        page.get_by_role("button", name=SELECTOR_BUTTON).click()
-    search.fill(name)
-    return page.get_by_role("listbox", name="Available models").get_by_role(
-        "option", name=f"Select {name} model"
-    )
-
-
-def select_model(page: Page, name: str) -> None:
-    model_options(page, name).click()
 
 
 @pytest.fixture
