@@ -113,6 +113,7 @@ def test_choosing_pgvector_swaps_the_api_key_for_the_table_fields(page_for, cura
     expect(form.get_by_role("button", name="Create")).to_be_disabled()
 
 
+@pytest.mark.requires_postgres
 def test_a_source_is_added_once_its_test_query_finds_rows_and_survives_a_reload(
     page_for, curator, source_form
 ):
@@ -139,6 +140,7 @@ def test_a_source_is_added_once_its_test_query_finds_rows_and_survives_a_reload(
     assert saved["provider"] == "pgvector" and saved["enabled"] is True
 
 
+@pytest.mark.requires_postgres
 def test_a_source_whose_collection_holds_no_rows_cannot_be_created(page_for, curator, source_form):
     page = page_for(curator)
     form = _open_new_pgvector_form(page)
@@ -152,6 +154,7 @@ def test_a_source_whose_collection_holds_no_rows_cannot_be_created(page_for, cur
     expect(form.get_by_role("button", name="Create")).to_be_disabled()
 
 
+@pytest.mark.requires_postgres
 def test_a_chat_with_the_source_attached_is_sent_the_nearest_rows_of_its_collection(
     page_for, curator, source_form, upstream
 ):

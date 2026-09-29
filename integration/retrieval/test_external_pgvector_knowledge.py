@@ -10,15 +10,18 @@ credentials of its own (they belong in the database URL) and the source needs a 
 Discriminates: red on dev 176d31d1d, where the query embedding reaches Postgres as a float array
 and every search fails (open-webui/open-webui#26663, fix in #31112); the search tests pass once it
 is sent as a vector. In a backend copy with that fixed, filtering on the other collections turns
-the three search tests red (their rows come back), ordering by descending distance turns the two
-route tests red, keeping the key of a pgvector connection turns the credentials test red and
-dropping the vector field check turns the last test red.
+the unsaved-connection and chat tests red (the other rows come back), ordering by descending
+distance turns the two route tests red, keeping the key of a pgvector connection turns the
+credentials test red, dropping the vector field check turns the refusal test red, accepting any
+character in a table name turns the odd-name test red and reading a schema-qualified name as one
+identifier turns the schema test red.
 """
 
 from __future__ import annotations
 
 import json
 
+import psycopg
 import pytest
 
 from harness import upstream as reply
@@ -30,7 +33,12 @@ from harness.external_knowledge import (
 )
 from harness.pgvector_source import COLLECTION, SOURCE_CONFIG, chunk, serving_pgvector
 
-pytestmark = [pytest.mark.journey, pytest.mark.api, pytest.mark.requires_source]
+pytestmark = [
+    pytest.mark.journey,
+    pytest.mark.api,
+    pytest.mark.requires_source,
+    pytest.mark.requires_postgres,
+]
 
 CHUNKS = [
     chunk("far", "Moorings are inspected every May.", [0.3, 0.2, 0.1], source="moorings.md"),
@@ -54,6 +62,15 @@ NEAREST_FIRST = [
 def source_form():
     with serving_pgvector(CHUNKS) as form:
         yield form
+
+
+@pytest.fixture
+def table_copies(source_form):
+    """The rows again in another schema and in a table whose name is not a plain identifier."""
+    with psycopg.connect(source_form["endpoint"], autocommit=True) as conn:
+        conn.execute("CREATE SCHEMA harbour")
+        conn.execute("CREATE TABLE harbour.document_chunk AS TABLE document_chunk")
+        conn.execute('CREATE TABLE "odd-table" AS TABLE document_chunk')
 
 
 @pytest.fixture
@@ -147,3 +164,32 @@ def test_a_source_without_a_vector_field_is_refused(admin, connection_id):
 
     assert refused.status_code == 400, refused.text
     assert "Vector field" in refused.text
+
+
+def _try_table(admin, source_form, table_name):
+    config = {**SOURCE_CONFIG, "table_name": table_name}
+    with admin.client() as client:
+        return client.post(
+            "/api/v1/knowledge/external/source/test",
+            json={
+                "connection": source_form,
+                "source": {"name": COLLECTION, "config": config},
+                "query": "where are the tide tables",
+                "count": 5,
+            },
+        )
+
+
+def test_a_table_in_another_schema_is_searched(admin, source_form, table_copies):
+    tried = _try_table(admin, source_form, "harbour.document_chunk")
+
+    assert tried.status_code == 200, tried.text
+    assert tried.json()["documents"] == NEAREST_FIRST
+
+
+def test_a_table_whose_name_is_not_a_plain_identifier_is_not_searched(
+    admin, source_form, table_copies
+):
+    tried = _try_table(admin, source_form, "odd-table")
+
+    assert tried.status_code >= 400, "a table with a hyphen in its name was searched"
