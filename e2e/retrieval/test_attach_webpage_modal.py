@@ -3,12 +3,14 @@
 The plus menu offers Attach Webpage; the modal takes one link per line, refuses text that is not
 an http(s) link, and the page behind each link is fetched by the server and shown in the composer
 as an attachment named by its link. The text of the page reaches the model with the next message,
-and a page the server cannot read is refused with a toast and leaves no attachment. The pages are
-a local service, on an instance that may fetch loopback addresses.
+and a page the server cannot read is refused with a toast and leaves no attachment. Without the web
+upload permission the menu entry does nothing for a user and still opens for an admin. The pages
+are a local service, on an instance that may fetch loopback addresses.
 
 Discriminates: passes on the 176d31d1d build; with the link validation removed the refused-text
-test goes red, with the de-duplication removed the several-links test does, and with the handoff to
-the chat or the modal's close button removed the attachment, refusal and close tests do.
+test goes red, with the de-duplication removed the several-links test does, with the handoff to
+the chat or the modal's close button removed the attachment, refusal and close tests do, and with
+the permission check removed from the menu entry the no-permission test does.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from harness import upstream as reply
-from harness.actors import create_user
+from harness.actors import admin_of, create_user
 from harness.listener import listening, text_answer
 from harness.web_retrieval import LOCAL_WEB_FETCH
 from utils.chat_ui import chat_input, expect_reply, send
@@ -30,6 +32,7 @@ pytestmark = [
 ]
 
 REFUSED = "Could not read content from"
+NO_WEB_UPLOAD = {**LOCAL_WEB_FETCH, "USER_PERMISSIONS_CHAT_WEB_UPLOAD": "False"}
 
 
 @pytest.fixture(scope="module")
@@ -43,6 +46,14 @@ def pages():
 @pytest.fixture
 def fetching_instance(instance_with):
     launched = instance_with(LOCAL_WEB_FETCH)
+    if not launched.serves_frontend:
+        pytest.skip("no built frontend (set OPEN_WEBUI_BUILD_DIR)")
+    return launched
+
+
+@pytest.fixture
+def restricted_instance(instance_with):
+    launched = instance_with(NO_WEB_UPLOAD)
     if not launched.serves_frontend:
         pytest.skip("no built frontend (set OPEN_WEBUI_BUILD_DIR)")
     return launched
@@ -147,3 +158,23 @@ def test_the_modal_closes_without_attaching_anything(page_for, fetching_instance
 
     expect(page.get_by_role("textbox", name="Webpage URLs")).to_have_count(0)
     expect(page.get_by_text(link(pages, "/tides"))).to_have_count(0)
+
+
+def test_a_user_without_the_web_upload_permission_cannot_open_the_modal(
+    page_for, restricted_instance
+):
+    page = open_chat(page_for, restricted_instance)
+    expect(chat_input(page)).to_be_visible(timeout=30_000)
+    page.get_by_role("button", name="More", exact=True).last.click()
+
+    page.get_by_role("button", name="Attach Webpage").hover()
+
+    expect(page.get_by_text("You do not have permission to upload web content.")).to_be_visible()
+    page.get_by_role("button", name="Attach Webpage").click()
+    expect(page.get_by_role("textbox", name="Webpage URLs")).to_have_count(0)
+
+
+def test_an_admin_can_open_the_modal_where_web_upload_is_off_by_default(
+    page_for, restricted_instance
+):
+    open_modal(page_for(admin_of(restricted_instance)))
