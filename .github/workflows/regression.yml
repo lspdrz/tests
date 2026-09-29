@@ -329,8 +329,11 @@ jobs:
             open-webui/backend/requirements.txt
             tests/pyproject.toml
 
+      # The instances that share a Redis start a redis-server of their own.
       - name: Install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
           uv pip install --system 'torch<=2.9.1' --index-url https://download.pytorch.org/whl/cpu
           uv pip install --system -r open-webui/backend/requirements.txt
           uv pip install --system -e ./tests
