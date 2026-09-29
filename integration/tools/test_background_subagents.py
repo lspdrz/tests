@@ -10,17 +10,22 @@ background switch off turns the call into an ordinary one, and neither the concu
 a second chat holds a background sub-agent back or mixes the reports. Stopping a sub-agent
 through its task lists it as interrupted and a failing one as failed.
 
+The chat's stored current message follows the report's follow-up reply, which the open page
+reads when the server tells it to reload; on dev it keeps pointing at the earlier reply, so the
+page shows neither the report nor the follow-up until it is reloaded. That test stays red until
+the current message is set when the report is stored.
+
 A report that comes while the answer to a later question is still written is attached to the
 answer before it and hides that question (open-webui/open-webui#31507, fix PR #31557); that
 test stays red until the fix merges.
 
-Discriminates: passes on dev 176d31d1d apart from the test named above, which fails there. In
+Discriminates: passes on dev 176d31d1d apart from the two tests named above, which fail there. In
 backend copies each test turns red with its edit: the dispatch made to wait for the sub-agent,
 the sub-agent left out of the running tasks, the report not stored, stored without its metadata
 or under the wrong reply, the report never continuing the chat, a pending report dropped, the
-cap ignored, never released or applied to the unlimited setting, the switch ignored, the stop not
-reaching the task, the failure not reported, the concurrent limit applied to background work
-and the parent's id mixed up between chats.
+cap ignored, never released, applied to the unlimited setting or to a limit of zero, the switch
+ignored, the stop not reaching the task, the failure not reported, the concurrent limit applied
+to background work and the parent's id mixed up between chats.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ pytestmark = [pytest.mark.journey, pytest.mark.api, pytest.mark.requires_source]
 
 SUBAGENTS = ("/api/v1/configs/subagents", "/api/v1/configs/subagents")
 SLOW_SECONDS = 3.0
+HELD_SECONDS = 8.0
 CONCURRENT_ENV = {
     "ENABLE_SUBAGENTS": "true",
     "SUBAGENTS_BACKGROUND_ENABLED": "true",
@@ -230,6 +236,39 @@ def test_a_report_that_arrives_while_the_reply_is_written_waits_for_it(
     assert len([r for r in upstream.chat_requests() if report_of(task)(r)]) == 1
 
 
+def test_the_stored_chat_points_at_the_follow_up_while_it_is_written(
+    background_on, make_user, upstream
+):
+    """The open page follows the current message the chat stores when told to reload."""
+    background_on()
+    prompt, task = unique("hand this over"), unique("look it up")
+    upstream.queue(
+        dispatch(task, prompt),
+        reply.text("found it", match=reply.answering(task)),
+        reply.text("Handed over.", match=reply.answering(prompt)),
+        reply.text("Looked up.", delay=SLOW_SECONDS, match=report_of(task)),
+    )
+    with make_user().client() as client:
+        turn, _ = ask(client, prompt)
+        wait_for_message(
+            client,
+            turn.chat_id,
+            lambda message: (
+                (message.get("meta") or {}).get("type") == "subagent"
+                and bool(message["childrenIds"])
+            ),
+        )
+        stored = client.get(f"/api/v1/chats/{turn.chat_id}").json()
+        wait_for_message(client, turn.chat_id, finished_reply("Looked up."))
+
+    history = stored["chat"]["history"]
+    assert history["messages"][history["currentId"]]["role"] == "assistant"
+    assert stored["current_message_id"] == history["currentId"], (
+        "the chat's current message still points at the earlier reply, so the open page keeps "
+        "showing it instead of the report and the follow-up"
+    )
+
+
 def test_a_report_that_arrives_before_a_later_answer_ends_follows_the_answer_that_dispatched_it(
     background_on, make_user, upstream
 ):
@@ -342,6 +381,25 @@ def test_an_unlimited_background_setting_lets_every_delegation_through(
     assert [handle["status"] for handle in dispatch_handles(stored)] == ["dispatched"] * 3
 
 
+def test_a_background_limit_of_zero_means_the_default_and_refuses_nothing(
+    background_on, make_user, upstream
+):
+    background_on(SUBAGENTS_MAX_ASYNC=0)
+    prompt = unique("split this up")
+    tasks = [unique("first errand"), unique("second errand")]
+    upstream.queue(
+        two_dispatches(tasks, prompt),
+        *[reply.text("done", delay=SLOW_SECONDS, match=reply.answering(task)) for task in tasks],
+        reply.text("Two sent off.", match=reply.answering(prompt)),
+    )
+    with make_user().client() as client:
+        _, stored = ask(client, prompt)
+
+    outputs = tool_outputs(stored)
+    assert len(outputs) == 2
+    assert all('"status": "dispatched"' in text for text in outputs), outputs
+
+
 def test_a_background_call_while_background_sub_agents_are_off_runs_as_an_ordinary_delegation(
     background_on, make_user, upstream
 ):
@@ -449,12 +507,13 @@ def test_a_concurrent_limit_of_one_does_not_hold_background_subagents_back(insta
     tasks = [unique("first errand"), unique("second errand")]
     upstream.queue(
         two_dispatches(tasks, prompt),
-        *[reply.text("Done.", delay=SLOW_SECONDS, match=reply.answering(t)) for t in tasks],
+        *[reply.text("Done.", delay=HELD_SECONDS, match=reply.answering(t)) for t in tasks],
         reply.text("Both sent off.", match=reply.answering(prompt)),
     )
     with create_user(launched).client() as client:
         turn = send_message(client, prompt)
-        deadline = time.monotonic() + 30
+        # under a limit of one the second would only start once the first had ended
+        deadline = time.monotonic() + HELD_SECONDS / 2
         started: list[dict] = []
         while time.monotonic() < deadline and len(started) < 2:
             started = [
