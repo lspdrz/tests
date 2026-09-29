@@ -2,10 +2,20 @@
 
 A fresh admin (plain accounts need the automations permission) creates a daily automation with a
 prompt and the scripted model, lands on its page, and presses Run now. The run is listed under
-Runs, and its chat holds the prompt and the model's answer.
+Runs, and its chat holds the prompt and the model's answer. Every further run joins the history
+with its own chat, and a run whose model no longer exists is listed with the error it failed on
+and no chat.
+
+Bug, no upstream issue yet: a Run now run never sets the automation's last run time, so after
+it the page still says "Last run Never" above the run it lists (the list page says "Never" as
+well). Only the scheduler's own claim writes that time. `test_a_manual_run_shows_as_the_last_run`
+stays red until it is fixed.
 
 Discriminates: passes on dev ac00d40e3; in a backend copy, with `POST /api/v1/automations/{id}/run`
-answering without starting the run no run is ever listed.
+answering without starting the run no run is ever listed. On dev 176d31d1d a frontend copy
+keeping only the newest run turns the history test red, and one hiding a run's error turns the
+failed run test red; a backend copy writing the last run time with every recorded run turns the
+last run test green.
 """
 
 from __future__ import annotations
@@ -14,7 +24,7 @@ import re
 import uuid
 
 import pytest
-from playwright.sync_api import expect
+from playwright.sync_api import Page, expect
 
 from harness import upstream as reply
 from utils.chat_ui import conversation, expect_reply
@@ -22,16 +32,6 @@ from utils.chat_ui import conversation, expect_reply
 pytestmark = [pytest.mark.journey, pytest.mark.requires_browser, pytest.mark.requires_source]
 
 RUN_TIMEOUT_MS = 30_000
-
-
-@pytest.fixture
-def scheduler(make_user):
-    """A fresh admin, whose automations are deleted afterwards so none runs on its own later."""
-    account = make_user(role="admin")
-    yield account
-    with account.client() as client:
-        for automation in client.get("/api/v1/automations/list").json().get("items", []):
-            client.delete(f"/api/v1/automations/{automation['id']}/delete")
 
 
 def test_run_now_lists_a_run_whose_chat_holds_the_answer(page_for, scheduler, upstream):
@@ -65,3 +65,67 @@ def test_run_now_lists_a_run_whose_chat_holds_the_answer(page_for, scheduler, up
     expect(page).to_have_url(re.compile(r"/c/[0-9a-f-]+$"))
     expect(conversation(page).get_by_text(prompt)).to_be_visible()
     expect_reply(page, "Three tickets came in overnight.")
+
+
+def _run_now(page: Page) -> None:
+    triggered = page.get_by_text("Automation triggered")
+    # the previous run's toast covers the button and stays while the pointer rests on it
+    page.mouse.move(0, 0)
+    expect(triggered).to_be_hidden(timeout=RUN_TIMEOUT_MS)
+    page.get_by_role("button", name="Run now").click()
+    expect(triggered).to_be_visible()
+
+
+def test_the_run_history_lists_every_run_with_its_chat(
+    page_for, scheduler, make_automation, upstream
+):
+    automation = make_automation(scheduler)
+    prompt = automation["data"]["prompt"]
+    upstream.queue(
+        reply.text("First report.", match=reply.answering(prompt)),
+        reply.text("Second report.", match=reply.answering(prompt)),
+    )
+    page = page_for(scheduler)
+    page.goto(f"/automations/{automation['id']}")
+    details = page.get_by_role("main")
+    expect(details).to_contain_text("No runs yet")
+
+    view_chat = details.get_by_role("button", name="View chat")
+    _run_now(page)
+    expect(view_chat).to_have_count(1, timeout=RUN_TIMEOUT_MS)
+    _run_now(page)
+    expect(view_chat).to_have_count(2, timeout=RUN_TIMEOUT_MS)
+
+    page.reload()
+    expect(view_chat).to_have_count(2)
+
+
+def test_a_run_whose_model_is_gone_is_listed_as_failed(page_for, scheduler, make_automation):
+    automation = make_automation(scheduler, model_id=f"retired-{uuid.uuid4().hex[:6]}")
+    page = page_for(scheduler)
+    page.goto(f"/automations/{automation['id']}")
+    details = page.get_by_role("main")
+    expect(details).to_contain_text("No runs yet")
+
+    _run_now(page)
+    expect(details.get_by_text("Model not found")).to_be_visible(timeout=RUN_TIMEOUT_MS)
+    expect(details.get_by_role("button", name="View chat")).to_have_count(0)
+
+
+def test_a_manual_run_shows_as_the_last_run(page_for, scheduler, make_automation, upstream):
+    automation = make_automation(scheduler)
+    prompt = automation["data"]["prompt"]
+    upstream.queue(reply.text("The report.", match=reply.answering(prompt)))
+    page = page_for(scheduler)
+    page.goto(f"/automations/{automation['id']}")
+    details = page.get_by_role("main")
+    expect(details).to_contain_text("Last run Never")
+
+    _run_now(page)
+    expect(details.get_by_role("button", name="View chat")).to_be_visible(timeout=RUN_TIMEOUT_MS)
+    page.reload()
+    expect(details.get_by_role("button", name="View chat")).to_be_visible()
+
+    expect(
+        details, "the automation page says it never ran while its run history lists a run"
+    ).not_to_contain_text("Last run Never")
