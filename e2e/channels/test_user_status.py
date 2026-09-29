@@ -3,16 +3,22 @@
 The user menu offers "Update your status", a dialog with an emoji picker and a message. Once saved
 the menu shows the status with a clear button. Another account sees it on the person's profile
 card in a channel and beside the person's name in the sidebar's direct message entry; after the
-person clears it, the menu offers to set one again and the other account sees neither.
+person clears it, the menu offers to set one again and the other account sees neither. A status
+whose expiry has passed is not shown to the other account any more. That last test stays red: the
+server stores `status_expires_at` and the sidebar never compares it with the time, so the status
+stays for good (the dialog offers no expiry, so it can only be set through the API).
 
-Discriminates: passes on dev 176d31d1d; in a frontend copy, sending an empty message from the
-dialog turns the save, card and sidebar tests red, hiding the status in the direct message entry
-turns the sidebar test red, leaving the message out of the profile card turns the card test red,
-sending the old values on clear turns the clear test red, and offering the status row whatever
-the admin setting turns the switched-off test red.
+Discriminates: passes on dev 176d31d1d except the expiry test; in a frontend copy, sending an empty
+message from the dialog turns the save, card and sidebar tests red, hiding the status in the direct
+message entry turns the sidebar test red, leaving the message out of the profile card turns the card
+test red, sending the old values on clear turns the clear test red, and offering the status row
+whatever the admin setting turns the switched-off test red. Hiding a status whose expiry has passed
+in the direct message entry turns the expiry test green.
 """
 
 from __future__ import annotations
+
+import time
 
 import pytest
 from playwright.sync_api import Locator, Page, expect
@@ -43,6 +49,7 @@ def _set_status(page: Page, message: str) -> None:
     _open_user_menu(page)
     page.get_by_role("button", name="Update your status").click()
     dialog = page.get_by_role("dialog")
+    # the emoji picker button has no name; it is the dialog's second button after Close
     dialog.get_by_role("button").nth(1).click()
     page.get_by_placeholder("Search all emojis").click()
     page.keyboard.type("rocket")
@@ -50,6 +57,19 @@ def _set_status(page: Page, message: str) -> None:
     dialog.get_by_placeholder("What's on your mind?").fill(message)
     dialog.get_by_role("button", name="Save").click()
     expect(page.get_by_text("Status updated successfully")).to_be_visible()
+
+
+def _set_status_through_api(actor, message: str, expires_at: int) -> None:
+    # the status dialog has no expiry control, so this is the only way to store one
+    with actor.client() as client:
+        client.post(
+            "/api/v1/users/user/status/update",
+            json={
+                "status_emoji": "rocket",
+                "status_message": message,
+                "status_expires_at": expires_at,
+            },
+        ).raise_for_status()
 
 
 def _stored_status(actor) -> tuple[str | None, str | None]:
@@ -145,3 +165,25 @@ def test_the_user_menu_offers_no_status_while_user_status_is_off(admin, people, 
 
     expect(page.get_by_role("menu").get_by_role("button", name="Settings")).to_be_visible()
     expect(page.get_by_role("button", name="Update your status")).to_have_count(0)
+
+
+def test_a_status_that_has_not_expired_yet_is_shown_beside_the_direct_message(people, page_for):
+    person, viewer = people
+    _open_direct_message(person, viewer)
+    # in milliseconds, so it lies ahead whichever unit the page reads
+    _set_status_through_api(person, STATUS, (int(time.time()) + 3600) * 1000)
+
+    entry = _direct_message_entry(page_for(viewer), person.name)
+
+    expect(entry.get_by_text(STATUS)).to_be_visible()
+
+
+def test_a_status_whose_expiry_has_passed_is_not_shown_beside_the_direct_message(people, page_for):
+    person, viewer = people
+    _open_direct_message(person, viewer)
+    _set_status_through_api(person, STATUS, int(time.time()) - 3600)
+
+    entry = _direct_message_entry(page_for(viewer), person.name)
+
+    expect(entry).to_be_visible()
+    expect(entry.get_by_text(STATUS)).to_have_count(0)
