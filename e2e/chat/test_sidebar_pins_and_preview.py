@@ -14,6 +14,7 @@ no messages and the preview ignoring the hover-preview setting.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 
@@ -28,6 +29,9 @@ from utils.chat_ui import chat_input, expect_reply, send
 from utils.tooltips import tooltip_button
 
 pytestmark = [pytest.mark.journey, pytest.mark.requires_browser, pytest.mark.requires_source]
+
+
+PINNED_MODEL_SYSTEM_PROMPT = "You are the pinned model."
 
 
 def _unique(prefix: str) -> str:
@@ -65,7 +69,7 @@ def pinned_model(make_user) -> tuple[Actor, str]:
                 "name": model_id,
                 "base_model_id": MOCK_MODEL_ID,
                 "meta": {},
-                "params": {},
+                "params": {"system": PINNED_MODEL_SYSTEM_PROMPT},
             },
         )
         assert created.status_code == 200, created.text
@@ -89,7 +93,7 @@ def test_a_pinned_model_opens_a_chat_with_that_model(page_for, pinned_model, ups
     send(page, prompt)
     expect_reply(page, "answered by the pin")
     sent = [body for body in upstream.chat_requests() if reply.answering(prompt)(body)]
-    assert sent[-1]["model"] == MOCK_MODEL_ID
+    assert PINNED_MODEL_SYSTEM_PROMPT in json.dumps(sent[-1]["messages"])
 
 
 def test_shift_hover_unpins_a_model_for_good(page_for, pinned_model):
