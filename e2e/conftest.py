@@ -87,8 +87,12 @@ def admin_token(admin: Actor) -> str:
     return admin.token
 
 
-def _new_context(browser: Browser, config: AppConfig, base_url: str) -> BrowserContext:
-    context = browser.new_context(viewport={"width": 1920, "height": 1080}, base_url=base_url)
+def _new_context(
+    browser: Browser, config: AppConfig, base_url: str, **context_options
+) -> BrowserContext:
+    context = browser.new_context(
+        viewport={"width": 1920, "height": 1080}, base_url=base_url, **context_options
+    )
     context.set_default_timeout(config.default_timeout)
     context.set_default_navigation_timeout(config.navigation_timeout)
     context.tracing.start(screenshots=True, snapshots=True)
@@ -135,12 +139,15 @@ def _signed_in_page(context: BrowserContext, token: str) -> Page:
 def page_for(
     browser: Browser, config: AppConfig, request: pytest.FixtureRequest
 ) -> Generator[Callable[[Actor], Page], None, None]:
-    """`page_for(actor)` opens a signed-in page on the actor's instance, in a browser of its own."""
+    """`page_for(actor)` opens a signed-in page on the actor's instance, in a browser of its own.
+
+    Further keywords go to the browser context, such as `timezone_id` for a browser in another zone.
+    """
     opened: list[BrowserContext] = []
 
-    def open_page(actor: Actor) -> Page:
+    def open_page(actor: Actor, **context_options) -> Page:
         _dismiss_first_run_modals(actor)
-        browser_context = _new_context(browser, config, actor.base_url)
+        browser_context = _new_context(browser, config, actor.base_url, **context_options)
         opened.append(browser_context)
         return _signed_in_page(browser_context, actor.token)
 
