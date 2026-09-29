@@ -145,8 +145,7 @@ def test_a_writer_in_a_shared_group_edits_the_note(page_for, make_user, admin):
     expect(page.get_by_role("main").get_by_text("Read-Only Access")).to_have_count(0)
     editor.click()
     page.keyboard.press("End")
-    # at a person's pace: a faster burst can lose its last save on the server
-    page.keyboard.type(" with sunscreen", delay=60)
+    page.keyboard.type(" with sunscreen")
 
     _wait_until_stored(owner, note_id, "packing list with sunscreen")
 
