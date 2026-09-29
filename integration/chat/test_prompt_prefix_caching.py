@@ -9,20 +9,27 @@ only adds to the end, so the provider's prefix cache is never invalidated.
 Each test drives one chat through a feature family over several turns, the way the web client
 sends them, and checks every consecutive pair of requests the provider received, tool rounds
 included: plain turns, single and multi-step tool rounds, parallel tool calls, reasoning, the
-chat file tools, knowledge, the memory tools, unchanged memories kept in the system prompt,
-skills, a sub-agent, web search and fetch, an image a tool returned, time passing and a change
-to settings outside the prefix. The controls at the end take the breakers the page names
-(Citations on, File Context on, the memory system context with a memory changing, web search
-switched on mid-chat, an earlier message edited) and show the check goes red on each.
+chat file tools, knowledge bases, notes and chats attached to the chat, the model's knowledge,
+the memory tools, unchanged memories kept in the system prompt, skills, a sub-agent, a
+background sub-agent's report, a timer, web search and fetch, an image a tool returned, time
+passing and a change to settings outside the prefix. The controls at the end take the breakers
+the page names (Citations on, File Context on, the memory system context with a memory
+changing, web search switched on mid-chat, an earlier message edited) and show the check goes
+red on each.
 
-A model that calls a second tool straight after the first, with no text in between, has both
-calls folded into one assistant message on the next round, so the round rewrites the assistant
-message the previous request ended with. That test stays red.
+Three tests stay red. A model that calls a second tool straight after the first, with no text
+in between, has both calls folded into one assistant message on the next round, so that round
+rewrites the assistant message the previous request ended with. The turn a timer or a
+background sub-agent's report starts is sent the chat's finished system prompt as its own and
+has the model's system prompt and attached knowledge added to it again, so the system message
+changes on that turn and changes back on the next; issue open-webui/open-webui#31568 reports the
+same reuse for the sub-agent's own prompt.
 
-Discriminates: passes on dev 176d31d1d apart from the multi-step tool loop, which fails there.
-In backend copies, a clock value added to the model's system prompt and the tool list shuffled
-per request each turned all sixteen promise tests red; with each round's tool calls kept in an
-assistant message of their own, the multi-step test passed. The controls pass on all four.
+Discriminates: passes on dev 176d31d1d apart from those three, which fail there. In backend
+copies, a clock value added to the model's system prompt and the tool list shuffled per request
+each turned all nineteen promise tests red; with each round's tool calls kept in an assistant
+message of their own and no stored system prompt handed to a timer or report, all of them
+passed. The controls pass on all four.
 """
 
 from __future__ import annotations
@@ -36,6 +43,7 @@ import pytest
 from harness import upstream as reply
 from harness.actors import admin_of, create_user
 from harness.chat import ask
+from harness.knowledge_bases import add_text_file, knowledge_base
 from harness.listener import text_answer
 from harness.mcp_server import TOOL_SERVERS, mcp_connection, serving_mcp
 from harness.prompt_caching import (
@@ -61,6 +69,7 @@ pytestmark = [pytest.mark.journey, pytest.mark.api, pytest.mark.requires_source]
 CALL_NUMBERS = itertools.count(1)
 NOTES = ("berths.txt", "Berth 3 is reserved for the pilot boat.\nBerth 5 is free on Mondays.\n")
 SUBAGENTS = ("/api/v1/configs/subagents", "/api/v1/configs/subagents")
+TIMER_PROMPT = "Time to leave for the ferry."
 
 
 @pytest.fixture
@@ -78,6 +87,20 @@ def turn_on_memory_system_context(admin) -> None:
         current = client.get(ADMIN_CONFIG).json()
         saved = client.post(ADMIN_CONFIG, json={**current, "ENABLE_MEMORY_SYSTEM_CONTEXT": True})
     assert saved.status_code == 200, saved.text
+
+
+@pytest.fixture
+def subagents_on(admin, preserve):
+    """`subagents_on(**settings)` switches sub-agents and timers on for this test."""
+    preserve(SUBAGENTS)
+
+    def switch_on(**settings) -> None:
+        with admin.client() as client:
+            current = client.get(SUBAGENTS[0]).json()
+            body = {**current, "ENABLE_SUBAGENTS": True, **settings}
+            client.post(SUBAGENTS[1], json=body).raise_for_status()
+
+    return switch_on
 
 
 def calling(name: str, arguments: dict, **options) -> Reply:
@@ -147,6 +170,20 @@ def upload(client, name: str, text: str) -> dict:
         "size": len(text),
         "status": "uploaded",
     }
+
+
+def wait_for_answer_to(client, chat_id: str, prompt: str, timeout: float = 30.0) -> str:
+    """The id of the finished reply to the internal message that starts with `prompt`."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        messages = client.get(f"/api/v1/chats/{chat_id}").json()["chat"]["history"]["messages"]
+        for message in messages.values():
+            if message.get("role") == "user" and str(message.get("content")).startswith(prompt):
+                answer = messages.get((message.get("childrenIds") or [""])[0], {})
+                if answer.get("done"):
+                    return answer["id"]
+        time.sleep(0.3)
+    raise AssertionError(f"nothing ever answered {prompt!r} in the chat")
 
 
 def offered_tools(request: dict) -> set[str]:
@@ -314,6 +351,46 @@ def test_knowledge_tools_only_append(cached_setup, make_user, upstream):
     assert_append_only(chat.requests())
 
 
+def test_chat_attached_knowledge_notes_and_chats_only_append(cached_setup, make_user, upstream):
+    person = make_user(role="admin")  # a user may not create knowledge by default
+    with person.client() as client, knowledge_base(client, "Timetables") as knowledge_id:
+        add_text_file(client, knowledge_id, "buses.txt", "The harbour bus leaves at 07:15.\n")
+        note = client.post(
+            "/api/v1/notes/create",
+            json={"title": "Packing list", "data": {"content": {"md": "rain jacket, tickets"}}},
+        )
+        assert note.status_code == 200, note.text
+        earlier_chat, _ = ask(client, "an earlier trip", model=cached_setup.id)
+        attachments = [
+            {"type": "collection", "id": knowledge_id, "name": "Timetables"},
+            {"type": "note", "id": note.json()["id"], "name": "Packing list"},
+            {"type": "chat", "id": earlier_chat.chat_id, "name": "An earlier trip"},
+        ]
+        chat = Conversation(client, upstream, cached_setup.id, files=attachments)
+        chat.say(
+            "when does the bus leave?",
+            calling("query_knowledge_files", {"query": "bus"}),
+            reply.text("07:15 (buses.txt)."),
+            files=None,
+            chat_files=attachments,
+        )
+        chat.say(
+            "what should I pack?",
+            calling("view_note", {"note_id": note.json()["id"]}),
+            reply.text("A rain jacket."),
+        )
+        chat.say(
+            "what did we say last time?",
+            calling("view_chat", {"chat_id": earlier_chat.chat_id}),
+            reply.text("We talked about a trip."),
+        )
+
+    requests = chat.requests()
+    results = tool_results(requests[-1])
+    assert "07:15" in results and "rain jacket" in results and "earlier trip" in results, results
+    assert_append_only(requests)
+
+
 def test_memory_tools_only_append(cached_setup, make_user, upstream):
     with make_user().client() as client:
         chat = Conversation(client, upstream, cached_setup.id, features={"memory": True})
@@ -379,11 +456,8 @@ def test_skills_only_append(cached_setup, make_user, upstream):
     assert_append_only(chat.requests())
 
 
-def test_a_sub_agent_only_appends(cached_setup, make_user, admin, preserve, upstream):
-    preserve(SUBAGENTS)
-    with admin.client() as client:
-        current = client.get(SUBAGENTS[0]).json()
-        client.post(SUBAGENTS[1], json={**current, "ENABLE_SUBAGENTS": True}).raise_for_status()
+def test_a_sub_agent_only_appends(cached_setup, make_user, subagents_on, upstream):
+    subagents_on()
     with make_user().client() as client:
         chat = Conversation(client, upstream, cached_setup.id)
         chat.say("hello")
@@ -456,6 +530,58 @@ def test_a_tool_image_only_appends(cached_setup, admin, make_user, preserve, ups
         "the image never reached the model"
     )
     assert_append_only(chat.requests())
+
+
+def test_a_timer_only_appends(cached_setup, make_user, subagents_on, upstream):
+    subagents_on()
+    upstream.queue(reply.text("Time to go.", match=reply.answering(TIMER_PROMPT)))
+    with make_user().client() as client:
+        chat = Conversation(client, upstream, cached_setup.id)
+        chat.say(
+            "remind me to leave",
+            calling("timer", {"prompt": TIMER_PROMPT, "at": "2s"}),
+            reply.text("Timer set."),
+        )
+        chat.parent_id = wait_for_answer_to(client, chat.chat_id, TIMER_PROMPT)
+        chat.say("thanks")
+
+    requests = chat.requests()
+    assert reply.answering(TIMER_PROMPT)(requests[2]), "the timer's turn is not the third request"
+    broken = first_break(requests)
+    assert broken is None, (
+        "the turn a timer started was sent the chat's finished system prompt with the model's "
+        f"system prompt and attached knowledge added to it a second time: {broken}"
+    )
+
+
+def test_a_background_sub_agent_report_only_appends(
+    cached_setup, make_user, subagents_on, upstream
+):
+    subagents_on(SUBAGENTS_BACKGROUND_ENABLED=True)
+    task = f"find the ferry time {uuid.uuid4().hex[:6]}"
+    upstream.queue(
+        reply.text("It leaves at 06:40.", match=reply.answering(task)),
+        reply.text("The helper says 06:40.", match=reply.answering("[ASYNC SUBAGENT COMPLETE")),
+    )
+    with make_user().client() as client:
+        chat = Conversation(client, upstream, cached_setup.id)
+        chat.say(
+            "ask a helper about the ferry",
+            calling("delegate_task", {"task": task, "background": True}),
+            reply.text("A helper is on it."),
+        )
+        chat.parent_id = wait_for_answer_to(client, chat.chat_id, "[ASYNC SUBAGENT COMPLETE")
+        chat.say("thanks")
+
+    requests = chat.requests()
+    assert reply.answering("[ASYNC SUBAGENT COMPLETE")(requests[2]), [
+        str(request["messages"][-1])[:200] for request in requests
+    ]
+    broken = first_break(requests)
+    assert broken is None, (
+        "the turn a background sub-agent's report started was sent the chat's finished system "
+        f"prompt with the model's system prompt added to it a second time: {broken}"
+    )
 
 
 def test_time_passing_between_turns_changes_nothing(cached_setup, make_user, upstream):
