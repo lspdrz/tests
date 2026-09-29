@@ -512,7 +512,7 @@ def subagents_on(streaming, preserve):
         client.post(SUBAGENTS[1], json=settings).raise_for_status()
 
 
-def test_a_timer_fires_and_its_follow_up_streams_into_the_open_page(
+def test_a_timer_fires_and_its_whole_follow_up_shows_after_a_reload(
     subagents_on, chat_page, account, streaming
 ):
     pieces = [f"steeped-{index} " for index in range(8)]
@@ -532,7 +532,7 @@ def test_a_timer_fires_and_its_follow_up_streams_into_the_open_page(
     expect_whole_reply(chat_page, whole)
 
 
-def test_a_background_subagent_report_and_the_follow_up_reply_show_in_the_open_page(
+def test_a_background_subagent_report_and_its_follow_up_show_after_a_reload(
     subagents_on, chat_page, account, streaming
 ):
     findings = ["The ledger ", "is ", "balanced ", "for ", "March."]
