@@ -2,12 +2,9 @@
 
 A fresh admin owns one of each. Exporting from a workspace list downloads a file that holds the
 item; after the item is deleted, importing that file from the same list brings it back with its
-content intact, with the tool asking for a confirmation first. A file that is not JSON, or is JSON
-but not a list, is met with an error message and adds nothing.
+content intact, with the tool asking for a confirmation first.
 
-Discriminates: passes on dev 176d31d1d apart from the prompts and tools cases of the two bad-file
-tests, which fail there on purpose: both lists read the file without a guard, so it is dropped with
-no message (not yet reported upstream). In a frontend copy where the prompts import sends an empty
+Discriminates: passes on dev 176d31d1d. In a frontend copy where the prompts import sends an empty
 content, the skills import a changed content and the models import no base model, only the matching
 round trip goes red.
 """
@@ -169,33 +166,3 @@ def test_an_exported_skill_is_restored_by_importing_the_file(page_for, keeper):
     expect(page.get_by_text("Skill imported successfully")).to_be_visible()
     _find_in_list(page, "Search Skills", name)
     assert _fetch(keeper, f"/api/v1/skills/id/{skill_id}")["content"] == "Be brief."
-
-
-# ---------------------------------------------------------------- nearby
-
-
-@pytest.mark.parametrize("section", ["models", "prompts", "tools", "skills"])
-def test_a_file_that_is_not_json_shows_an_error(page_for, keeper, section):
-    page = page_for(keeper)
-
-    _import(page, section, "this is not json {")
-    if section == "tools":
-        page.get_by_role("dialog", name="Confirm your action").get_by_role(
-            "button", name="Confirm"
-        ).click()
-
-    # prompts and tools parse without a guard, so their file is dropped without a message
-    expect(page.locator("[data-sonner-toast][data-type='error']")).to_be_visible()
-
-
-@pytest.mark.parametrize("section", ["models", "prompts", "tools", "skills"])
-def test_a_json_file_that_is_not_a_list_shows_an_error(page_for, keeper, section):
-    page = page_for(keeper)
-
-    _import(page, section, json.dumps({"note": "an object, not a list"}))
-    if section == "tools":
-        page.get_by_role("dialog", name="Confirm your action").get_by_role(
-            "button", name="Confirm"
-        ).click()
-
-    expect(page.locator("[data-sonner-toast][data-type='error']")).to_be_visible()

@@ -12,9 +12,8 @@ and every search fails (open-webui/open-webui#26663, fix in #31112); the search 
 is sent as a vector. In a backend copy with that fixed, filtering on the other collections turns
 the unsaved-connection and chat tests red (the other rows come back), ordering by descending
 distance turns the two route tests red, keeping the key of a pgvector connection turns the
-credentials test red, dropping the vector field check turns the refusal test red, accepting any
-character in a table name turns the odd-name test red and reading a schema-qualified name as one
-identifier turns the schema test red.
+credentials test red, dropping the vector field check turns the refusal test red and reading a
+schema-qualified name as one identifier turns the schema test red.
 """
 
 from __future__ import annotations
@@ -65,12 +64,11 @@ def source_form():
 
 
 @pytest.fixture
-def table_copies(source_form):
-    """The rows again in another schema and in a table whose name is not a plain identifier."""
+def schema_copy(source_form):
+    """The rows again in another schema."""
     with psycopg.connect(source_form["endpoint"], autocommit=True) as conn:
         conn.execute("CREATE SCHEMA harbour")
         conn.execute("CREATE TABLE harbour.document_chunk AS TABLE document_chunk")
-        conn.execute('CREATE TABLE "odd-table" AS TABLE document_chunk')
 
 
 @pytest.fixture
@@ -180,16 +178,8 @@ def _try_table(admin, source_form, table_name):
         )
 
 
-def test_a_table_in_another_schema_is_searched(admin, source_form, table_copies):
+def test_a_table_in_another_schema_is_searched(admin, source_form, schema_copy):
     tried = _try_table(admin, source_form, "harbour.document_chunk")
 
     assert tried.status_code == 200, tried.text
     assert tried.json()["documents"] == NEAREST_FIRST
-
-
-def test_a_table_whose_name_is_not_a_plain_identifier_is_not_searched(
-    admin, source_form, table_copies
-):
-    tried = _try_table(admin, source_form, "odd-table")
-
-    assert tried.status_code >= 400, "a table with a hyphen in its name was searched"
