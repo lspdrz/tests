@@ -11,8 +11,9 @@ sends them, and checks every consecutive pair of requests the provider received,
 included: plain turns, single and multi-step tool rounds, parallel tool calls, reasoning, the
 chat file tools, knowledge bases, notes and chats attached to the chat, the model's knowledge,
 the memory tools, unchanged memories kept in the system prompt, skills, a sub-agent, a
-background sub-agent's report, a timer, web search and fetch, an image a tool returned, time
-passing and a change to settings outside the prefix. The controls at the end take the breakers
+background sub-agent's report, a timer, web search and fetch, an image a tool returned, a real
+Open Terminal connected from the first turn, time passing and a change to settings outside the
+prefix. The controls at the end take the breakers
 the page names (Citations on, File Context on, the memory system context with a memory
 changing, web search switched on mid-chat, an earlier message edited) and show the check goes
 red on each.
@@ -27,7 +28,7 @@ same reuse for the sub-agent's own prompt.
 
 Discriminates: passes on dev 176d31d1d apart from those three, which fail there. In backend
 copies, a clock value added to the model's system prompt and the tool list shuffled per request
-each turned all nineteen promise tests red; with each round's tool calls kept in an assistant
+each turned all twenty promise tests red; with each round's tool calls kept in an assistant
 message of their own and no stored system prompt handed to a timer or report, all of them
 passed. The controls pass on all four.
 """
@@ -55,7 +56,7 @@ from harness.prompt_caching import (
     turn_off_memory_system_context,
 )
 from harness.python_tools import EVERYONE_READS
-from harness.terminal_server import read_grant
+from harness.terminal_server import TERMINAL_SERVERS_CONFIG, configure_terminals, read_grant
 from harness.upstream import Reply
 from harness.web_retrieval import (
     LOCAL_WEB_FETCH,
@@ -582,6 +583,41 @@ def test_a_background_sub_agent_report_only_appends(
         "the turn a background sub-agent's report started was sent the chat's finished system "
         f"prompt with the model's system prompt added to it a second time: {broken}"
     )
+
+
+def test_an_open_terminal_only_appends(
+    cached_setup, admin, make_user, preserve, open_terminal, upstream
+):
+    preserve(TERMINAL_SERVERS_CONFIG)
+    person = make_user()
+    connection = open_terminal.connection(config={"access_grants": [read_grant(person.id)]})
+    with admin.client() as client:
+        configure_terminals(client, connection)
+    with person.client() as client:
+        chat = Conversation(client, upstream, cached_setup.id, terminal_id=connection["id"])
+        chat.say("hello")
+        chat.say(
+            "note the ferry time",
+            calling("write_file", {"path": "ferry.txt", "content": "06:40 from pier 7\n"}),
+            reply.text("Written."),
+        )
+        chat.say(
+            "list my files",
+            calling("run_command", {"command": "ls && cat ferry.txt", "wait": 10}),
+            reply.text("ferry.txt is there."),
+        )
+        chat.say(
+            "read it back",
+            calling("read_file", {"path": "ferry.txt"}),
+            reply.text("06:40 from pier 7."),
+        )
+        chat.say("thanks")
+
+    requests = chat.requests()
+    assert {"run_command", "write_file", "read_file"} <= offered_tools(requests[0])
+    assert "You have access to a computer" in requests[0]["messages"][0]["content"]
+    assert tool_results(requests[-1]).count("06:40 from pier 7") >= 2, tool_results(requests[-1])
+    assert_append_only(requests)
 
 
 def test_time_passing_between_turns_changes_nothing(cached_setup, make_user, upstream):

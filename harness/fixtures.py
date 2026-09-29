@@ -190,6 +190,15 @@ def milvus_service() -> Generator:
         yield fake
 
 
+@pytest.fixture(scope="session")
+def open_terminal() -> Generator:
+    """A real Open Terminal for the session; skips where open-terminal is not installed."""
+    from harness.open_terminal import serving_open_terminal
+
+    with serving_open_terminal() as terminal:
+        yield terminal
+
+
 @pytest.fixture
 def listener() -> Generator[Listener, None, None]:
     """A local service for the instance to call, recording every request it gets."""

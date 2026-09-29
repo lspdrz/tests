@@ -44,6 +44,13 @@ playwright install chromium                                 # for e2e/
 
 The checkout is found through `OPEN_WEBUI_SOURCE_DIR` (pointing at `.../open-webui/backend`), else as a sibling `open-webui/` next to this repo. The frontend build is `build/` next to that backend, or `OPEN_WEBUI_BUILD_DIR`. The postgres migration tests also want `pgserver` (in the `dev` extra) and skip without it.
 
+The Open Terminal tests start the real `open-terminal` from PyPI. Install it into an environment of its own, so its dependencies stay out of the backend's, and name its executable in `OPEN_TERMINAL_BIN` (or put it on `PATH`); the tests skip without it:
+
+```bash
+uv venv ../open-terminal && uv pip install --python ../open-terminal open-terminal
+export OPEN_TERMINAL_BIN=../open-terminal/bin/open-terminal
+```
+
 ### Frontend suite
 
 `frontend/` imports `src/lib` modules straight out of the checkout, so the checkout needs `npm ci` and a `svelte-kit sync` first (its `tsconfig.json` extends the generated one).
@@ -129,6 +136,7 @@ Tests skip when what they need is absent, so the whole suite runs anywhere and o
 | `preserve(...)` | restores the global settings a test changes |
 | `instance_with({...})` | a further instance for settings that only exist as environment variables |
 | `listener` | a local HTTP service for the instance to call, recording what it gets |
+| `open_terminal` | a real Open Terminal for the session (`OPEN_TERMINAL_BIN`), skipped where it is not installed |
 
 `harness.chat.ask(client, "text")` sends a message the way the web client does and returns the stored reply.
 

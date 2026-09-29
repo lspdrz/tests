@@ -136,12 +136,16 @@ jobs:
             open-webui/backend/requirements.txt
             tests/pyproject.toml
 
+      # Open Terminal gets an environment of its own; the suite starts it from OPEN_TERMINAL_BIN.
       - name: Install dependencies
         run: |
           uv pip install --system 'torch<=2.9.1' --index-url https://download.pytorch.org/whl/cpu
           uv pip install --system -r open-webui/backend/requirements.txt
           uv pip install --system -e "./tests[postgres]"
           python -m playwright install --with-deps chromium
+          uv venv "$RUNNER_TEMP/open-terminal"
+          uv pip install --python "$RUNNER_TEMP/open-terminal" open-terminal
+          echo "OPEN_TERMINAL_BIN=$RUNNER_TEMP/open-terminal/bin/open-terminal" >> "$GITHUB_ENV"
 
       - name: Run the integration suite
         working-directory: tests
@@ -207,6 +211,9 @@ jobs:
           uv pip install --system -r open-webui/backend/requirements.txt
           uv pip install --system -e "./tests[postgres]"
           python -m playwright install --with-deps chromium
+          uv venv "$RUNNER_TEMP/open-terminal"
+          uv pip install --python "$RUNNER_TEMP/open-terminal" open-terminal
+          echo "OPEN_TERMINAL_BIN=$RUNNER_TEMP/open-terminal/bin/open-terminal" >> "$GITHUB_ENV"
 
       - name: Run the integration suite on Postgres and Redis
         working-directory: tests
@@ -328,6 +335,9 @@ jobs:
           uv pip install --system -r open-webui/backend/requirements.txt
           uv pip install --system -e ./tests
           python -m playwright install --with-deps chromium
+          uv venv "$RUNNER_TEMP/open-terminal"
+          uv pip install --python "$RUNNER_TEMP/open-terminal" open-terminal
+          echo "OPEN_TERMINAL_BIN=$RUNNER_TEMP/open-terminal/bin/open-terminal" >> "$GITHUB_ENV"
 
       - name: Run the browser suite
         working-directory: tests
