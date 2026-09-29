@@ -10,7 +10,8 @@ Discriminates: in a backend copy, skipping the owner check in `add_members_by_id
 member add row red (HTTP 200 and a new member), leaving the membership row in place in
 `remove_members_by_id` turns the removal test red (the person still reads the channel), counting
 no unread messages in `get_channels` turns the unread test red, and dropping the membership check
-from the `dm` branch of `get_channel_by_id` turns the third person test red.
+from the `dm` branch of `get_channel_by_id` or of `get_channel_messages` turns the third person
+test red.
 """
 
 from __future__ import annotations
@@ -147,5 +148,6 @@ def test_a_third_person_cannot_open_a_direct_message(channels_on, make_user):
         opened = client.get(_channel_path(channel_id))
 
     assert opened.status_code == REFUSED, opened.text
-    assert "for your eyes only" not in opened.text
+    assert _status_of_reading(outsider, channel_id) == REFUSED
+    assert _member_ids(sender, channel_id) == {sender.id, reader.id}
     assert channel_id not in _listed_ids(outsider)

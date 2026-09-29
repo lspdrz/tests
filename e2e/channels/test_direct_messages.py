@@ -138,3 +138,5 @@ def test_someone_outside_a_direct_message_is_sent_home_and_never_sees_it(
     expect(chat_input(page)).to_be_visible()
     expect(page).not_to_have_url(re.compile("/channels/"))
     expect(page.get_by_text("the code word is lantern")).to_have_count(0)
+    with outsider.client() as client:
+        assert client.get(f"/api/v1/channels/{direct_message_id}/messages").status_code == 403
