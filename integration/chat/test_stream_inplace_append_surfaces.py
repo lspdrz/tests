@@ -7,8 +7,9 @@ runs on an instance of each kind and expects the same literal outcome: a global 
 each chunk, an outlet filter editing the reply and reporting what it saw, a pipe yielding text
 pieces or chunks and SSE lines with reasoning, an action run on the finished reply, an API client
 without a socket session (with and without reasoning), a temporary chat and its follow-up, a
-channel where a model answers and what the members receive, a sub-agent, a timer and an
-automation that streams into a chat.
+channel where a model answers and what the members receive, a sub-agent, a timer, an
+automation that streams into a chat and an Anthropic client of the messages endpoint whose reply
+an outlet filter audits.
 
 Discriminates: in a backend copy whose in-place branch adds a bar before each piece every
 `append-in-place` case goes red and every `append-copies` case stays green; with the bar in the
@@ -609,3 +610,53 @@ def test_an_automation_run_streams_its_reply_into_a_channel(scheduler, channels_
 
     assert run["status"] == "success", run
     assert answer["content"] == "Standup at nine sharp."
+
+
+# --- an Anthropic client through the messages endpoint ------------------------------------------
+
+
+def anthropic_stream(client: httpx.Client, model: str) -> list[dict]:
+    """A streamed request to the Anthropic-compatible endpoint; returns its decoded events."""
+    request = {
+        "model": model,
+        "max_tokens": 64,
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    response = client.post("/api/v1/messages", json=request)
+    assert response.status_code == 200, response.text
+    return [
+        json.loads(line.removeprefix("data:"))
+        for line in response.text.splitlines()
+        if line.startswith("data:")
+    ]
+
+
+def test_an_anthropic_client_gets_the_stream_and_the_outlet_sees_the_whole_reply(
+    instance_admin, listener, raw
+):
+    listener.route("POST", "/audit", lambda _: (200, {}, b""))
+    outlet = audit_source(f"{listener.base_url}/audit", "pass")
+    raw.stream(
+        sse(
+            chunk({"role": "assistant", "content": "Snow "}),
+            chunk({"content": "falls "}),
+            chunk({"content": "softly."}),
+            chunk({}, "stop"),
+        )
+    )
+    with (
+        installed_function(instance_admin, outlet, is_global=True),
+        instance_admin.client() as client,
+    ):
+        events = anthropic_stream(client, RAW_MODEL_ID)
+        wait_for(lambda: listener.requests_to("/audit"), "the outlet filter's audit")
+
+    text = "".join(
+        event["delta"]["text"]
+        for event in events
+        if event.get("type") == "content_block_delta" and event["delta"].get("type") == "text_delta"
+    )
+    assert text == "Snow falls softly."
+    [audit] = listener.requests_to("/audit")
+    assert audit.json()["content"] == "Snow falls softly."

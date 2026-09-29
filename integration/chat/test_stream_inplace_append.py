@@ -8,7 +8,10 @@ socket deltas it merges when a chat asks for `stream_delta_chunk_size`. Only an 
 is meant to behave differently. Every test here runs once with the toggle off and once on and holds
 both to the same expectations: the stored reply, every delta a browser tab is sent and the history
 the provider gets on the next turn. Each case lands at least two pieces in one field, since the
-first piece is never appended.
+first piece is never appended. The cases cover the web chat path: text of every size, reasoning
+in each form the handler detects, tool calls, usage, errors, a stream cut off, stopping, deltas
+batched per chat or per model, continuing, regenerating, a llama.cpp connection that gets its
+reasoning back and two models answering one message at once.
 
 Discriminates: in a backend copy, prefixing each piece the in-place branch appends with `|` fails
 every case with the toggle on and none with it off; the same edit to the copying branch fails every
@@ -18,12 +21,14 @@ case with it off and none with it on.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
 from harness import upstream as reply
 from harness.actors import create_user
 from harness.chat import ask, send_message, wait_for_reply
+from harness.listener import text_answer
 from harness.python_tools import python_tool
 from harness.second_provider import OPENAI_CONFIG, attach, sse
 from harness.socket_client import connected
@@ -99,6 +104,8 @@ def _ask_watched(actor, prompt: str, **options) -> tuple[object, dict, list[tupl
     """Ask as a web client with a tab open; returns the turn, the stored reply and the deltas."""
     with connected(actor) as socket, actor.client() as client:
         turn, message = ask(client, prompt, **options)
+        # the stored reply can be done before the tab has every event
+        socket.wait_for(turn.chat_id, "chat:completion", done=True)
         return turn, message, _deltas(socket, turn.chat_id)
 
 
@@ -475,6 +482,7 @@ def test_a_stopped_reply_keeps_whole_pieces(streaming, owner):
         _wait_for_deltas(socket, turn.chat_id, 3)
         stopped = client.post(f"/api/tasks/chat/{turn.chat_id}/stop")
         message = wait_for_reply(client, turn)
+        socket.wait_for(turn.chat_id, "chat:tasks:cancel")
         streamed = "".join(text for _, text in _deltas(socket, turn.chat_id))
 
     assert stopped.status_code == 200, stopped.text
@@ -486,8 +494,6 @@ def test_a_stopped_reply_keeps_whole_pieces(streaming, owner):
 
 
 def _wait_for_deltas(socket, chat_id: str, count: int, timeout: float = 30.0) -> None:
-    import time
-
     deadline = time.monotonic() + timeout
     while len(_deltas(socket, chat_id)) < count:
         assert time.monotonic() < deadline, f"fewer than {count} deltas arrived"
@@ -615,3 +621,179 @@ def test_regenerating_keeps_both_versions(streaming, owner):
     ]
     regenerated_request = streaming.upstream.chat_requests()[-1]["messages"]
     assert [entry["role"] for entry in regenerated_request] == ["user"]
+
+
+# --- more shapes: many tiny pieces, a cut-off stream, merged tool arguments ------------------
+
+
+def test_thousands_of_tiny_pieces_are_kept_in_order(streaming, owner):
+    pieces = [chr(ord("a") + index % 26) for index in range(3000)]
+    streaming.upstream.queue(reply.text(pieces, match=reply.answering("spell it")))
+    _, message, deltas = _ask_watched(owner, "spell it")
+
+    assert "".join(text for _, text in deltas) == "".join(pieces)
+    assert len(deltas) == len(pieces)
+    assert message["content"] == "".join(pieces)
+
+
+def test_a_stream_cut_off_without_its_end_keeps_what_arrived(streaming, owner, second_provider):
+    chunks = [
+        {"object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": piece}}]}
+        for piece in ["Cut ", "off ", "mid-"]
+    ]
+    body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+    cut_off = text_answer(body, content_type="text/event-stream")
+    _script(second_provider, cut_off)
+    _, message, deltas = _ask_watched(owner, "trail off", model=SECOND_MODEL)
+
+    assert [text for _, text in deltas] == ["Cut ", "off ", "mid-"]
+    assert message["content"] == "Cut off mid-"
+    assert "error" not in message
+
+
+def test_merged_deltas_carry_split_tool_arguments_whole(
+    streaming, owner, second_provider, weather_tool
+):
+    arguments = {"city": "Reykjavík", "country": "Ísland"}
+    pieces = _split(arguments)
+    _script(
+        second_provider,
+        sse(*_streamed_call(0, "call_a", arguments), finish_reason="tool_calls"),
+        sse({"content": "Cold "}, {"content": "and "}, {"content": "clear."}),
+    )
+    _, message, deltas = _ask_watched(
+        owner,
+        "weather up north?",
+        model=SECOND_MODEL,
+        tool_ids=[weather_tool],
+        params={"stream_delta_chunk_size": 4},
+    )
+
+    argument_deltas = [text for kind, text in deltas if kind == "function_call_arguments"]
+    assert argument_deltas == [
+        "".join(pieces[start : start + 4]) for start in range(0, len(pieces), 4)
+    ]
+    [call] = _items(message, "function_call")
+    assert json.loads(call["arguments"]) == arguments
+    assert _tool_results_sent_back(_sent(second_provider)[1]) == ["Reykjavík, Ísland: sunny"]
+    assert message["content"].endswith("Cold and clear.")
+
+
+@pytest.fixture
+def batching_model(streaming, owner):
+    """A workspace model whose admin set the socket batch size in its advanced params."""
+    form = {
+        "id": "batching-model",
+        "base_model_id": reply.MOCK_MODEL_ID,
+        "name": "Batching",
+        "meta": {},
+        "params": {"stream_delta_chunk_size": 5},
+    }
+    with owner.client() as client:
+        client.post("/api/v1/models/model/delete", json={"id": form["id"]})
+        created = client.post("/api/v1/models/create", json=form)
+        assert created.status_code == 200, created.text
+        yield form["id"]
+        client.post("/api/v1/models/model/delete", json={"id": form["id"]})
+
+
+def test_a_models_own_batch_size_merges_the_deltas(streaming, owner, batching_model):
+    pieces = [f"p{index} " for index in range(12)] + ["end."]
+    streaming.upstream.queue(reply.text(pieces, match=reply.answering("batch by model")))
+    _, message, deltas = _ask_watched(owner, "batch by model", model=batching_model)
+
+    assert [text for _, text in deltas] == [
+        "".join(pieces[start : start + 5]) for start in range(0, len(pieces), 5)
+    ]
+    assert message["content"] == "".join(pieces)
+
+
+# --- a llama.cpp connection gets its reasoning back ------------------------------------------
+
+
+@pytest.fixture
+def llama_cpp(streaming, owner, preserve, listener):
+    """The listener as a llama.cpp connection, whose history carries `reasoning_content`."""
+    preserve(OPENAI_CONFIG, on=streaming)
+    with owner.client() as client:
+        attach(client, listener, "llama-model", provider="llama.cpp")
+    return listener
+
+
+def test_reasoning_is_replayed_whole_to_a_llama_cpp_connection(streaming, owner, llama_cpp):
+    _script(
+        llama_cpp,
+        sse(
+            {"reasoning_content": "Count "},
+            {"reasoning_content": "the legs."},
+            {"content": "Eight "},
+            {"content": "legs."},
+        ),
+        sse({"content": "ok"}),
+    )
+    turn, message, _ = _ask_watched(owner, "how many legs?", model="llama-model")
+    assert message["content"] == "Eight legs."
+
+    _history_after(owner, turn, model="llama-model")
+    assert _replayed_assistant(_sent(llama_cpp)[-1]) == [
+        {"role": "assistant", "content": "Eight legs.", "reasoning_content": "Count the legs."}
+    ]
+
+
+# --- two models answering one message at once ----------------------------------------------
+
+
+def _deltas_of(socket, message_id: str) -> str:
+    return "".join(
+        entry["data"]["data"]["delta"]
+        for entry in list(socket.events)
+        if entry.get("message_id") == message_id
+        and entry["data"].get("type") == "response:completion"
+        and str(entry["data"]["data"].get("type", "")).endswith(".delta")
+    )
+
+
+def test_two_models_answering_at_once_keep_their_own_text(streaming, owner, second_provider):
+    mock_pieces = [f"left-{index} " for index in range(15)] + ["done."]
+    second_pieces = [f"right-{index} " for index in range(15)] + ["done."]
+    streaming.upstream.queue(
+        reply.text(mock_pieces, chunk_delay=0.02, match=reply.answering("both of you"))
+    )
+    _script(second_provider, sse(*({"content": piece} for piece in second_pieces)))
+    first_id, second_id = f"left-{owner.id}", f"right-{owner.id}"
+    message_ids = [
+        {"model_id": reply.MOCK_MODEL_ID, "message_id": first_id, "modelIdx": 0},
+        {"model_id": SECOND_MODEL, "message_id": second_id, "modelIdx": 1},
+    ]
+    with connected(owner) as socket, owner.client() as client:
+        turn = send_message(client, "both of you", id=first_id, message_ids=message_ids)
+        replies = {
+            message_id: wait_for_reply(
+                client, type(turn)(turn.chat_id, turn.user_message_id, message_id)
+            )
+            for message_id in (first_id, second_id)
+        }
+        _wait_until_done(socket, first_id, second_id)
+        streamed = {
+            message_id: _deltas_of(socket, message_id) for message_id in (first_id, second_id)
+        }
+
+    assert replies[first_id]["content"] == "".join(mock_pieces)
+    assert replies[second_id]["content"] == "".join(second_pieces)
+    assert streamed == {first_id: "".join(mock_pieces), second_id: "".join(second_pieces)}
+
+
+def _wait_until_done(socket, *message_ids: str, timeout: float = 30.0) -> None:
+    """Until the tab got the finishing event of every one of these messages."""
+    deadline = time.monotonic() + timeout
+    while True:
+        finished = {
+            entry.get("message_id")
+            for entry in list(socket.events)
+            if entry["data"].get("type") == "chat:completion"
+            and (entry["data"].get("data") or {}).get("done")
+        }
+        if set(message_ids) <= finished:
+            return
+        assert time.monotonic() < deadline, f"only {finished} finished"
+        time.sleep(0.05)
