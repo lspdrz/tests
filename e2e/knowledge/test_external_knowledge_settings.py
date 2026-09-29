@@ -69,15 +69,17 @@ def _open_integrations(page: Page) -> Locator:
 
 def _add_button(settings: Locator) -> Locator:
     # the plus button has no accessible name, so it is found next to the section title
-    header = settings.get_by_text("External Knowledge Sources", exact=True).locator(
-        "xpath=ancestor::div[contains(@class, 'justify-between')][1]"
-    )
-    return header.get_by_role("button")
+    title = settings.get_by_text("External Knowledge Sources", exact=True)
+    return title.locator("xpath=ancestor::div[.//button][1]").get_by_role("button")
 
 
 def _row(settings: Locator, name: str) -> Locator:
-    return settings.get_by_text(name).locator(
-        "xpath=ancestor::div[contains(@class, 'gap-2') and contains(@class, 'w-full')][1]"
+    # the innermost block holding both the name and its Configure button
+    return (
+        settings.locator("div")
+        .filter(has=settings.page.get_by_text(name))
+        .filter(has=settings.page.get_by_role("button", name="Configure"))
+        .last
     )
 
 
