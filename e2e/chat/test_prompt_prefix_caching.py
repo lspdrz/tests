@@ -6,9 +6,10 @@ the one before it byte for byte and only adds to the end. Its integration twin c
 feature family over HTTP; here a person drives chats through the web client. One goes through a
 file attached in the chat input and searched with the file tools, a reply with reasoning, the
 model's knowledge searched, a native tool call, a page reload, the chat continued from a second
-browser and a while passing between turns. Another has a real Open Terminal picked for the chat
-from the first turn, with a file written, a command run and the file read back across a reload.
-Every consecutive pair of the provider's requests is checked.
+browser and a while passing between turns. Another asks about an image attached in the chat
+input across a reload. Another has a real Open Terminal picked for the chat from the first turn,
+with a file written, a command run and the file read back across a reload. Every consecutive
+pair of the provider's requests is checked.
 
 Two terminal tests stay red, on what the page does not name as a breaker: opening a folder in
 the terminal's file browser moves the working directory written into the run_command tool's
@@ -29,6 +30,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from harness import upstream as reply
+from harness.mcp_server import SNAPSHOT_PNG
 from harness.prompt_caching import (
     assert_append_only,
     cache_optimal_model,
@@ -53,12 +55,13 @@ def cached_setup(admin, preserve):
         yield model
 
 
-def attach(page: Page, name: str, text: str) -> None:
+def attach(page: Page, name: str, content: str | bytes, mime_type: str = "text/plain") -> None:
     expect(chat_input(page)).to_be_visible()
     page.get_by_role("button", name="More", exact=True).last.click()
     with page.expect_file_chooser() as chooser:
         page.get_by_role("menu").get_by_role("button", name="Upload Files").click()
-    chooser.value.set_files({"name": name, "mimeType": "text/plain", "buffer": text.encode()})
+    buffer = content.encode() if isinstance(content, str) else content
+    chooser.value.set_files({"name": name, "mimeType": mime_type, "buffer": buffer})
 
 
 def ask(page: Page, upstream, prompt: str, *replies: reply.Reply) -> None:
@@ -133,6 +136,22 @@ def test_a_long_chat_in_the_browser_only_appends(page_for, cached_setup, make_us
     )
     assert "Berth 5 is free" in tool_results and "06:40" in tool_results, tool_results
     assert "<attached_files>" in str(requests[0]["messages"][1]["content"])
+    assert_append_only(requests)
+
+
+def test_a_chat_about_an_attached_image_only_appends(page_for, cached_setup, make_user, upstream):
+    page = page_for(make_user())
+    page.goto(f"/?models={cached_setup.id}")
+
+    attach(page, "harbour.png", SNAPSHOT_PNG, "image/png")
+    ask(page, upstream, "what is in this picture?", reply.text("A calm harbour."))
+    ask(page, upstream, "any boats?", reply.text("Two boats."))
+    page.reload()
+    ask(page, upstream, "thanks", reply.text("Enjoy the view."))
+
+    requests = [body for body in upstream.chat_requests() if body.get("stream")]
+    first_question = requests[0]["messages"][1]["content"]
+    assert any(part.get("type") == "image_url" for part in first_question), first_question
     assert_append_only(requests)
 
 
