@@ -14,7 +14,7 @@ HTTP long polling alone when `ENABLE_WEBSOCKET_SUPPORT` is off, which then refus
 calls to a tab, the disconnects of a changed account, rooms left when access is revoked and the
 Redis manager between instances are driven in integration/chat/test_socket_runtime.py,
 integration/security/test_revoked_access_leaves_live_rooms.py,
-integration/deps/test_redis_stack.py and integration/chat/test_cross_instance_streaming.py.
+integration/deps/test_redis_stack.py and integration/chat/test_socket_delivery_across_instances.py.
 pycrdt merges the live edits two tabs make to one note: a long edit still arrives whole after the
 server has folded its oldest updates into one snapshot, and an update that arrives twice counts
 once.

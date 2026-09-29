@@ -9,6 +9,7 @@ SQLite and in-process state, as before.
 An instance that brings its own database or Redis keeps it: a `DATABASE_URL`, a `DATA_DIR`
 holding a `webui.db` a test prepared, or any Redis setting (the stand-ins under `integration/`).
 `write_rows` and `read_rows` run one statement on an instance's own database, whichever it is.
+`RedisProcess` is a `redis-server` a test can stop, start and restart with its data kept.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import pytest
 
@@ -105,6 +106,66 @@ def _answers_ping(port: int) -> bool:
             return connection.recv(16).startswith(b"+PONG")
     except OSError:
         return False
+
+
+def wait_until(condition: Callable[[], bool], timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.25)
+    return condition()
+
+
+class RedisProcess:
+    """A redis-server on a fixed port that the test can stop and start again."""
+
+    def __init__(self, *options: str):
+        binary = shutil.which("redis-server")
+        if binary is None:
+            pytest.skip("needs a redis-server binary on PATH")
+        self.workdir = Path(tempfile.mkdtemp(prefix="owui-redis-"))
+        self.port = _free_port()
+        self.command = [
+            binary,
+            "--port",
+            str(self.port),
+            "--bind",
+            "127.0.0.1",
+            "--save",
+            "",
+            "--dir",
+            str(self.workdir),
+            *options,
+        ]
+        self.process: subprocess.Popen | None = None
+        self.url = f"redis://127.0.0.1:{self.port}/0"
+
+    def start(self) -> None:
+        self.process = subprocess.Popen(
+            self.command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+        )
+        if not wait_until(lambda: _answers_ping(self.port), timeout=10):
+            pytest.fail(f"redis-server did not start on port {self.port}")
+
+    def stop(self) -> None:
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait(timeout=10)
+
+    def restart(self, outage: float = 0.0) -> None:
+        """Save to disk, stop, stay down for `outage` seconds and start on the saved data."""
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as connection:
+            connection.sendall(b"SHUTDOWN SAVE\r\n")
+            connection.recv(64)
+        if self.process:
+            self.process.wait(timeout=10)
+        time.sleep(outage)
+        self.start()
+
+    def close(self) -> None:
+        self.stop()
+        shutil.rmtree(self.workdir, ignore_errors=True)
 
 
 @contextlib.contextmanager

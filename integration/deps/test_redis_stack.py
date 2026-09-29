@@ -13,7 +13,7 @@ Two instances here share one database and one `redis-server`; the other Redis pa
 by integration/chat/test_redis_task_commands.py (a stop over pub/sub, a restart, a Redis
 Cluster), integration/chat/test_socket_cleanup_locks.py (locks and the session pool sweep),
 integration/resilience/test_redis_sentinel_failover.py (Sentinel) and
-integration/chat/test_cross_instance_streaming.py (streams across instances).
+integration/chat/test_socket_delivery_across_instances.py (streams across instances).
 
 Discriminates: passes on dev ef67cc3fa. In a backend copy, a revoked token stored without its
 expiry fails the sign-out test, `disconnect` answered by python-socketio's pub/sub manager

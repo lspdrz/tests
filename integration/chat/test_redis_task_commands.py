@@ -33,18 +33,15 @@ ends, the restarted Redis never gets its subscriber back and the stop is lost. R
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
-import tempfile
 import threading
 import time
-from pathlib import Path
-from typing import Callable, Iterator
+from typing import Iterator
 
 import pytest
 import redis
 
 from harness.actors import create_user
+from harness.backends import RedisProcess, wait_until
 from harness.chat import wait_for_reply
 from harness.inflight import LAST_PIECE, start_slow_reply
 from harness.instance import free_port
@@ -60,66 +57,6 @@ STOP_CHANNEL = "open-webui:tasks:commands"
 # longer than redis-py's own reconnect attempts, so the listener's stream really ends
 OUTAGE_SECONDS = 15
 STALL_SECONDS = 4
-
-
-class RedisProcess:
-    """A redis-server on a fixed port that the test can stop and start again."""
-
-    def __init__(self, *options: str):
-        binary = shutil.which("redis-server")
-        if binary is None:
-            pytest.skip("needs a redis-server binary on PATH")
-        self.workdir = Path(tempfile.mkdtemp(prefix="owui-redis-"))
-        self.port = free_port()
-        self.command = [
-            binary,
-            "--port",
-            str(self.port),
-            "--bind",
-            "127.0.0.1",
-            "--save",
-            "",
-            "--dir",
-            str(self.workdir),
-            *options,
-        ]
-        self.process: subprocess.Popen | None = None
-        self.url = f"redis://127.0.0.1:{self.port}/0"
-
-    def start(self) -> None:
-        self.process = subprocess.Popen(
-            self.command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
-        )
-        client = redis.Redis(port=self.port, socket_connect_timeout=1)
-        try:
-            assert _wait_until(lambda: _answers(client), timeout=10), "redis-server did not start"
-        finally:
-            client.close()
-
-    def stop(self) -> None:
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            self.process.wait(timeout=10)
-
-    def close(self) -> None:
-        self.stop()
-        shutil.rmtree(self.workdir, ignore_errors=True)
-
-
-def _answers(client: redis.Redis) -> bool:
-    try:
-        return bool(client.ping())
-    except redis.exceptions.RedisError:
-        return False
-
-
-def _wait_until(condition: Callable[[], bool], timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if condition():
-            return True
-        time.sleep(0.25)
-    return condition()
 
 
 def _subscribers(url: str) -> int:
@@ -166,7 +103,7 @@ def _stall(url: str) -> None:
 
 
 def test_a_stop_reaches_the_reply_through_redis(redis_instance, restartable_redis):
-    assert _wait_until(lambda: _subscribers(restartable_redis.url) >= 1, timeout=15)
+    assert wait_until(lambda: _subscribers(restartable_redis.url) >= 1, timeout=15)
 
     content = _stop_mid_stream(redis_instance)
 
@@ -175,7 +112,7 @@ def test_a_stop_reaches_the_reply_through_redis(redis_instance, restartable_redi
 
 
 def test_only_a_stop_command_cancels_the_reply(redis_instance, restartable_redis):
-    assert _wait_until(lambda: _subscribers(restartable_redis.url) >= 1, timeout=15)
+    assert wait_until(lambda: _subscribers(restartable_redis.url) >= 1, timeout=15)
     account = create_user(redis_instance)
     publisher = redis.Redis.from_url(restartable_redis.url)
     with account.client() as client:
@@ -210,12 +147,12 @@ def test_a_slow_redis_answer_is_waited_for_by_default(redis_instance, restartabl
 
 
 def test_after_a_redis_restart_a_stop_still_reaches_the_reply(redis_instance, restartable_redis):
-    assert _wait_until(lambda: _subscribers(restartable_redis.url) >= 1, timeout=15)
+    assert wait_until(lambda: _subscribers(restartable_redis.url) >= 1, timeout=15)
     restartable_redis.stop()
     time.sleep(OUTAGE_SECONDS)
     restartable_redis.start()
 
-    assert _wait_until(lambda: _subscribers(restartable_redis.url) >= 1, timeout=60), (
+    assert wait_until(lambda: _subscribers(restartable_redis.url) >= 1, timeout=60), (
         "after Redis came back the instance never subscribed to stop commands again (#28909)"
     )
     content = _stop_mid_stream(redis_instance)
@@ -236,7 +173,7 @@ def cluster_redis() -> Iterator[RedisProcess]:
     server.start()
     client = redis.Redis(port=server.port, decode_responses=True)
     client.execute_command("CLUSTER", "ADDSLOTSRANGE", "0", "16383")
-    assert _wait_until(
+    assert wait_until(
         lambda: "cluster_state:ok" in client.execute_command("CLUSTER", "INFO"), timeout=15
     )
     client.close()
@@ -250,7 +187,7 @@ def cluster_instance(instance_with, cluster_redis):
 
 
 def test_on_a_redis_cluster_a_stop_reaches_the_reply(cluster_instance, cluster_redis):
-    assert _wait_until(lambda: _subscribers(cluster_redis.url) >= 1, timeout=15), (
+    assert wait_until(lambda: _subscribers(cluster_redis.url) >= 1, timeout=15), (
         "the listener never subscribed on the Redis Cluster (#19840)"
     )
 
