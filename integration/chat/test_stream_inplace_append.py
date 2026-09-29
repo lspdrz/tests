@@ -458,21 +458,26 @@ def test_usage_on_the_last_chunk_is_stored(streaming, owner):
     assert {key: message["usage"][key] for key in usage} == usage
 
 
-def test_an_error_mid_stream_keeps_the_text_that_arrived(streaming, owner, second_provider):
+@pytest.mark.parametrize(
+    "error_line, stored_error",
+    [
+        ('{"error": "rate limit exceeded"}', "rate limit exceeded"),
+        ('data: {"error": {"message": "rate limit exceeded"}}', {"message": "rate limit exceeded"}),
+    ],
+    ids=["plain-json-line", "event-line"],
+)
+def test_an_error_mid_stream_keeps_the_text_that_arrived(
+    streaming, owner, second_provider, error_line, stored_error
+):
     _script(
         second_provider,
-        sse(
-            {"content": "Half "},
-            {"content": "an "},
-            {"content": "answer"},
-            '{"error": "rate limit exceeded"}',
-        ),
+        sse({"content": "Half "}, {"content": "an "}, {"content": "answer"}, error_line),
     )
     _, message, deltas = _ask_watched(owner, "fail halfway", model=SECOND_MODEL)
 
     assert deltas == [("output_text", "Half "), ("output_text", "an "), ("output_text", "answer")]
     assert message["content"] == "Half an answer"
-    assert message["error"]["content"] == "rate limit exceeded"
+    assert message["error"]["content"] == stored_error
 
 
 def test_a_stopped_reply_keeps_whole_pieces(streaming, owner):
