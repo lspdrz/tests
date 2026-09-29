@@ -11,9 +11,11 @@ a second chat holds a background sub-agent back or mixes the reports. Stopping a
 through its task lists it as interrupted and a failing one as failed.
 
 The chat's stored current message follows the report's follow-up reply, which the open page
-reads when the server tells it to reload; on dev it keeps pointing at the earlier reply, so the
-page shows neither the report nor the follow-up until it is reloaded. That test stays red until
-the current message is set when the report is stored.
+reads when the server tells it to reload; on dev it keeps pointing at the earlier reply until the
+follow-up's first save, so the page shows neither the report nor the follow-up until it is
+reloaded (open-webui/open-webui#31566, fix PR #31576). The test deletes the chat's model while
+the sub-agent works, so the follow-up fails before any save of its own and only the storing of
+the report can set the pointer; it stays red until that is fixed.
 
 A report that comes while the answer to a later question is still written is attached to the
 answer before it and hides that question (open-webui/open-webui#31507, fix PR #31557); that
@@ -38,6 +40,7 @@ import pytest
 
 from harness import upstream as reply
 from harness.chat import ask, send_message, wait_for_reply
+from harness.upstream import MOCK_MODEL_ID
 
 pytestmark = [pytest.mark.journey, pytest.mark.api, pytest.mark.requires_source]
 
@@ -108,6 +111,15 @@ def wait_for_message(client, chat_id: str, condition, timeout: float = 60.0) -> 
                 return message
         time.sleep(0.1)
     raise AssertionError(f"no stored message of chat {chat_id} ever satisfied the condition")
+
+
+def wait_for_request(upstream, condition, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(condition(body) for body in upstream.chat_requests()):
+            return
+        time.sleep(0.1)
+    raise AssertionError("the model never got the request")
 
 
 def finished_reply(text: str):
@@ -236,20 +248,42 @@ def test_a_report_that_arrives_while_the_reply_is_written_waits_for_it(
     assert len([r for r in upstream.chat_requests() if report_of(task)(r)]) == 1
 
 
-def test_the_stored_chat_points_at_the_follow_up_while_it_is_written(
+def _create_preset(client) -> str:
+    model_id = f"report-{uuid.uuid4().hex[:8]}"
+    created = client.post(
+        "/api/v1/models/create",
+        json={
+            "id": model_id,
+            "base_model_id": MOCK_MODEL_ID,
+            "name": "Report model",
+            "meta": {},
+            "params": {},
+        },
+    )
+    assert created.status_code == 200, created.text
+    client.get("/api/models", params={"refresh": "true"}).raise_for_status()
+    return model_id
+
+
+def test_the_stored_chat_points_at_the_follow_up_once_the_report_is_stored(
     background_on, make_user, upstream
 ):
-    """The open page follows the current message the chat stores when told to reload."""
+    """The chat's model is deleted while the sub-agent works, so the follow-up fails before its
+    own first save and nothing but the storing of the report can set the current message."""
     background_on()
     prompt, task = unique("hand this over"), unique("look it up")
     upstream.queue(
         dispatch(task, prompt),
-        reply.text("found it", match=reply.answering(task)),
+        reply.text("found it", delay=SLOW_SECONDS, match=reply.answering(task)),
         reply.text("Handed over.", match=reply.answering(prompt)),
-        reply.text("Looked up.", delay=SLOW_SECONDS, match=report_of(task)),
     )
-    with make_user().client() as client:
-        turn, _ = ask(client, prompt)
+    with make_user(role="admin").client() as client:
+        model_id = _create_preset(client)
+        turn, _ = ask(client, prompt, model=model_id)
+        wait_for_request(upstream, lambda body: reply.answering(task)(body))
+        deleted = client.post("/api/v1/models/model/delete", json={"id": model_id})
+        assert deleted.status_code == 200, deleted.text
+        client.get("/api/models", params={"refresh": "true"}).raise_for_status()
         wait_for_message(
             client,
             turn.chat_id,
@@ -259,7 +293,6 @@ def test_the_stored_chat_points_at_the_follow_up_while_it_is_written(
             ),
         )
         stored = client.get(f"/api/v1/chats/{turn.chat_id}").json()
-        wait_for_message(client, turn.chat_id, finished_reply("Looked up."))
 
     history = stored["chat"]["history"]
     assert history["messages"][history["currentId"]]["role"] == "assistant"
