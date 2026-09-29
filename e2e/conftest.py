@@ -22,7 +22,14 @@ from playwright.sync_api import Browser, BrowserContext, Page
 from conftest import AppConfig
 from harness.actors import Actor
 from harness.fixtures import TEST_USER_EMAIL, TEST_USER_PASSWORD
-from harness.instance import ADMIN_EMAIL, ADMIN_PASSWORD, LaunchedInstance
+from harness.instance import (
+    ADMIN_EMAIL,
+    ADMIN_PASSWORD,
+    LaunchedInstance,
+    resolve_backend,
+    resolve_frontend_build,
+)
+from harness.prepared_data import serving
 
 ARTIFACTS_DIR = Path("test-results")
 
@@ -151,3 +158,17 @@ def authenticated_page(page_for: Callable[[Actor], Page], user: Actor, user_toke
 @pytest.fixture
 def admin_page(page_for: Callable[[Actor], Page], admin: Actor, admin_token: str) -> Page:
     return page_for(admin)
+
+
+@pytest.fixture
+def fresh_install(tmp_path):
+    """The checkout serving its built frontend on an empty data directory, before any account."""
+    backend = resolve_backend()
+    if backend is None:
+        pytest.skip("open-webui backend source not found (set OPEN_WEBUI_SOURCE_DIR)")
+    build = resolve_frontend_build(backend)
+    if build is None:
+        pytest.skip("no built frontend (set OPEN_WEBUI_BUILD_DIR)")
+    settings = {"FRONTEND_BUILD_DIR": str(build), "CORS_ALLOW_ORIGIN": "*"}
+    with serving(tmp_path, settings=settings) as server:
+        yield server

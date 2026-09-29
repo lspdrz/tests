@@ -19,8 +19,6 @@ from __future__ import annotations
 import pytest
 from playwright.sync_api import expect
 
-from harness.instance import resolve_backend, resolve_frontend_build
-from harness.prepared_data import serving
 from utils.chat_ui import chat_input
 
 pytestmark = [
@@ -32,19 +30,6 @@ pytestmark = [
 
 ADMIN_EMAIL = "owner@example.com"
 ADMIN_PASSWORD = "owner-password-123"
-
-
-@pytest.fixture
-def fresh_install(tmp_path):
-    backend = resolve_backend()
-    if backend is None:
-        pytest.skip("open-webui backend source not found (set OPEN_WEBUI_SOURCE_DIR)")
-    build = resolve_frontend_build(backend)
-    if build is None:
-        pytest.skip("no built frontend (set OPEN_WEBUI_BUILD_DIR)")
-    settings = {"FRONTEND_BUILD_DIR": str(build), "CORS_ALLOW_ORIGIN": "*"}
-    with serving(tmp_path, settings=settings) as server:
-        yield server
 
 
 def test_the_first_visitor_creates_the_admin_account_and_lands_in_chat(browser, fresh_install):
