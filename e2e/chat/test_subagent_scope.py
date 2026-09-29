@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import Locator, Page, expect
@@ -111,9 +112,16 @@ def sidebar_chats(page: Page) -> Locator:
     return page.locator('a[href^="/c/"]')
 
 
-def search_sidebar(page: Page, text: str) -> None:
+def open_search(page: Page) -> None:
     page.get_by_role("navigation", name="Chat history").get_by_label("Search").first.click()
-    page.get_by_role("dialog").get_by_placeholder("Search").fill(text)
+
+
+def search_for(page: Page, text: str) -> None:
+    """Fill the open search dialog and return once the server has answered that search."""
+    with page.expect_response(
+        lambda response: parse_qs(urlparse(response.url).query).get("text") == [text]
+    ):
+        page.get_by_role("dialog").get_by_placeholder("Search").fill(text)
 
 
 def test_the_subagents_chat_shows_in_no_ones_sidebar_or_search(
@@ -123,18 +131,28 @@ def test_the_subagents_chat_shows_in_no_ones_sidebar_or_search(
     upstream.queue(
         *delegation(prompt, task, reply.text("Three boats.", match=reply.answering(task)))
     )
+    other_prompt = unique("a chat of my own")
+    upstream.queue(reply.text("Noted.", match=reply.answering(other_prompt)))
     owner_page, other_page = page_for(make_user()), page_for(make_user())
 
     send(owner_page, prompt)
     expect_reply(owner_page, "The helper is done.")
+    send(other_page, other_prompt)
+    expect_reply(other_page, "Noted.")
 
     expect(sidebar_chats(owner_page)).to_have_count(1)
     owner_page.reload()
     expect(sidebar_chats(owner_page)).to_have_count(1)
-    search_sidebar(owner_page, task)
+    open_search(owner_page)
+    search_for(owner_page, prompt)
+    expect(
+        owner_page.get_by_role("dialog").get_by_role("link", name=re.compile(prompt))
+    ).to_be_visible()
+    search_for(owner_page, task)
     expect(owner_page.get_by_text("No results found")).to_be_visible()
-    expect(sidebar_chats(other_page)).to_have_count(0)
-    search_sidebar(other_page, task)
+    expect(sidebar_chats(other_page)).to_have_count(1)
+    open_search(other_page)
+    search_for(other_page, task)
     expect(other_page.get_by_text("No results found")).to_be_visible()
 
 

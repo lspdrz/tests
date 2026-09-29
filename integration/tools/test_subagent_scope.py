@@ -14,8 +14,8 @@ sent, and where a tool matters the sub-agent calls it and the test reads the res
 Three tests are red on dev on purpose, each a gap not yet reported upstream: a sub-agent started
 in a folder chat is offered the tools that browse every knowledge base where its parent has the
 folder's scoped ones, a temporary chat that delegates leaves the sub-agent's chat stored on the
-server (`Temporary Chat` keeps nothing there; the task tools were withheld from it for that
-reason in PR 27563), and a sub-agent's system prompt names each skill twice (the parent's
+server (`Temporary Chat` keeps nothing there; the task tools are withheld from it for that
+reason, dev d2936c880), and a sub-agent's system prompt names each skill twice (the parent's
 already-assembled prompt carries the skill list the sub-agent builds again).
 
 Discriminates: passes on dev 176d31d1d apart from those three, which turn green in a backend
@@ -563,31 +563,50 @@ def test_a_subagent_in_a_folder_chat_gets_the_folders_knowledge_tools_its_parent
     )
 
 
-def _stored_subagent_chats(instance, parent_chat_id: str) -> int:
+def _stored_subagent_chats(instance, parent_chat_id: str) -> list[dict]:
     with sqlite3.connect(instance.data_dir / "webui.db") as database:
-        return database.execute(
-            "select count(*) from chat where meta like ?",
-            (f'%"parent_chat_id": "{parent_chat_id}"%',),
-        ).fetchone()[0]
+        rows = database.execute("select chat, meta from chat where meta like '%subagent%'")
+        return [
+            json.loads(chat)
+            for chat, meta in rows.fetchall()
+            if json.loads(meta).get("parent_chat_id") == parent_chat_id
+        ]
+
+
+def _delegate_from(client, upstream, chat_id: str | None, task: str, answer: str) -> str:
+    """Send a delegating message and return once the parent has the sub-agent's result."""
+    prompt = unique("hand this over")
+    delegating(upstream, prompt, task, reply.text(answer, match=reply.answering(task)))
+    turn = send_message(client, prompt, chat_id=chat_id)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        requests = [r for r in upstream.chat_requests() if reply.answering(prompt)(r)]
+        if any(r["messages"][-1]["role"] == "tool" for r in requests):
+            return turn.chat_id
+        time.sleep(0.1)
+    raise AssertionError("the delegation never came back to the parent")
+
+
+def test_a_saved_chat_keeps_the_task_and_answer_of_its_subagent(
+    subagents_on, instance, make_user, upstream
+):
+    task, answer = unique("look it up"), unique("Found it")
+    with make_user().client() as client:
+        chat_id = _delegate_from(client, upstream, None, task, answer)
+
+    [stored] = _stored_subagent_chats(instance, chat_id)
+    assert task in json.dumps(stored)
+    assert answer in json.dumps(stored)
 
 
 def test_a_temporary_chat_leaves_no_stored_subagent_chat_behind(
     subagents_on, instance, make_user, upstream
 ):
-    prompt, task = unique("hand this over"), unique("look it up")
-    chat_id = f"local:{uuid.uuid4().hex[:12]}"
-    delegating(upstream, prompt, task, sub_answer(task))
+    task, answer = unique("look it up"), unique("Found it")
+    chat_id = f"temporary:{uuid.uuid4().hex[:12]}"
     with make_user().client() as client:
-        send_message(client, prompt, chat_id=chat_id)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            requests = [r for r in upstream.chat_requests() if reply.answering(prompt)(r)]
-            if any(r["messages"][-1]["role"] == "tool" for r in requests):
-                break
-            time.sleep(0.1)
-        else:
-            raise AssertionError("the delegation never came back to the parent")
+        _delegate_from(client, upstream, chat_id, task, answer)
 
-    assert _stored_subagent_chats(instance, chat_id) == 0, (
+    assert _stored_subagent_chats(instance, chat_id) == [], (
         "a temporary chat's delegation left the task and the answer stored on the server"
     )
