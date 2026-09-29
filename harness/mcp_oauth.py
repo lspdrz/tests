@@ -10,8 +10,11 @@ answers `invalid_grant`.
 
 The authorization server records every request. `access_token_lifetime` sets the `expires_in`
 of the tokens it issues next, `registration_names_scope = False` leaves the scope out of its
-registration answers, `revoke_refresh_tokens()` withdraws the live refresh tokens and
-`ProtectedMcp.presented` lists every bearer token the MCP server was shown.
+registration answers, `token_base` names the token endpoint of its metadata by another base URL,
+`revoke_refresh_tokens()` withdraws the live refresh tokens and
+`ProtectedMcp.presented` lists every bearer token the MCP server was shown. Both servers listen
+on `host` and name themselves by `name` (the address by default), so a test reaches them by a
+host name.
 """
 
 from __future__ import annotations
@@ -30,8 +33,10 @@ from typing import Callable, Iterator
 
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.transport_security import TransportSecuritySettings
 
 from harness.instance import free_port
+from harness.listener import IPv6HTTPServer
 from harness.mcp_server import serving_mcp
 
 SCOPE = "mcp:tools"
@@ -81,6 +86,7 @@ class McpAuthorizationServer:
     issued: list[dict] = field(default_factory=list)  # every token response, newest last
     access_token_lifetime: int = 3600
     registration_names_scope: bool = True  # RFC 7591 lets a server leave `scope` out (Atlassian)
+    token_base: str | None = None  # the base URL the metadata gives the token endpoint, if not ours
 
     @property
     def issuer(self) -> str:
@@ -90,7 +96,7 @@ class McpAuthorizationServer:
         return {
             "issuer": self.issuer,
             "authorization_endpoint": f"{self.base_url}/authorize",
-            "token_endpoint": f"{self.base_url}/token",
+            "token_endpoint": f"{self.token_base or self.base_url}/token",
             "registration_endpoint": f"{self.base_url}/register",
             "scopes_supported": [SCOPE],
             "response_types_supported": ["code"],
@@ -213,10 +219,16 @@ class McpAuthorizationServer:
         return answer
 
 
-def serve_authorization_server() -> tuple[McpAuthorizationServer, Callable[[], None]]:
+def _url_host(host: str, name: str | None) -> str:
+    return name or (f"[{host}]" if ":" in host else host)
+
+
+def serve_authorization_server(
+    host: str = "127.0.0.1", name: str | None = None
+) -> tuple[McpAuthorizationServer, Callable[[], None]]:
     """Start an authorization server on a daemon thread; returns it with its shutdown function."""
     port = free_port()
-    server = McpAuthorizationServer(base_url=f"http://127.0.0.1:{port}")
+    server = McpAuthorizationServer(base_url=f"http://{_url_host(host, name)}:{port}")
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -266,7 +278,8 @@ def serve_authorization_server() -> tuple[McpAuthorizationServer, Callable[[], N
             else:
                 self._send(404, {"error": "not_found"})
 
-    http_server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server_class = IPv6HTTPServer if ":" in host else ThreadingHTTPServer
+    http_server = server_class((host, port), Handler)
     threading.Thread(target=http_server.serve_forever, daemon=True).start()
 
     def shutdown() -> None:
@@ -310,16 +323,27 @@ class ProtectedMcp:
 
 
 @contextmanager
-def serving_protected_mcp() -> Iterator[ProtectedMcp]:
-    auth_server, shutdown = serve_authorization_server()
+def serving_protected_mcp(
+    host: str = "127.0.0.1", name: str | None = None
+) -> Iterator[ProtectedMcp]:
+    auth_server, shutdown = serve_authorization_server(host, name)
     port = free_port()
-    resource_url = f"http://127.0.0.1:{port}/mcp"
+    resource_url = f"http://{_url_host(host, name)}:{port}/mcp"
     verifier = IssuedTokenVerifier(auth_server, resource_url)
     settings = AuthSettings(
         issuer_url=auth_server.issuer, resource_server_url=resource_url, required_scopes=[SCOPE]
     )
     try:
-        with serving_mcp(port, auth=settings, token_verifier=verifier) as url:
+        # the SDK's Host check admits only loopback names, and a test reaches this one by others
+        transport = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        with serving_mcp(
+            port,
+            host=host,
+            name=name,
+            auth=settings,
+            token_verifier=verifier,
+            transport_security=transport,
+        ) as url:
             yield ProtectedMcp(url=url, auth_server=auth_server, verifier=verifier)
     finally:
         shutdown()

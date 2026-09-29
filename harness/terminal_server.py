@@ -33,7 +33,7 @@ from websockets.server import ServerProtocol
 from websockets.sync.client import ClientConnection, connect
 
 from harness.instance import free_port
-from harness.listener import Answer
+from harness.listener import Answer, IPv6HTTPServer
 
 # The admin endpoint pair, for `preserve(TERMINAL_SERVERS_CONFIG)`.
 TERMINAL_SERVERS_CONFIG = ("/api/v1/configs/terminal_servers", "/api/v1/configs/terminal_servers")
@@ -212,7 +212,8 @@ def serving_terminal(host: str = "127.0.0.1") -> Iterator[FakeTerminalServer]:
 
         do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _serve
 
-    server = ThreadingHTTPServer((host, port), RequestHandler)
+    server_class = IPv6HTTPServer if ":" in host else ThreadingHTTPServer
+    server = server_class((host, port), RequestHandler)
     # A short poll keeps teardown quick; shutdown waits for one poll.
     threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
     try:

@@ -16,6 +16,12 @@ seconds after the token was spent, so concurrent refreshes overlap. `jwks_refuse
 the key endpoint answer 403 to a client whose User-Agent starts with it, the way a provider's
 firewall turns away anonymous scripts.
 
+`endpoint_bases` names an endpoint of the discovery document by another base URL than the
+provider's own (`{"token_endpoint": "http://ip6-localhost:PORT"}`), which is how a test reaches
+one endpoint by a host name; `serve(addresses)` listens on those local addresses too, on the
+provider's port. The introspection endpoint answers `active` for a token the provider issued,
+naming `introspected_client_id` as the client it was minted for.
+
 `sso_env(provider)` is the environment that points an instance at it, `sign_in(instance)` walks
 the browser's redirect chain with httpx and returns the session the callback handed out, and
 `oauth_settings(instance, ...)` changes admin-panel OAuth settings for the length of a block.
@@ -34,7 +40,7 @@ import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Sequence
 
 import httpx
 import jwt
@@ -43,10 +49,18 @@ from jwt.algorithms import RSAAlgorithm
 
 from harness.backends import write_rows
 from harness.instance import LaunchedInstance, free_port
+from harness.listener import IPv6HTTPServer
 
 CLIENT_ID = "owui-test-client"
 CLIENT_SECRET = "owui-test-client-secret-0123456789abcdef"
 OAUTH_CONFIG_PATH = "/api/v1/auths/admin/config/oauth"
+ENDPOINT_PATHS = {
+    "token_endpoint": "/token",
+    "userinfo_endpoint": "/userinfo",
+    "jwks_uri": "/jwks",
+    "end_session_endpoint": "/logout",
+    "introspection_endpoint": "/introspect",
+}
 
 
 def _new_key() -> rsa.RSAPrivateKey:
@@ -87,6 +101,8 @@ class OidcProvider:
     sends_expiry: bool = True  # whether token answers carry `expires_in`
     sends_refresh_token: bool = True
     jwks_refused_agent: str | None = None  # a User-Agent prefix the key endpoint answers 403
+    endpoint_bases: dict[str, str] = field(default_factory=dict)  # discovery key -> base URL
+    introspected_client_id: str = CLIENT_ID  # the client the introspection endpoint names
 
     @property
     def issuer(self) -> str:
@@ -190,6 +206,12 @@ class OidcProvider:
             return [entry for entry in self.requests if entry.path == path]
 
     def discovery(self) -> dict:
+        document = self._own_discovery()
+        for key, base_url in self.endpoint_bases.items():
+            document[key] = f"{base_url}{ENDPOINT_PATHS[key]}"
+        return document
+
+    def _own_discovery(self) -> dict:
         return {
             "issuer": self.issuer,
             "authorization_endpoint": f"{self.base_url}/authorize",
@@ -292,6 +314,12 @@ class OidcProvider:
             refused = self.jwks_refused_agent
         return bool(refused) and user_agent.startswith(refused)
 
+    def _introspect(self, token: str) -> tuple[int, dict]:
+        with self.lock:
+            active = token in self.access_tokens
+        answer = {"active": active}
+        return 200, {**answer, "client_id": self.introspected_client_id} if active else answer
+
     def _userinfo(self, authorization: str) -> tuple[int, dict]:
         token = authorization.removeprefix("Bearer ").strip()
         with self.lock:
@@ -299,8 +327,11 @@ class OidcProvider:
         return (200, answer) if answer is not None else (401, {"error": "invalid_token"})
 
 
-def serve() -> tuple[OidcProvider, Callable[[], None]]:
-    """Start a provider on a daemon thread; returns it with its shutdown function."""
+def serve(addresses: Sequence[str] = ()) -> tuple[OidcProvider, Callable[[], None]]:
+    """Start a provider on a daemon thread; returns it with its shutdown function.
+
+    It listens on 127.0.0.1 and on each of `addresses` (an IPv6 one included), all on one port.
+    """
     port = free_port()
     provider = OidcProvider(base_url=f"http://127.0.0.1:{port}")
 
@@ -355,15 +386,22 @@ def serve() -> tuple[OidcProvider, Callable[[], None]]:
             entry = self._record()
             if entry.path == "/token":
                 self._send(*provider._token(entry.form))
+            elif entry.path == "/introspect":
+                self._send(*provider._introspect(entry.form.get("token", "")))
             else:
                 self._send(404, {"error": "not_found"})
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    servers = []
+    for address in ("127.0.0.1", *addresses):
+        server_class = IPv6HTTPServer if ":" in address else ThreadingHTTPServer
+        servers.append(server_class((address, port), Handler))
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
 
     def shutdown() -> None:
-        server.shutdown()
-        server.server_close()
+        for server in servers:
+            server.shutdown()
+            server.server_close()
 
     return provider, shutdown
 

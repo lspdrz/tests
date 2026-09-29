@@ -3,7 +3,8 @@
 `instance` is one scratch backend per session that the regression tests share; every test gets
 a clean `upstream` script and can add accounts with `make_user`. Tests that change global
 settings wrap them in `preserve`, which restores what it snapshotted. `instance_with(env)`
-boots a second backend for settings that only exist as environment variables.
+boots a second backend for settings that only exist as environment variables, and
+`package_instance_with(env)` keeps one for every module of a test package.
 """
 
 from __future__ import annotations
@@ -157,13 +158,8 @@ def preserve(request: pytest.FixtureRequest) -> Generator[Callable[..., None], N
     assert not failures, failures
 
 
-@pytest.fixture(scope="module")
-def instance_with() -> Generator[Callable[[dict[str, str]], LaunchedInstance], None, None]:
-    """`instance_with({"ENV": "value"})` boots an instance of its own, once per env set and module.
-
-    Every call resets that instance's provider, so call it before queueing replies. The
-    instances stop with the module, which keeps the suite's memory to a few instances at a time.
-    """
+@contextlib.contextmanager
+def _instances_by_env() -> Iterator[Callable[[dict[str, str]], LaunchedInstance]]:
     stack = contextlib.ExitStack()
     booted: dict[frozenset, LaunchedInstance] = {}
 
@@ -177,6 +173,24 @@ def instance_with() -> Generator[Callable[[dict[str, str]], LaunchedInstance], N
         return booted[key]
 
     with stack:
+        yield factory
+
+
+@pytest.fixture(scope="module")
+def instance_with() -> Generator[Callable[[dict[str, str]], LaunchedInstance], None, None]:
+    """`instance_with({"ENV": "value"})` boots an instance of its own, once per env set and module.
+
+    Every call resets that instance's provider, so call it before queueing replies. The
+    instances stop with the module, which keeps the suite's memory to a few instances at a time.
+    """
+    with _instances_by_env() as factory:
+        yield factory
+
+
+@pytest.fixture(scope="package")
+def package_instance_with() -> Generator[Callable[[dict[str, str]], LaunchedInstance], None, None]:
+    """`instance_with` for a test package whose modules share one env set, booted once for all."""
+    with _instances_by_env() as factory:
         yield factory
 
 

@@ -2,9 +2,10 @@
 
 `FakeComfyUI(save_node_class)` finishes every queued prompt at once: it announces the end of the
 run on the `/ws` websocket the client waits on and reports one image from the workflow's output
-node, whose `class_type` is `save_node_class`. `serving(fake)` runs it and yields its base URL;
-`comfyui_settings(base_url, workflow)` is the admin's image configuration for generation and
-editing through it. Wrap a change on the shared instance in `preserve(IMAGES_CONFIG)`.
+node, whose `class_type` is `save_node_class`, and `/object_info` lists `CHECKPOINTS`.
+`serving(fake)` runs it and yields its base URL; `comfyui_settings(base_url, workflow)` is the
+admin's image configuration for generation and editing through it. Wrap a change on the shared
+instance in `preserve(IMAGES_CONFIG)`.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from aiohttp import web
 from harness.instance import free_port
 
 PROMPT_ID = "prompt-1"
+CHECKPOINTS = ["dream.safetensors", "sketch.safetensors"]
 SAVE_NODE = "9"
 PROMPT_NODE = {"type": "prompt", "node_ids": ["6"], "key": "text"}
 IMAGE_NODE = {"type": "image", "node_ids": ["10"], "key": "image"}
@@ -68,6 +70,10 @@ class FakeComfyUI:
     async def view(self, request: web.Request) -> web.Response:
         return web.Response(body=PNG, content_type="image/png")
 
+    async def object_info(self, request: web.Request) -> web.Response:
+        loader = {"input": {"required": {"ckpt_name": [CHECKPOINTS]}}}
+        return web.json_response({"CheckpointLoaderSimple": loader})
+
     async def upload(self, request: web.Request) -> web.Response:
         return web.json_response({"name": "input.png"})
 
@@ -79,6 +85,7 @@ def serving(fake: FakeComfyUI) -> Iterator[str]:
     app.router.add_post("/prompt", fake.queue_prompt)
     app.router.add_get(f"/history/{PROMPT_ID}", fake.history)
     app.router.add_get("/view", fake.view)
+    app.router.add_get("/object_info", fake.object_info)
     app.router.add_post("/api/upload/image", fake.upload)
 
     loop = asyncio.new_event_loop()

@@ -3,12 +3,14 @@
 Stands in for whatever outside service the instance calls: a page to fetch, an image engine,
 a tool server, a search provider. `route(method, path, handler)` registers an answer; a handler
 gets the recorded request and returns `(status, headers, body)`. Unrouted paths answer 404,
-CORS preflights (`OPTIONS`) included.
+CORS preflights (`OPTIONS`) included. `listening(host)` binds another local address, an IPv6
+one included.
 """
 
 from __future__ import annotations
 
 import json
+import socket
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -57,6 +59,10 @@ class Listener:
             return [entry for entry in self.received if entry.path.split("?")[0] == path]
 
 
+class IPv6HTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
 @contextmanager
 def listening(host: str = "127.0.0.1") -> Iterator[Listener]:
     class RequestHandler(BaseHTTPRequestHandler):
@@ -100,9 +106,11 @@ def listening(host: str = "127.0.0.1") -> Iterator[Listener]:
 
         do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _serve
 
-    server = ThreadingHTTPServer((host, 0), RequestHandler)
+    server_class = IPv6HTTPServer if ":" in host else ThreadingHTTPServer
+    server = server_class((host, 0), RequestHandler)
     port = server.server_port
-    listener = Listener(base_url=f"http://{host}:{port}", port=port)
+    url_host = f"[{host}]" if ":" in host else host
+    listener = Listener(base_url=f"http://{url_host}:{port}", port=port)
     threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
     try:
         yield listener

@@ -10,7 +10,8 @@ with a self-signed certificate.
 `TOOL_SERVERS` after `preserve(TOOL_SERVERS)`. Given FastMCP's `auth` settings and a
 `token_verifier`, the SDK guards it the way a real OAuth-protected MCP server is guarded: a
 request without a token the verifier accepts gets a 401 pointing at the protected-resource
-metadata it also serves.
+metadata it also serves. `host` is the address it listens on and `name` the host its URL
+carries (the address by default), so a test can reach it by a name.
 """
 
 from __future__ import annotations
@@ -83,6 +84,8 @@ def serving_mcp(
     media: bool = False,
     failing: bool = False,
     tls: bool = False,
+    host: str = "127.0.0.1",
+    name: str | None = None,
     **auth: Any,
 ) -> Iterator[str]:
     """Serve the echo server on `port` (a free one by default); `auth` goes to FastMCP."""
@@ -95,7 +98,7 @@ def serving_mcp(
             certificate = {"ssl_certfile": str(certificate_path), "ssl_keyfile": str(key_path)}
         # log_config=None keeps uvicorn from reconfiguring the test process's logging
         config = uvicorn.Config(
-            app, host="127.0.0.1", port=port, log_config=None, log_level="warning", **certificate
+            app, host=host, port=port, log_config=None, log_level="warning", **certificate
         )
         runner = uvicorn.Server(config)
         thread = threading.Thread(target=runner.run, daemon=True)
@@ -106,7 +109,8 @@ def serving_mcp(
                 raise RuntimeError("the MCP server did not start")
             time.sleep(0.05)
         try:
-            yield f"{'https' if tls else 'http'}://127.0.0.1:{port}/mcp"
+            url_host = name or (f"[{host}]" if ":" in host else host)
+            yield f"{'https' if tls else 'http'}://{url_host}:{port}/mcp"
         finally:
             runner.should_exit = True
             thread.join(timeout=10)
