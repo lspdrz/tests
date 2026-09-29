@@ -1,0 +1,242 @@
+"""Journey: an admin connects a Qdrant collection in the Integrations settings and a chat uses it.
+
+The admin adds a knowledge connection in Admin Settings > Integrations, which can only be saved
+after its test query returned points, reloads to see it listed, edits it without retyping the
+API key and switches it off. A chat that attaches the resulting knowledge base with `#` is sent
+the points Qdrant found; once the connection is switched off the chat is sent none. A local
+service plays Qdrant, so the tests read the query it got and the context the model was sent.
+The settings offer no way to delete a connection or its source.
+
+Discriminates: passes on dev 176d31d1d; in a frontend copy, with the source form sending an
+empty API key on an edit the edit test fails (Qdrant gets no key), with the Create button enabled
+before a test passed the create and the no-points tests fail, and with the switch sending the
+old enabled state the switch test fails (it stays on). In a backend copy, with the retrieval of
+an external knowledge base skipped the chat test fails (Qdrant is never queried).
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+
+import pytest
+from playwright.sync_api import Locator, Page, expect
+
+from harness import upstream as reply
+from harness.external_knowledge import (
+    CONNECTIONS,
+    QDRANT_API_KEY,
+    external_connection,
+    external_knowledge_base,
+    point,
+    queries_to,
+    serve_qdrant,
+)
+from utils.chat_ui import chat_input, expect_reply, send
+
+pytestmark = [pytest.mark.journey, pytest.mark.requires_browser, pytest.mark.requires_source]
+
+POINTS = [
+    point(21, "The boathouse key hangs behind the oar rack.", 0.93, source="boathouse.md"),
+    point(22, "Oars are counted every Friday.", 0.74, source="oars.md"),
+]
+QUESTION = "where is the boathouse key?"
+
+
+@pytest.fixture
+def curator(make_user):
+    """A fresh admin, whose external knowledge is deleted afterwards."""
+    account = make_user(role="admin")
+    yield account
+    with account.client() as client:
+        for knowledge in client.get(
+            "/api/v1/knowledge/search", params={"source": "external"}
+        ).json()["items"]:
+            if knowledge["user_id"] == account.id:
+                client.delete(f"/api/v1/knowledge/{knowledge['id']}/delete")
+        for connection in client.get(CONNECTIONS).json()["items"]:
+            if connection["created_by"] == account.id:
+                client.delete(f"{CONNECTIONS}/{connection['id']}")
+
+
+def _open_integrations(page: Page) -> Locator:
+    """The Integrations tab of the admin settings, freshly loaded from the server."""
+    page.goto("/admin/settings/integrations")
+    settings = page.get_by_role("dialog")
+    expect(settings.get_by_text("External Knowledge Sources", exact=True)).to_be_visible()
+    return settings
+
+
+def _add_button(settings: Locator) -> Locator:
+    # the plus button has no accessible name, so it is found next to the section title
+    header = settings.get_by_text("External Knowledge Sources", exact=True).locator(
+        "xpath=ancestor::div[contains(@class, 'justify-between')][1]"
+    )
+    return header.get_by_role("button")
+
+
+def _row(settings: Locator, name: str) -> Locator:
+    return settings.get_by_text(name).locator(
+        "xpath=ancestor::div[contains(@class, 'gap-2') and contains(@class, 'w-full')][1]"
+    )
+
+
+def _source_form(page: Page, title: str) -> Locator:
+    return page.get_by_role("dialog").filter(has=page.get_by_role("heading", name=title))
+
+
+def _fill_new_source(form: Locator, name: str, endpoint: str, collection: str, query: str) -> None:
+    form.get_by_label("Name", exact=True).fill(name)
+    form.get_by_label("Endpoint").fill(endpoint)
+    form.get_by_label("API Key / Token").fill(QDRANT_API_KEY)
+    form.get_by_label("Collection").fill(collection)
+    form.get_by_label("Test Query").fill(query)
+
+
+def test_a_source_is_added_once_its_test_query_passes_and_survives_a_reload(
+    page_for, curator, listener
+):
+    name = f"Boathouse {uuid.uuid4().hex[:6]}"
+    collection = "boathouse_docs"
+    endpoint = serve_qdrant(listener, collection, POINTS)["endpoint"]
+    page = page_for(curator)
+    settings = _open_integrations(page)
+    _add_button(settings).click()
+    form = _source_form(page, "Add Knowledge Connection")
+    _fill_new_source(form, name, endpoint, collection, QUESTION)
+    expect(form.get_by_role("button", name="Create")).to_be_disabled()
+
+    form.get_by_role("button", name="Verify Connection").click()
+    expect(page.get_by_text("Test succeeded.").first).to_be_visible()
+    form.get_by_role("button", name="Create").click()
+    expect(page.get_by_text("Knowledge source created.").first).to_be_visible()
+
+    settings = _open_integrations(page)
+    expect(settings.get_by_text(name)).to_be_visible()
+    expect(settings.get_by_text(f"qdrant · {collection}")).to_be_visible()
+    # the button test and the create each query Qdrant, both with the key
+    assert [query["limit"] for query in queries_to(listener, collection)] == [5, 5]
+    calls = listener.requests_to(f"/collections/{collection}/points/query")
+    assert {call.headers.get("api-key") for call in calls} == {QDRANT_API_KEY}
+    with curator.client() as client:
+        [saved] = [
+            connection
+            for connection in client.get(CONNECTIONS).json()["items"]
+            if connection["endpoint"] == endpoint
+        ]
+    assert saved["auth_configured"] is True and saved["enabled"] is True
+
+
+def test_a_source_whose_test_query_finds_nothing_cannot_be_created(page_for, curator, listener):
+    collection = "empty_docs"
+    endpoint = serve_qdrant(listener, collection, [])["endpoint"]
+    page = page_for(curator)
+    _add_button(_open_integrations(page)).click()
+    form = _source_form(page, "Add Knowledge Connection")
+    _fill_new_source(form, f"Empty {uuid.uuid4().hex[:6]}", endpoint, collection, QUESTION)
+
+    form.get_by_role("button", name="Verify Connection").click()
+
+    expect(page.get_by_text("Test returned no results.").first).to_be_visible()
+    expect(form.get_by_role("button", name="Create")).to_be_disabled()
+    assert len(queries_to(listener, collection)) == 1
+
+
+def test_an_edited_source_is_saved_under_its_new_name_with_the_key_kept(
+    page_for, curator, listener
+):
+    collection = "boathouse_docs"
+    name = f"Boathouse {uuid.uuid4().hex[:6]}"
+    renamed = f"Slipway {uuid.uuid4().hex[:6]}"
+    form_data = serve_qdrant(listener, collection, POINTS)
+    page = page_for(curator)
+    with (
+        curator.client() as client,
+        external_connection(client, form_data) as connection_id,
+        external_knowledge_base(client, connection_id, collection, name),
+    ):
+        settings = _open_integrations(page)
+        row = _row(settings, name)
+        row.get_by_role("button", name="Configure").click()
+        form = _source_form(page, "Edit Knowledge Connection")
+        expect(form.get_by_label("Name", exact=True)).to_have_value(name)
+        expect(form.get_by_label("Endpoint")).to_have_value(form_data["endpoint"])
+        expect(form.get_by_label("Collection")).to_have_value(collection)
+        expect(form.get_by_label("API Key / Token")).to_have_value("")
+        form.get_by_label("Name", exact=True).fill(renamed)
+        form.get_by_label("Test Query").fill(QUESTION)
+        form.get_by_role("button", name="Verify Connection").click()
+        expect(page.get_by_text("Test succeeded.").first).to_be_visible()
+        form.get_by_role("button", name="Save").click()
+        expect(page.get_by_text("Knowledge source updated.").first).to_be_visible()
+
+        settings = _open_integrations(page)
+        expect(settings.get_by_text(renamed)).to_be_visible()
+        expect(settings.get_by_text(name)).to_have_count(0)
+
+    calls = listener.requests_to(f"/collections/{collection}/points/query")
+    assert len(calls) == 2, "the button test and the save each query Qdrant"
+    assert {call.headers.get("api-key") for call in calls} == {QDRANT_API_KEY}
+
+
+def _attach_and_ask(page: Page, knowledge_name: str, prefix: str) -> None:
+    page.goto("/")
+    chat_input(page).click()
+    page.keyboard.type(f"#{prefix}")
+    page.get_by_role("tooltip").get_by_role("button", name=knowledge_name).click()
+    send(page, QUESTION)
+
+
+def test_a_chat_with_the_source_attached_is_sent_the_points_qdrant_found(
+    page_for, curator, listener, upstream
+):
+    collection = "boathouse_docs"
+    name = f"Boathouse {uuid.uuid4().hex[:6]}"
+    form_data = serve_qdrant(listener, collection, POINTS)
+    upstream.queue(reply.text("Behind the oar rack.", match=reply.answering(QUESTION)))
+    page = page_for(curator)
+    with (
+        curator.client() as client,
+        external_connection(client, form_data) as connection_id,
+        external_knowledge_base(client, connection_id, collection, name),
+    ):
+        _attach_and_ask(page, name, "Boathouse")
+        expect_reply(page, "Behind the oar rack.")
+
+    [query] = queries_to(listener, collection)
+    assert query["query"] == {"nearest": [0.1, 0.2, 0.3]}
+    [chat_request] = [body for body in upstream.chat_requests() if reply.answering(QUESTION)(body)]
+    sent = json.dumps(chat_request["messages"])
+    assert "The boathouse key hangs behind the oar rack." in sent
+    assert "Oars are counted every Friday." in sent
+
+
+def test_a_switched_off_source_stays_off_after_a_reload_and_a_chat_gets_no_points(
+    page_for, curator, listener, upstream
+):
+    collection = "boathouse_docs"
+    name = f"Boathouse {uuid.uuid4().hex[:6]}"
+    form_data = serve_qdrant(listener, collection, POINTS)
+    upstream.queue(reply.text("I do not know.", match=reply.answering(QUESTION)))
+    page = page_for(curator)
+    with (
+        curator.client() as client,
+        external_connection(client, form_data) as connection_id,
+        external_knowledge_base(client, connection_id, collection, name),
+    ):
+        settings = _open_integrations(page)
+        row = _row(settings, name)
+        row.get_by_role("switch").click()
+        expect(row.get_by_role("switch")).not_to_be_checked()
+
+        settings = _open_integrations(page)
+        row = _row(settings, name)
+        expect(row.get_by_role("switch")).not_to_be_checked()
+        assert client.get(f"{CONNECTIONS}/{connection_id}").json()["enabled"] is False
+
+        _attach_and_ask(page, name, "Boathouse")
+        expect_reply(page, "I do not know.")
+
+    assert queries_to(listener, collection) == []
+    [chat_request] = [body for body in upstream.chat_requests() if reply.answering(QUESTION)(body)]
+    assert "oar rack" not in json.dumps(chat_request["messages"])
