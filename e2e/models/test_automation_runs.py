@@ -6,7 +6,7 @@ Runs, and its chat holds the prompt and the model's answer. Every further run jo
 with its own chat, and a run whose model no longer exists is listed with the error it failed on
 and no chat.
 
-Bug, no upstream issue yet: a Run now run never sets the automation's last run time, so after
+Bug, open-webui/open-webui#31580: a Run now run never sets the automation's last run time, so after
 it the page still says "Last run Never" above the run it lists (the list page says "Never" as
 well). Only the scheduler's own claim writes that time. `test_a_manual_run_shows_as_the_last_run`
 stays red until it is fixed.
@@ -127,5 +127,6 @@ def test_a_manual_run_shows_as_the_last_run(page_for, scheduler, make_automation
     expect(details.get_by_role("button", name="View chat")).to_be_visible()
 
     expect(
-        details, "the automation page says it never ran while its run history lists a run"
+        details,
+        "the page says it never ran while its history lists a run (open-webui/open-webui#31580)",
     ).not_to_contain_text("Last run Never")

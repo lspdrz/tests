@@ -11,6 +11,10 @@ fails, one edit each: the subfolder dialog creating at the top level, the folder
 without its prompt and files, a chat dropped on a folder not being moved, the in-place rename
 saving the old name, the delete confirmation inverting its checkbox (both delete tests), a chat
 started on the folder page sent without the folder and the expand toggle not being saved.
+
+The in-place rename test is red on purpose until open-webui/open-webui#31582 is fixed: pressing
+Enter saves the folder twice, so two update requests and two "Folder updated successfully"
+toasts follow one rename.
 """
 
 from __future__ import annotations
@@ -235,13 +239,26 @@ def test_a_chat_dragged_into_between_and_out_of_folders_lands_each_time(page_for
 def test_a_folder_renamed_in_place_keeps_its_new_name(page_for, make_user):
     owner = make_user()
     folder_id = create_folder(owner, "Drafts")
+    update_path = f"/api/v1/folders/{folder_id}/update"
     sidebar = open_sidebar(page_for(owner))
 
     folder_row(sidebar, "Drafts").dblclick()
+    updates = []
+    sidebar.page.on(
+        "request",
+        lambda request: updates.append(request) if request.url.endswith(update_path) else None,
+    )
     rename_input = sidebar.get_by_role("textbox")
     rename_input.fill("Final copies")
     rename_input.press("Enter")
-    expect(sidebar.page.get_by_text("Folder updated successfully").first).to_be_visible()
+    toasts = sidebar.page.get_by_text("Folder updated successfully")
+    expect(toasts.first).to_be_visible()
+    expect(toasts, "one rename showed several toasts (open-webui/open-webui#31582)").to_have_count(
+        1
+    )
+    assert len(updates) == 1, (
+        f"one rename saved the folder {len(updates)} times (open-webui/open-webui#31582)"
+    )
 
     assert stored_folder(owner, folder_id)["name"] == "Final copies"
     reloaded(sidebar)

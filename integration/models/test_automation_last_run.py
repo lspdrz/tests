@@ -4,7 +4,7 @@
 `GET /api/v1/automations/{id}/runs` says `success` and names the chat it made, or `error` with
 the reason when the automation's model no longer exists.
 
-Bug, no upstream issue yet: the automation's `last_run_at` ("Last execution time" in the
+Bug, open-webui/open-webui#31580: the automation's `last_run_at` ("Last execution time" in the
 database reference) is only written when the scheduler claims a due automation, so after a
 Run now run the automation and its list entry still say it never ran, and the automations page
 shows "Last run Never" above the run it lists. `test_a_run_now_run_sets_the_last_run_time` stays
@@ -107,5 +107,6 @@ def test_a_run_now_run_sets_the_last_run_time(scheduler, upstream):
 
     listed_entry = next(item for item in listed if item["id"] == automation["id"])
     assert stored["last_run_at"] is not None and listed_entry["last_run_at"] is not None, (
-        f"a {run['status']} run was recorded but the automation still says it never ran"
+        f"a {run['status']} run was recorded but the automation says it never ran "
+        "(open-webui/open-webui#31580)"
     )

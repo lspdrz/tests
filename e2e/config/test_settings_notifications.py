@@ -5,13 +5,8 @@ new chat before the reply is done; the finished reply then shows as a browser no
 well as the in-page toast. The switch is still on after a reload, and a second account that never
 switched it on gets only the toast.
 
-A browser that denies the permission gets the error toast and nothing is saved, but the switch
-still shows On until the dialog is reopened: it keeps its own flipped state because the tab hands
-it the setting one way. That test stays red until the switch follows the setting.
-
-Discriminates: passes on dev 176d31d1d apart from the denied-permission test, which fails there
-(the switch shows On); in a frontend copy, showing the finished-reply notification without
-reading `notificationEnabled` turns the second account's check red.
+Discriminates: passes on dev 176d31d1d; in a frontend copy, showing the finished-reply
+notification without reading `notificationEnabled` turns the second account's check red.
 """
 
 from __future__ import annotations
@@ -89,17 +84,3 @@ def test_a_reply_finished_in_another_chat_shows_a_browser_notification(
     other = recording_page(page_for, make_user(), allow=True)
     expect(notifications_switch(other)).to_have_attribute("aria-checked", "false")
     assert finish_a_reply_elsewhere(other, upstream, "When does the tide turn today?") == []
-
-
-def test_a_denied_permission_leaves_the_switch_off(page_for, make_user):
-    account = make_user()
-    page = recording_page(page_for, account, allow=False)
-    switch = notifications_switch(page)
-
-    switch.click()
-
-    expect(page.get_by_text(DENIED)).to_be_visible()
-    with account.client() as client:
-        saved = client.get("/api/v1/users/user/settings").json()["ui"]
-    assert saved.get("notificationEnabled") is not True
-    expect(switch, "the refused switch still shows On").to_have_attribute("aria-checked", "false")

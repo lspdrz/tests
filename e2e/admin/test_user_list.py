@@ -13,10 +13,10 @@ nothing turns the delete test red (the row stays) and the Email header sorting b
 sort test red; in a backend copy, the user search matching emails alone turns the search test red
 (the name finds nobody).
 
-The header test is red on dev 176d31d1d: the sorted column's `aria-sort`, added by #27501 to tell
-screen readers the sort, keeps the value it had on load, since in legacy mode Svelte does not
-re-run a template call to a helper when the state that helper reads changes. Writing the
-comparison into each header's attribute turns it green.
+The header test is red on dev 176d31d1d (open-webui/open-webui#31581): the sorted column's
+`aria-sort`, added by #27501 to tell screen readers the sort, keeps the value it had on load,
+since in legacy mode Svelte does not re-run a template call to a helper when the state that
+helper reads changes. Writing the comparison into each header's attribute turns it green.
 """
 
 from __future__ import annotations
@@ -180,6 +180,6 @@ def test_the_sorted_column_header_tells_assistive_technology_its_direction(admin
     with admin_page.expect_response(lambda response: "order_by=name" in response.url):
         name_header.get_by_role("button").click()
 
-    stale = "aria-sort keeps the value it had on load after a header click (#27501)"
+    stale = "aria-sort keeps its load value after a header click (open-webui/open-webui#31581)"
     expect(name_header, stale).to_have_attribute("aria-sort", "ascending")
     expect(created_header, stale).to_have_attribute("aria-sort", "none")
