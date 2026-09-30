@@ -11,12 +11,19 @@ The revocation tests run on an instance of their own backed by `StatefulRedis`; 
 warning is read from the shared instance's log, or from a Redis-less one of its own when the run
 puts the shared instance on Redis.
 
+Fix `2062231f9` (#31621): `GET /api/config` decoded the session token but never asked the
+revocation list, so a signed-out or password-revoked session still received the signed-in
+configuration (permissions, default models and prompts). It now gets the logged-out shape, the
+one an anonymous request gets, while a live session keeps the full one.
+
 Twin of unit/security/test_password_change_revokes_sessions.py.
 
 Discriminates: passes on dev bbfa876af, fails with both `revoke_user_tokens` calls removed
 from the password routes (earlier sessions keep answering 200, no marker is stored and no
 warning is logged), with the marker kept for a fixed 30 days (it expires before the 8-week
-tokens) and with the admin reset revoking even when no password was written.
+tokens) and with the admin reset revoking even when no password was written. The app
+configuration tests pass on dev a5bc78300 and fail with 2062231f9 reverted (the revoked sessions
+get the signed-in configuration back).
 """
 
 from __future__ import annotations
@@ -69,6 +76,14 @@ def redis_instance(revocation_store, instance_with):
 def _session_status(instance, token: str) -> int:
     with instance.client(token) as client:
         return client.get("/api/v1/auths/").status_code
+
+
+def _config_keys(instance, token: str | None = None) -> set[str]:
+    """The top-level keys of `/api/config`; no token means an anonymous request."""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    response = httpx.get(f"{instance.base_url}/api/config", headers=headers, timeout=60.0)
+    assert response.status_code == 200, response.text
+    return set(response.json())
 
 
 def _change_own_password(instance, account, current_password: str) -> httpx.Response:
@@ -236,3 +251,40 @@ def test_without_redis_the_change_logs_that_nothing_was_revoked(instance, instan
         "the operator believes the other sessions were signed out while every one keeps "
         "working (#28725)"
     )
+
+
+def test_a_signed_out_session_gets_the_logged_out_configuration(redis_instance):
+    account = create_user(redis_instance)
+    other_device = sign_in(redis_instance, account.email, account.password)
+    anonymous = _config_keys(redis_instance)
+    signed_in = _config_keys(redis_instance, account.token)
+    assert signed_in > anonymous, "a live session must get more than the logged-out configuration"
+
+    with redis_instance.client(account.token) as client:
+        client.post("/api/v1/auths/signout").raise_for_status()
+
+    assert _config_keys(redis_instance, account.token) == anonymous, (
+        "a signed-out token still received the signed-in configuration (#31621)"
+    )
+    assert _config_keys(redis_instance, other_device) == signed_in, (
+        "signing out one device changed the configuration the account's other session gets"
+    )
+
+
+@pytest.mark.parametrize("change", PASSWORD_CHANGES)
+def test_a_session_revoked_by_a_password_change_gets_the_logged_out_configuration(
+    redis_instance, change
+):
+    account = create_user(redis_instance)
+    other_device = sign_in(redis_instance, account.email, account.password)
+    bystander = create_user(redis_instance)
+    anonymous = _config_keys(redis_instance)
+    signed_in = _config_keys(redis_instance, bystander.token)
+
+    _change_password(redis_instance, account, change)
+
+    assert _config_keys(redis_instance, other_device) == anonymous, (
+        f"a session revoked by the {change} still received the signed-in configuration (#31621)"
+    )
+    assert _config_keys(redis_instance, account.token) == anonymous
+    assert _config_keys(redis_instance, bystander.token) == signed_in
