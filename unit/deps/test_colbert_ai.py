@@ -28,9 +28,9 @@ colbert-ai is a heavy import (it pulls torch), so the import itself is the
 costly step; everything here stays offline. Uses the ``depcheck`` fixture from
 unit/deps/conftest.py.
 
-Kept as a unit contract: the only path to these calls is the ColBERT reranker, and it cannot load
-under the pinned transformers 5 (the red twin is the reranking test in
-integration/config/test_infra_boot.py), so no request reaches `docFromText` or `queryFromText`.
+Kept as a unit contract: the only path to these calls is the ColBERT reranker, which needs a
+checkpoint and a compiled extension (its integration twin is the reranking test in
+integration/config/test_infra_boot.py), so no request here reaches `docFromText` or `queryFromText`.
 """
 
 from __future__ import annotations

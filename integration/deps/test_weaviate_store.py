@@ -14,11 +14,13 @@ Weaviate is played by `harness/weaviate_server.py`, embeddings follow keywords
 (`harness.keyword_embeddings`) and the instance is this module's own (twin of
 unit/deps/test_weaviate_client.py).
 
-The store takes a missing distance for the worst one and tests it with `and
-obj.metadata.distance`, so a chunk Weaviate puts at distance exactly 0 (the query's own vector)
-scores 0 in place of 1; that test stays red until the store checks for `None`.
+A chunk Weaviate puts at distance exactly 0 (the query's own vector) scores 1 (issue #31527, fixed
+in PR #31531): the store once tested the distance for truth and took 0 for a missing one, so the
+perfect match scored 0, came last in a merged search and fell below the memory relevance threshold.
 
-Discriminates: passes on dev ef67cc3fa apart from the distance-zero test. In a backend copy, a
+Discriminates: passes on dev a5bc78300. In a backend copy, the store testing
+`obj.metadata.distance` for truth again (710b9f1e2 reverted) fails the three distance-zero
+tests: the exact match scores 0, ranks last and is filtered out by a threshold. A
 search that passes the raw distance on as the score fails the ranking test; a filtered delete that
 never runs, or a collection delete that does nothing, fails the removal test; a `fetch_objects` call
 that fails accepts the duplicate and keeps the edited file's old text; an iterator that yields
@@ -121,6 +123,40 @@ def test_a_chunk_at_distance_zero_scores_one(client):
         f"{scores[0]}: the Weaviate store reads a distance of 0 as missing and scores it as the "
         "worst match (`obj.metadata.distance if ... and obj.metadata.distance else 2.0`)"
     )
+
+
+def test_a_search_across_the_knowledge_base_lists_the_exact_match_first(
+    client, preserve, on_weaviate
+):
+    preserve(RETRIEVAL_CONFIG, on=on_weaviate)
+    saved = client.post(RETRIEVAL_CONFIG[1], json={"ENABLE_RAG_HYBRID_SEARCH": False})
+    assert saved.status_code == 200, saved.text
+    with knowledge_base(client) as knowledge_id:
+        _filled(client, knowledge_id)
+
+        found = client.post(
+            "/api/v1/retrieval/query/collection",
+            json={"collection_names": [knowledge_id], "query": "Where is the lighthouse?", "k": 3},
+        )
+
+    assert found.status_code == 200, found.text
+    [documents], [scores] = found.json()["documents"], found.json()["distances"]
+    assert [document.strip() for document in documents][0] == LIGHTHOUSE, documents
+    assert scores[0] == pytest.approx(1.0, abs=1e-3), scores
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_a_relevance_threshold_keeps_the_memory_that_matches_exactly(client, on_weaviate, preserve):
+    preserve(RETRIEVAL_CONFIG, on=on_weaviate)
+    saved = client.post(RETRIEVAL_CONFIG[1], json={"RELEVANCE_THRESHOLD": 0.7})
+    assert saved.status_code == 200, saved.text
+    with create_user(on_weaviate).client() as member:
+        _remember(member, "The keeper rows out at dawn.")
+        _remember(member, "The ferry is painted red.")
+
+        recalled = _recalled(member, "The keeper rows out at dawn.")
+
+    assert recalled == ["The keeper rows out at dawn."]
 
 
 def test_a_search_keeps_to_its_own_knowledge_base(client):

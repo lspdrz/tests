@@ -14,11 +14,12 @@
 * 52 (same commit): the ColBERT reranker's startup record passed the model name to a message
   with no placeholder, so the record could not be formatted and the log never named the model.
   The model here is a tiny ColBERT checkpoint written to disk, complete enough to load offline,
-  under a path the reranker loader recognises as `jinaai/jina-colbert-v2`. Loading it fails today,
-  for any checkpoint: colbert-ai 0.2.22's `HF_ColBERT` never calls `post_init`, which
-  transformers 5 relies on to set `all_tied_weights_keys`, so saving a ColBERT reranker switches
-  hybrid search back off (#31522). The reranking test stays red until PR31532 merges. It needs
-  `ninja` on PATH, since colbert-ai compiles a C++ extension to score, and skips without it.
+  under a path the reranker loader recognises as `jinaai/jina-colbert-v2`. Before PR31532
+  (bee06b08b, issue #31522) loading it failed for any checkpoint: colbert-ai 0.2.22's `HF_ColBERT`
+  never calls `post_init`, which transformers 5 relies on to set `all_tied_weights_keys`, so saving
+  a ColBERT reranker switched hybrid search back off. The reranking test saves the reranker, checks
+  hybrid search stays on, reads it back and reranks a knowledge search. It needs `ninja` on PATH,
+  since colbert-ai compiles a C++ extension to score, and skips without it.
 * 167 (PR27754, baeb2dfb8, issue #27752): with `DATABASE_ENABLE_IAM_TOKEN_AUTH` the main database
   signed in with an RDS IAM token, but the pgvector store built its own engine and signed in with
   the URL's password, so startup died with "no password supplied"; the token must also stay off a
@@ -31,11 +32,12 @@ Dockerfile audits stay in unit/config/test_infra_boot.py.
 
 Twin of unit/config/test_infra_boot.py.
 
-Discriminates: passes on bbfa876af; unpinning the resolver in env.py fails the resolver test,
-indexing `SRC_LOG_LEVELS['RAG']` in opengauss.py again fails the openGauss test and dropping the
+Discriminates: passes on a5bc78300; unpinning the resolver in env.py fails the resolver test,
+indexing `SRC_LOG_LEVELS['RAG']` in opengauss.py again fails the openGauss test, dropping the
 ColBERT record's placeholder fails the startup record test, dropping `enable_iam_token_auth` from
-`PgvectorClient` fails the vector store sign-in test and dropping its host, port and user check
-fails the other-database tests. The opt-in resolver and IAM-off tests pass on both.
+`PgvectorClient` fails the vector store sign-in test, dropping its host, port and user check fails
+the other-database tests, and taking the `post_init` subclass out of colbert.py again (PR31532,
+bee06b08b) fails the reranking test. The opt-in resolver and IAM-off tests pass on both.
 """
 
 from __future__ import annotations
@@ -259,11 +261,13 @@ def test_a_colbert_reranker_reranks_a_knowledge_search(
             "/api/v1/retrieval/query/collection",
             json={"collection_names": [knowledge_id], "query": "who is the harbour master?"},
         )
+        stored = client.get(RETRIEVAL_CONFIG[0]).json()
 
     assert saved["ENABLE_RAG_HYBRID_SEARCH"] is True, (
         "saving the jina-colbert-v2 reranker switched hybrid search back off: the ColBERT model "
         "failed to load (colbert-ai 0.2.22 under transformers 5 has no all_tied_weights_keys)"
     )
+    assert stored["ENABLE_RAG_HYBRID_SEARCH"] is True
     assert found.status_code == 200, found.text
     assert "Ingrid" in str(found.json()["documents"])
 

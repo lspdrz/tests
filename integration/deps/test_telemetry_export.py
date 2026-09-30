@@ -15,15 +15,17 @@ exported carrying the trace of the request that wrote it, and the server log pri
 beside the line. The default gRPC exporters send all three signals to a gRPC collector with the
 configured basic auth; that instance keeps its state in Redis and its vectors on a Chroma server.
 
-With traces and logs both on, every log line of Open WebUI's own reaches the collector twice:
-Open WebUI hands each record to its OTLP log handler, and the logging instrumentor it enables
-for traces installs a second handler on the root logger (opentelemetry-instrumentation-logging
-0.63b1 does so unless `OTEL_PYTHON_LOG_AUTO_INSTRUMENTATION=false`). The once-only test stays
-red until one of the two goes.
+Each log line reaches the collector once, with traces and logs both on or with logs alone (issue
+#31524, fixed in PR #31528). Open WebUI hands each record to its OTLP log handler, and the logging
+instrumentor it enables for traces once installed a second handler on the root logger
+(opentelemetry-instrumentation-logging 0.63b1 does so unless log auto-instrumentation is off), so
+with traces on every line was exported twice.
 
 Twin of unit/deps/test_opentelemetry.py and unit/deps/test_psutil.py.
 
-Discriminates: passes on dev ef67cc3fa (except the once-only log test); in a backend copy,
+Discriminates: passes on dev a5bc78300; in a backend copy, calling the logging instrumentor
+without `enable_log_auto_instrumentation=False` (the parent of bff0492b5) fails the once-only test
+of the full setup, which sees two copies, while the logs-only test passes on both; also,
 dropping the user attributes from the sign-in check fails both identity tests, request hooks that
 return at once fail the three client span tests, a Redis hook that does fails the last of them,
 instrumenting no engine fails the database test, the metrics middleware counting the raw path
@@ -286,11 +288,11 @@ def test_a_log_line_carries_the_trace_of_the_request_that_wrote_it(exporting, co
     [span] = collector.wait_for(sign_in_span, "a sign-in span on the log line's trace")
     assert span.attributes["http.status_code"] == 400
     [server_line] = [line for line in exporting.log_since(offset).splitlines() if email in line]
-    assert f'"trace_id": "{record.trace_id}"' in server_line, server_line
+    assert f'"trace_id":"{record.trace_id}"' in server_line.replace('": "', '":"'), server_line
 
 
-def test_each_log_line_is_exported_once(exporting, collector):
-    email = _failed_sign_in(exporting)
+def _assert_exported_once(instance, collector) -> None:
+    email = _failed_sign_in(instance)
 
     collector.wait_for(lambda: _log_lines_naming(collector, email), "the log line")
     time.sleep(2)  # ten batch intervals for a second copy to follow
@@ -300,6 +302,22 @@ def test_each_log_line_is_exported_once(exporting, collector):
         f"the log line reached the collector {len(copies)} times: Open WebUI's log handler and "
         "the one the logging instrumentor adds to the root logger both export it"
     )
+
+
+def test_each_log_line_is_exported_once(exporting, collector):
+    _assert_exported_once(exporting, collector)
+
+
+def test_each_log_line_is_exported_once_with_logs_alone(instance_with, collector):
+    logs_only = instance_with(
+        {
+            **http_collector_env(collector),
+            "ENABLE_OTEL_TRACES": "false",
+            "ENABLE_OTEL_METRICS": "false",
+        }
+    )
+
+    _assert_exported_once(logs_only, collector)
 
 
 @pytest.fixture(scope="module")
