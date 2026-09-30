@@ -10,9 +10,18 @@ with a bundle of its own stays as it is.
 
 A signed-out browser opens the sign-in page with that language as its only preference.
 
-Discriminates: passes on the efe63bd34 build; on a build with d603b5799 reverted every mapped
-case fails (the raw code is stored as the locale and, but for `fr`, the page shows English).
-The unchanged cases pass on both.
+The same file holds the administrator's default language, open-webui/open-webui#31548, fix
+`4987711391` (PR open-webui/open-webui#31551): since 0.11.4 a new visitor got the browser's
+language even when an administrator set DEFAULT_LOCALE, because the detector remembered it as
+the visitor's own pick. On an instance with DEFAULT_LOCALE set, a first visit now shows the
+default language whatever the browser reports, while a language stored by a pick in Settings and
+a `?lang=` link still win. Without DEFAULT_LOCALE the browser's language is followed, as above.
+
+Discriminates: passes on the efe63bd34 build (the default language tests on dev a5bc78300); on a
+build with d603b5799 reverted every mapped case fails (the raw code is stored as the locale and,
+but for `fr`, the page shows English). The unchanged cases pass on both. With `4987711391`
+reverted the first visit test fails (the page shows the browser's French, not the default
+German); the stored pick and `?lang=` tests pass on both.
 """
 
 from __future__ import annotations
@@ -39,12 +48,14 @@ def open_sign_in(browser: Browser, config):
     """`open_sign_in(reported)` opens the sign-in page in a browser that reports `reported`."""
     contexts = []
 
-    def open_page(reported: str):
-        context = browser.new_context(locale=reported, base_url=config.base_url)
+    def open_page(reported: str, base_url: str | None = None, path: str = "/auth", stored=None):
+        context = browser.new_context(locale=reported, base_url=base_url or config.base_url)
         context.set_default_timeout(config.default_timeout)
         contexts.append(context)
+        if stored:
+            context.add_init_script(f"localStorage.locale = {stored!r}")
         page = context.new_page()
-        page.goto("/auth")
+        page.goto(path)
         return page
 
     yield open_page
@@ -91,3 +102,36 @@ def test_a_regional_code_of_another_script_is_not_moved_to_a_sibling(open_sign_i
     assert page.evaluate("localStorage.locale") == "zh-HK", (
         "Traditional Chinese from Hong Kong was sent to the Simplified zh-CN translation"
     )
+
+
+@pytest.fixture(scope="module")
+def german_default(instance_with) -> str:
+    """The base URL of an instance whose administrator set German as the default language."""
+    return instance_with({"DEFAULT_LOCALE": "de-DE"}).base_url
+
+
+@pytest.mark.slow
+def test_a_first_visit_gets_the_configured_default_language(open_sign_in, german_default):
+    page = open_sign_in("fr-FR", base_url=german_default)
+
+    expect(
+        page.get_by_role("button", name=SIGN_IN_LABEL["de-DE"], exact=True),
+        "#31548: the browser language won over DEFAULT_LOCALE on a first visit",
+    ).to_be_visible()
+
+
+@pytest.mark.slow
+def test_a_language_picked_in_settings_wins_over_the_configured_default(
+    open_sign_in, german_default
+):
+    # Settings keeps the pick in localStorage
+    page = open_sign_in("nl-NL", base_url=german_default, stored="fr-FR")
+
+    expect(page.get_by_role("button", name=SIGN_IN_LABEL["fr-FR"], exact=True)).to_be_visible()
+
+
+@pytest.mark.slow
+def test_a_lang_link_wins_over_the_configured_default(open_sign_in, german_default):
+    page = open_sign_in("nl-NL", base_url=german_default, path="/auth?lang=fr-FR")
+
+    expect(page.get_by_role("button", name=SIGN_IN_LABEL["fr-FR"], exact=True)).to_be_visible()

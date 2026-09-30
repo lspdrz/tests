@@ -7,10 +7,15 @@
   connection was added, the Add Connection form cleared its URL, key and a few fields but kept
   the headers, the enabled switch, the connection and API types, the provider and the API
   version, so the next connection added was silently saved with the first one's.
+* open-webui/open-webui#31377, fix `e924fa7b5` (PR open-webui/open-webui#31378): after the
+  connection dialog refused headers that are not a JSON object, its Save button stayed disabled
+  with a spinner until the page was reloaded, so the corrected headers could not be saved.
 
-Discriminates: passes on the efe63bd34 build; with `0864f8b2d` reverted the delete test fails
-(the connection is still saved), with `301aa8c5b` reverted both add tests fail (the second
-connection carries the first one's headers, provider and API type, or its disabled switch).
+Discriminates: passes on the efe63bd34 build (the headers test on dev a5bc78300); with `0864f8b2d`
+reverted the delete test fails (the connection is still saved), with `301aa8c5b` reverted both add
+tests fail (the second connection carries the first one's headers, provider and API type, or its
+disabled switch), with `e924fa7b5` reverted the headers test fails (Save stays disabled after the
+error).
 """
 
 from __future__ import annotations
@@ -161,3 +166,43 @@ def test_the_next_admin_connection_does_not_inherit_the_advanced_settings(
     assert carried == {"headers": None, "provider": None, "api_type": None}, (
         f"the second connection was saved with the first one's settings: {carried}"
     )
+
+
+# --------------------------------------------------------------------------- invalid headers
+
+
+def refuse_then_save_headers(page, form, url: str, is_save) -> None:
+    """Fill the form with headers that are no JSON object, then fix them and save."""
+    form.get_by_role("combobox", name="URL").fill(url)
+    form.get_by_role("button", name="Advanced").click()
+    headers = form.get_by_placeholder("Enter additional headers in JSON format")
+    headers.fill("[1, 2]")
+    save = form.get_by_role("button", name="Save")
+    save.click()
+    expect(page.get_by_text("Headers must be a valid JSON object")).to_be_visible()
+    expect(save, "#31377: Save stayed disabled after the headers error").to_be_enabled()
+    headers.fill('{"X-Team": "crew"}')
+    with page.expect_response(is_save):
+        save.click()
+    expect(form).to_be_hidden()
+
+
+def test_an_admin_connection_saves_once_its_headers_are_fixed(page_for, make_user, admin, preserve):
+    preserve(OPENAI_CONFIG)
+    page = page_for(make_user(role="admin"))
+    page.goto("/admin/settings/connections")
+    settings = page.get_by_role("dialog")
+    expect(settings.get_by_role("tab", selected=True)).to_be_visible()
+
+    tooltip_button(settings, "Add Connection").click()
+    refuse_then_save_headers(
+        page,
+        add_connection_form(page),
+        FIRST_URL,
+        lambda response: "/openai/config/update" in response.url,
+    )
+
+    with admin.client() as client:
+        config = client.get(OPENAI_CONFIG[0]).json()
+    index = config["OPENAI_API_BASE_URLS"].index(FIRST_URL)
+    assert config["OPENAI_API_CONFIGS"][str(index)]["headers"] == {"X-Team": "crew"}
