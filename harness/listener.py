@@ -11,11 +11,16 @@ from __future__ import annotations
 
 import json
 import socket
+import ssl
+import tempfile
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Callable, Iterator
+
+from harness.object_storage import self_signed_certificate
 
 
 @dataclass
@@ -64,7 +69,7 @@ class IPv6HTTPServer(ThreadingHTTPServer):
 
 
 @contextmanager
-def listening(host: str = "127.0.0.1") -> Iterator[Listener]:
+def listening(host: str = "127.0.0.1", tls: bool = False) -> Iterator[Listener]:
     class RequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -110,10 +115,17 @@ def listening(host: str = "127.0.0.1") -> Iterator[Listener]:
     server = server_class((host, 0), RequestHandler)
     port = server.server_port
     url_host = f"[{host}]" if ":" in host else host
-    listener = Listener(base_url=f"http://{url_host}:{port}", port=port)
-    threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
-    try:
-        yield listener
-    finally:
-        server.shutdown()
-        server.server_close()
+    scheme = "https" if tls else "http"
+    listener = Listener(base_url=f"{scheme}://{url_host}:{port}", port=port)
+    with tempfile.TemporaryDirectory(prefix="owui-listener-") as certificates:
+        if tls:
+            certificate, key = self_signed_certificate(Path(certificates))
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certificate, key)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
+        try:
+            yield listener
+        finally:
+            server.shutdown()
+            server.server_close()
