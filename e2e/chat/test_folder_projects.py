@@ -3,6 +3,8 @@
 A person creates a folder and a subfolder in the sidebar, gives a folder a system prompt, a
 knowledge base and an uploaded file in its settings, drags chats into, between and out of
 folders, renames and deletes folders, opens a folder's page and folds folders open and shut.
+A pinned chat that also sits in a folder, dragged onto Chats or onto Pinned, lands there with the
+stored pinned state that section means (open-webui/open-webui#31368, issue #31367).
 Each outcome is read back from what the server stored or after a reload, and the folder's
 settings from the request the scripted provider receives for a new chat started in the folder.
 
@@ -10,7 +12,9 @@ Discriminates: passes on the dev 176d31d1d build; in a frontend copy of that bui
 fails, one edit each: the subfolder dialog creating at the top level, the folder dialog saving
 without its prompt and files, a chat dropped on a folder not being moved, the in-place rename
 saving the old name, the delete confirmation inverting its checkbox (both delete tests), a chat
-started on the folder page sent without the folder and the expand toggle not being saved.
+started on the folder page sent without the folder and the expand toggle not being saved. In the
+a5bc78300 build with #31368 reverted, the pinned chat dropped on Chats stays under Pinned and the
+one dropped on Pinned ends unpinned.
 
 The in-place rename test is red on purpose until open-webui/open-webui#31582 is fixed: pressing
 Enter saves the folder twice, so two update requests and two "Folder updated successfully"
@@ -20,6 +24,7 @@ toasts follow one rename.
 from __future__ import annotations
 
 import re
+import time
 import uuid
 
 import pytest
@@ -234,6 +239,95 @@ def test_a_chat_dragged_into_between_and_out_of_folders_lands_each_time(page_for
     expect(sidebar.get_by_text("No chats")).to_have_count(2)
     expect(chat_row(sidebar, "Loose ends")).to_have_count(1)
     assert stored_chat(owner, chat_id)["folder_id"] is None
+
+
+def pinned_section(sidebar: Locator) -> Locator:
+    """The Pinned group inside the Chats section, found from its header button."""
+    header = sidebar.get_by_role("button", name="Pinned", exact=True)
+    return header.locator("xpath=ancestor::div[.//div[@id='sidebar-chat-group']][1]")
+
+
+def pin_chat(owner, chat_id: str) -> None:
+    with owner.client() as client:
+        pinned = client.post(f"/api/v1/chats/{chat_id}/pin")
+    assert pinned.status_code == 200, pinned.text
+
+
+def wait_until_pinned(owner, chat_id: str, timeout: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout
+    stored = stored_chat(owner, chat_id)
+    while not stored["pinned"] and time.monotonic() < deadline:
+        time.sleep(0.2)
+        stored = stored_chat(owner, chat_id)
+    return stored
+
+
+def pinned_and_filed(owner, title: str, folder_id: str) -> str:
+    chat_id = create_chat(owner, title, folder_id)
+    pin_chat(owner, chat_id)
+    stored = stored_chat(owner, chat_id)
+    assert (stored["pinned"], stored["folder_id"]) == (True, folder_id)
+    return chat_id
+
+
+@pytest.mark.regression
+def test_a_pinned_chat_in_a_folder_dragged_onto_chats_is_unpinned_and_listed_there(
+    page_for, make_user
+):
+    owner = make_user()
+    folder_id = create_folder(owner, "Alpha")
+    expand_folder(owner, folder_id)
+    chat_id = pinned_and_filed(owner, "Pinned and filed", folder_id)
+    sidebar = open_sidebar(page_for(owner))
+    pinned = pinned_section(sidebar)
+    expect(chat_row(pinned, "Pinned and filed")).to_be_visible()
+
+    drag(
+        sidebar.page,
+        chat_row(pinned, "Pinned and filed"),
+        sidebar.get_by_role("button", name="Chats", exact=True),
+    )
+
+    chats_content = sidebar.locator("#sidebar-chats-content")
+    expect(
+        sidebar.get_by_role("button", name="Pinned", exact=True),
+        "the chat dropped on Chats stayed under Pinned (open-webui/open-webui#31367)",
+    ).to_have_count(0)
+    expect(chat_row(chats_content, "Pinned and filed")).to_be_visible()
+    stored = stored_chat(owner, chat_id)
+    assert stored["pinned"] is False, "the chat dropped on Chats is still pinned (#31367)"
+    assert stored["folder_id"] is None
+    reloaded(sidebar)
+    expect(chat_row(chats_content, "Pinned and filed")).to_be_visible()
+
+
+@pytest.mark.regression
+def test_a_pinned_chat_in_a_folder_dragged_onto_pinned_stays_pinned_outside_the_folder(
+    page_for, make_user
+):
+    owner = make_user()
+    folder_id = create_folder(owner, "Alpha")
+    expand_folder(owner, folder_id)
+    anchor_id = create_chat(owner, "Anchor")
+    pin_chat(owner, anchor_id)
+    chat_id = pinned_and_filed(owner, "Pinned and filed", folder_id)
+    sidebar = open_sidebar(page_for(owner))
+    pinned = pinned_section(sidebar)
+    expect(chat_row(pinned, "Anchor")).to_be_visible()
+
+    with sidebar.page.expect_response(re.compile(f"/api/v1/chats/{chat_id}/folder")):
+        drag(
+            sidebar.page,
+            chat_row(pinned, "Pinned and filed"),
+            sidebar.get_by_role("button", name="Pinned", exact=True),
+        )
+
+    stored = wait_until_pinned(owner, chat_id)
+    assert stored["pinned"] is True, "the chat dropped on Pinned is not pinned (#31367)"
+    assert stored["folder_id"] is None
+    expect(chat_row(pinned, "Pinned and filed")).to_be_visible()
+    reloaded(sidebar)
+    expect(chat_row(pinned_section(sidebar), "Pinned and filed")).to_be_visible()
 
 
 def test_a_folder_renamed_in_place_keeps_its_new_name(page_for, make_user):

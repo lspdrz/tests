@@ -6,13 +6,16 @@ is stored. A note shared read-only opens for the reader marked Read-Only Access 
 that takes no typing, a note shared for writing through a group takes the writer's typing, and
 an account it was never shared with is sent away from it. A note downloads as plain text and as
 Markdown with its title as the file name, the search on the Notes page keeps only the notes
-whose title matches, and a note attached to a chat from the composer reaches the model.
+whose title matches, and a note attached to a chat from the composer reaches the model. The
+composer's note picker keeps a note shared read-only in its list when a name is typed into its
+search (open-webui/open-webui#30968, issue #30967).
 
 Discriminates: passes on dev 176d31d1d; in a frontend copy, each test fails when its behaviour
 is cut: the note editor ignoring the model's edit event, the editor staying editable for a reader,
 the editor not leaving a note it cannot load, the downloads writing the HTML, the Notes page
-search sending no query and the composer's note picker attaching nothing. In a backend copy,
-`GET /api/v1/notes/{id}` ignoring write grants turns the writer test red.
+search sending no query and the composer's note picker attaching nothing. In the a5bc78300
+build with #30968 reverted, the shared note is gone from the picker once a name is typed. In a
+backend copy, `GET /api/v1/notes/{id}` ignoring write grants turns the writer test red.
 """
 
 from __future__ import annotations
@@ -210,6 +213,14 @@ def test_the_notes_search_keeps_only_matching_notes(page_for, make_user):
 # ---------------------------------------------------------------- a note as chat context
 
 
+def _open_note_picker(page: Page) -> Locator:
+    expect(chat_input(page)).to_be_visible()
+    page.get_by_role("button", name="More", exact=True).last.click()
+    menu = page.get_by_role("menu")
+    menu.get_by_role("button", name="Attach Notes").click()
+    return menu
+
+
 def test_a_note_attached_in_the_composer_reaches_the_model(page_for, make_user, upstream):
     author = make_user()
     title = _unique("Allergies")
@@ -218,14 +229,35 @@ def test_a_note_attached_in_the_composer_reaches_the_model(page_for, make_user, 
     question = f"what should I avoid baking? {uuid.uuid4().hex[:6]}"
     upstream.queue(reply.text("Skip the hazelnuts.", match=reply.answering(question)))
     page = page_for(author)
-    expect(chat_input(page)).to_be_visible()
 
-    page.get_by_role("button", name="More", exact=True).last.click()
-    page.get_by_role("menu").get_by_role("button", name="Attach Notes").click()
-    page.get_by_role("menu").get_by_role("button", name=title).click()
+    picker = _open_note_picker(page)
+    picker.get_by_role("button", name=title).click()
     send(page, question)
 
     expect_reply(page, "Skip the hazelnuts.")
     [request] = [body for body in upstream.chat_requests() if reply.answering(question)(body)]
     sent = " ".join(str(message.get("content")) for message in request["messages"])
     assert note_text in sent, f"the note never reached the model: {sent}"
+
+
+@pytest.mark.regression
+def test_the_composer_note_picker_finds_a_note_shared_read_only_by_name(page_for, make_user):
+    author, reader = make_user(), make_user()
+    shared = _unique("Shared tide table")
+    own = _unique("Own tide table")
+    other = _unique("Unrelated recipe")
+    _create_note(author, shared, "high at noon", [grant("user", reader.id, "read")])
+    _create_note(reader, own, "low at dusk")
+    _create_note(reader, other, "soup")
+    picker = _open_note_picker(page_for(reader))
+    expect(picker.get_by_role("button", name=shared)).to_be_visible()
+
+    picker.get_by_placeholder("Search Notes").fill("tide table")
+
+    expect(picker.get_by_role("button", name=other)).to_have_count(0)
+    expect(picker.get_by_role("button", name=own)).to_be_visible()
+    expect(
+        picker.get_by_role("button", name=shared),
+        "the read-only shared note vanished from the picker once a search was typed"
+        " (open-webui/open-webui#30967)",
+    ).to_be_visible()

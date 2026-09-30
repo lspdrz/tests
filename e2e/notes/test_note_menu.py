@@ -3,18 +3,21 @@
 Copy link puts the note's address on the clipboard, from the editor and from the Notes page, and
 the address opens the note. Copy to clipboard puts the note's Markdown there as plain text and
 its formatting as HTML. Download as plain text saves what the editor holds under the note's
-title. Upload files attaches a file to the note as a chip above the text, stored with the note
-and still there after a reload, and the chip's close button detaches it again. The Access button
-opens Access Control, where an owner allowed to share notes adds a person or a group from the
-access list at Read or Write, changes the level or removes them, or makes the note public; each
-change is saved at once, and the other account then meets the note read-only, editable or not
-at all. Without the sharing permission the panel has no access list.
+title, and the Markdown download keeps a table cell of two lines inside its row
+(open-webui/open-webui#31539, issue #31538). Upload files attaches a file to the note as a chip
+above the text, stored with the note and still there after a reload, and the chip's close
+button detaches it again. The Access button opens Access Control, where an owner allowed to
+share notes adds a person or a group from the access list at Read or Write, changes the level or
+removes them, or makes the note public; each change is saved at once, and the other account then
+meets the note read-only, editable or not at all. Without the sharing permission the panel has no
+access list.
 
 Discriminates: passes on dev 176d31d1d; in a frontend copy, each test fails when its behaviour
 is cut: the copied link pointing at the Notes page (editor and list), the clipboard's plain text
 getting the HTML, the plain-text download writing the HTML, the upload not saving the note's
 files, the chip's close button not saving, the access panel never sending the grants, removing a
 person dropping only their write grant and the access list shown without the sharing permission.
+In the a5bc78300 build with #31539 reverted, the second line of a table cell starts a broken row.
 """
 
 from __future__ import annotations
@@ -173,6 +176,49 @@ def test_download_as_plain_text_saves_what_the_editor_holds(page_for, make_user)
     download = download_info.value
     assert download.suggested_filename == f"{title}.txt"
     assert Path(download.path()).read_text() == "eggs and flour"
+
+
+TABLE_HTML = (
+    "<table><tbody>"
+    "<tr><th><p>Item</p></th><th><p>Qty</p></th></tr>"
+    "<tr><td><p>Tea</p><p>Green</p></td><td><p>3</p></td></tr>"
+    "</tbody></table><p>end</p>"
+)
+
+
+@pytest.mark.regression
+def test_download_keeps_a_two_line_table_cell_inside_its_row(page_for, make_user):
+    author = make_user()
+    title = _unique("Pantry")
+    with author.client() as client:
+        created = client.post(
+            "/api/v1/notes/create",
+            json={
+                "title": title,
+                "data": {"content": {"html": TABLE_HTML, "md": ""}},
+                "access_grants": [],
+            },
+        )
+    assert created.status_code == 200, created.text
+    note_id = created.json()["id"]
+    page = page_for(author)
+    editor = _open_note(page, note_id, "Green")
+    editor.get_by_text("end", exact=True).click()
+    page.keyboard.press("End")
+    page.keyboard.type(" of list")
+    _eventually(
+        lambda: "end of list" in str(_stored_note(author, note_id)["data"]["content"]["md"]), True
+    )
+
+    menu = _open_note_menu(page)
+    menu.get_by_role("button", name="Download").hover()
+    with page.expect_download() as download_info:
+        page.get_by_role("button", name="Plain text (.md)").click()
+
+    markdown = Path(download_info.value.path()).read_text()
+    assert re.search(r"^\| Tea(<br>)+Green \| 3 \|$", markdown, re.M), (
+        f"a two-line table cell broke its row (open-webui/open-webui#31538): {markdown!r}"
+    )
 
 
 # ---------------------------------------------------------------- files
