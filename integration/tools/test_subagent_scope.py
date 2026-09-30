@@ -35,12 +35,12 @@ from __future__ import annotations
 import contextlib
 import json
 import secrets
-import sqlite3
 import time
 import uuid
 
 import pytest
 
+from harness import backends
 from harness import upstream as reply
 from harness.chat import ask, send_message
 from harness.knowledge_bases import add_text_file, knowledge_base, model_with_knowledge
@@ -567,13 +567,16 @@ def test_a_subagent_in_a_folder_chat_gets_the_folders_knowledge_tools_its_parent
 
 
 def _stored_subagent_chats(instance, parent_chat_id: str) -> list[dict]:
-    with sqlite3.connect(instance.data_dir / "webui.db") as database:
-        rows = database.execute("select chat, meta from chat where meta like '%subagent%'")
-        return [
-            json.loads(chat)
-            for chat, meta in rows.fetchall()
-            if json.loads(meta).get("parent_chat_id") == parent_chat_id
-        ]
+    rows = backends.read_rows(
+        instance,
+        "SELECT CAST(chat AS TEXT) AS chat, CAST(meta AS TEXT) AS meta FROM chat "
+        "WHERE CAST(meta AS TEXT) LIKE '%subagent%'",
+    )
+    return [
+        json.loads(row["chat"])
+        for row in rows
+        if json.loads(row["meta"]).get("parent_chat_id") == parent_chat_id
+    ]
 
 
 def _delegate_from(client, upstream, chat_id: str | None, task: str, answer: str) -> str:

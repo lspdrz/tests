@@ -390,12 +390,17 @@ def test_making_a_note_public_lets_any_account_read_it(page_for, sharer, make_us
     _open_note(page, note_id, "office closed on Monday")
     panel = _open_access_panel(page)
 
-    panel.get_by_role("combobox").first.select_option("public")
+    try:
+        panel.get_by_role("combobox").first.select_option("public")
 
-    expect(page.get_by_text("Saved", exact=True)).to_be_visible()
-    expect(panel.get_by_text("Accessible to all users")).to_be_visible()
-    assert ("user", "*", "read") in _stored_grants(sharer, note_id)
-    _expect_read_only(page_for(anyone), note_id, "office closed on Monday")
+        expect(page.get_by_text("Saved", exact=True)).to_be_visible()
+        expect(panel.get_by_text("Accessible to all users")).to_be_visible()
+        assert ("user", "*", "read") in _stored_grants(sharer, note_id)
+        _expect_read_only(page_for(anyone), note_id, "office closed on Monday")
+    finally:
+        # a public note shows in every later account's notes list
+        with sharer.client() as client:
+            client.delete(f"/api/v1/notes/{note_id}/delete").raise_for_status()
 
 
 def test_without_the_sharing_permission_the_access_panel_has_no_list(page_for, make_user):

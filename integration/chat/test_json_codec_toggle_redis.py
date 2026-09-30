@@ -82,6 +82,14 @@ def _finished(events: list[dict]) -> bool:
     return False
 
 
+def _settled(events: list[dict]) -> bool:
+    """Whether the chat's last event came: `chat:active` off, sent after the task ends."""
+    return any(
+        event.get("type") == "chat:active" and event["data"].get("active") is False
+        for event in events
+    )
+
+
 def _streamed_text(events: list[dict]) -> str:
     payloads = [event.get("data") for event in events]
     return "".join(
@@ -134,7 +142,10 @@ def test_a_tab_on_the_other_codec_receives_the_mixed_text_stream(pair, writer, r
         turn = send_message(client, prompt)
         stored = wait_for_reply(client, turn)
         near_tab.wait_for(turn.chat_id, "chat:completion", done=True)
-        _wait_until(lambda: _finished(far_tab.events_of(turn.chat_id)), GRACE_SECONDS)
+        tabs = (near_tab, far_tab)
+        _wait_until(
+            lambda: all(_settled(tab.events_of(turn.chat_id)) for tab in tabs), GRACE_SECONDS
+        )
 
     far_events = far_tab.events_of(turn.chat_id)
     assert far_events, f"a tab on the {reader} instance saw nothing of a chat streamed on {writer}"

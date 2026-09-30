@@ -361,6 +361,11 @@ def test_stopping_the_chat_during_a_foreground_subagent_stops_it_and_the_chat_st
 
     started_tasks = running_task_ids(admin) - idle_tasks
     assert len(started_tasks) >= 2, "the reply and its sub-agent should both be running tasks"
+    # stop while the sub-agent waits on its answer, not before it has asked for it
+    wait_until(
+        lambda: any(task in str(r["messages"]) for r in upstream.chat_requests()),
+        timeout_seconds=10.0,
+    )
 
     stop_button(page).click()
 
