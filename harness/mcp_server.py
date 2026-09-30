@@ -4,8 +4,9 @@
 URL, the one an admin enters for an MCP tool server connection. It offers a single tool, `echo`,
 and stops again when the block ends. With `media=True` it also offers `snapshot`, answering
 with `SNAPSHOT_PNG` as an image, and `chime`, answering with `CHIME_WAV` as audio; with
-`failing=True`, `capsize`, which fails with `CAPSIZE_ERROR`. `tls=True` serves it over HTTPS
-with a self-signed certificate.
+`failing=True`, `capsize`, which fails with `CAPSIZE_ERROR`; with `slow=True`, `ponder`, which
+answers `PONDERED` after the number of seconds it is asked to wait. `tls=True` serves it over
+HTTPS with a self-signed certificate.
 `mcp_connection(...)` is the admin's connection to it without auth; save it through
 `TOOL_SERVERS` after `preserve(TOOL_SERVERS)`. Given FastMCP's `auth` settings and a
 `token_verifier`, the SDK guards it the way a real OAuth-protected MCP server is guarded: a
@@ -16,6 +17,7 @@ carries (the address by default), so a test can reach it by a name.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import io
@@ -34,6 +36,7 @@ from harness.object_storage import self_signed_certificate
 
 ECHO_DESCRIPTION = "Repeat the text back."
 CAPSIZE_ERROR = "the boat capsized in the harbour"
+PONDERED = "slept on it"
 SNAPSHOT_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
@@ -52,7 +55,9 @@ def _silence_wav() -> bytes:
 CHIME_WAV = _silence_wav()
 
 
-def _echo_server(media: bool = False, failing: bool = False, **auth: Any) -> FastMCP:
+def _echo_server(
+    media: bool = False, failing: bool = False, slow: bool = False, **auth: Any
+) -> FastMCP:
     server = FastMCP("harness-mcp", log_level="WARNING", **auth)
 
     @server.tool(description=ECHO_DESCRIPTION)
@@ -75,6 +80,13 @@ def _echo_server(media: bool = False, failing: bool = False, **auth: Any) -> Fas
         def capsize() -> str:
             raise RuntimeError(CAPSIZE_ERROR)
 
+    if slow:
+
+        @server.tool(description="Think it over for a while.")
+        async def ponder(seconds: float) -> str:
+            await asyncio.sleep(seconds)
+            return PONDERED
+
     return server
 
 
@@ -83,6 +95,7 @@ def serving_mcp(
     port: int | None = None,
     media: bool = False,
     failing: bool = False,
+    slow: bool = False,
     tls: bool = False,
     host: str = "127.0.0.1",
     name: str | None = None,
@@ -90,7 +103,7 @@ def serving_mcp(
 ) -> Iterator[str]:
     """Serve the echo server on `port` (a free one by default); `auth` goes to FastMCP."""
     port = port or free_port()
-    app = _echo_server(media, failing, **auth).streamable_http_app()
+    app = _echo_server(media, failing, slow, **auth).streamable_http_app()
     with tempfile.TemporaryDirectory(prefix="owui-mcp-") as certificates:
         certificate = {}
         if tls:

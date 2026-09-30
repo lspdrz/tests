@@ -11,7 +11,11 @@ answers `invalid_grant`.
 The authorization server records every request. `access_token_lifetime` sets the `expires_in`
 of the tokens it issues next, `registration_names_scope = False` leaves the scope out of its
 registration answers, `token_base` names the token endpoint of its metadata by another base URL,
-`revoke_refresh_tokens()` withdraws the live refresh tokens and
+`authorize_base` its authorize endpoint (`GOOGLE_ACCOUNTS` plays Google's sign-in page), and
+`reached(url)` points a URL the browser was sent there back at this server. With
+`offline_access_only` a code grant carries a refresh token only when the authorize asked for
+`access_type=offline`, the way Google's does. `revoke_refresh_tokens()` withdraws the live refresh
+tokens and
 `ProtectedMcp.presented` lists every bearer token the MCP server was shown. Both servers listen
 on `host` and name themselves by `name` (the address by default), so a test reaches them by a
 host name.
@@ -40,6 +44,7 @@ from harness.listener import IPv6HTTPServer
 from harness.mcp_server import serving_mcp
 
 SCOPE = "mcp:tools"
+GOOGLE_ACCOUNTS = "https://accounts.google.com"
 
 
 @dataclass
@@ -87,6 +92,8 @@ class McpAuthorizationServer:
     access_token_lifetime: int = 3600
     registration_names_scope: bool = True  # RFC 7591 lets a server leave `scope` out (Atlassian)
     token_base: str | None = None  # the base URL the metadata gives the token endpoint, if not ours
+    authorize_base: str | None = None  # the same for the authorize endpoint
+    offline_access_only: bool = False
 
     @property
     def issuer(self) -> str:
@@ -95,7 +102,7 @@ class McpAuthorizationServer:
     def metadata(self) -> dict:
         return {
             "issuer": self.issuer,
-            "authorization_endpoint": f"{self.base_url}/authorize",
+            "authorization_endpoint": f"{self.authorize_base or self.base_url}/authorize",
             "token_endpoint": f"{self.token_base or self.base_url}/token",
             "registration_endpoint": f"{self.base_url}/register",
             "scopes_supported": [SCOPE],
@@ -104,6 +111,10 @@ class McpAuthorizationServer:
             "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
             "code_challenge_methods_supported": ["S256"],
         }
+
+    def reached(self, url: str) -> str:
+        """A URL on the metadata's authorize endpoint, as a browser would have reached it here."""
+        return url.replace(self.authorize_base or self.base_url, self.base_url, 1)
 
     def requests_to(self, path: str) -> list[AuthorizationRequest]:
         with self.lock:
@@ -162,6 +173,7 @@ class McpAuthorizationServer:
                 "code_challenge": query["code_challenge"],
                 "scope": query.get("scope", ""),
                 "resource": query.get("resource"),
+                "offline": query.get("access_type") == "offline",
             }
         answer = {"code": code, **({"state": query["state"]} if "state" in query else {})}
         return 302, {}, f"{query['redirect_uri']}?{urllib.parse.urlencode(answer)}"
@@ -188,7 +200,10 @@ class McpAuthorizationServer:
             return 400, {"error": "invalid_grant", "error_description": "redirect_uri mismatch"}
         if _s256(form.get("code_verifier", "")) != grant["code_challenge"]:
             return 400, {"error": "invalid_grant", "error_description": "PKCE verification failed"}
-        return 200, self._issue_tokens(client_id, grant["scope"], grant["resource"])
+        with_refresh_token = grant["offline"] or not self.offline_access_only
+        return 200, self._issue_tokens(
+            client_id, grant["scope"], grant["resource"], with_refresh_token
+        )
 
     def _refresh(self, client_id: str, form: dict[str, str]) -> tuple[int, dict]:
         with self.lock:
@@ -201,20 +216,23 @@ class McpAuthorizationServer:
             return 400, {"error": "invalid_grant"}
         return 200, self._issue_tokens(client_id, holder["scope"], holder["resource"])
 
-    def _issue_tokens(self, client_id: str, scope: str, resource: str | None) -> dict:
+    def _issue_tokens(
+        self, client_id: str, scope: str, resource: str | None, with_refresh_token: bool = True
+    ) -> dict:
         access_token, refresh_token = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
         answer = {
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": self.access_token_lifetime,
-            "refresh_token": refresh_token,
             "scope": scope,
         }
         grant = {"client_id": client_id, "scope": scope, "resource": resource}
         with self.lock:
             expires_at = int(time.time()) + self.access_token_lifetime
             self.access_tokens[access_token] = {**grant, "expires_at": expires_at}
-            self.refresh_tokens[refresh_token] = grant
+            if with_refresh_token:
+                answer["refresh_token"] = refresh_token
+                self.refresh_tokens[refresh_token] = grant
             self.issued.append(answer)
         return answer
 
