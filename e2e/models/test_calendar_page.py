@@ -13,7 +13,7 @@
   tool shows at the local time it was given; another account sees an event only once its
   calendar is shared with it.
 * Saving a later occurrence of a repeating event moved the whole series to that day, issue
-  #30970 (fix PR #30971, open), so that test stays red until the fix merges.
+  #30970, fixed by PR #30971.
 
 Discriminates: in a frontend build with the editor dropping the location on create, the all-day
 start taken from the time field, the edit saving the old title, the delete never sent, a clicked
@@ -21,7 +21,7 @@ day starting at eight, the week view placing events by hour alone, "Weekly" save
 week, the page no longer sending the browser's zone and the sidebar toggle ignored, the matching
 test went red and the rest stayed green; in a backend copy with the calendar tool reading times
 as UTC the model's event test went red, and with calendars listed to their owners only the
-sharing test went red at the reader. The occurrence test is red on dev 176d31d1d (#30970).
+sharing test went red at the reader. The occurrence test fails on dev 176d31d1d, before PR #30971.
 """
 
 from __future__ import annotations

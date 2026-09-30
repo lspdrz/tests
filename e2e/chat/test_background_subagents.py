@@ -10,19 +10,17 @@ is reported with its error, and sub-agents that finish while the reply is writte
 one report of two tasks. Stopping the reply leaves the background sub-agent running; stopping
 the chat during a foreground sub-agent ends the reply and leaves the chat usable.
 
-The open page does not follow a report on its own: the server tells it to reload the chat while
-the chat's stored current message still points at the earlier reply, so the page keeps showing
-that one and neither the report nor the follow-up appears until the person reloads. Every test
-that reads the report waits for it in the open page, so all of them stay red on that bug and pass
-where the report is stored with the chat's current message set.
+Before PR #31576 (open-webui/open-webui#31566) the open page did not follow a report on its own:
+the server told it to reload the chat while the chat's stored current message still pointed at the
+earlier reply, so the page kept showing that one and neither the report nor the follow-up appeared
+until the person reloaded. Every test that reads the report waits for it in the open page.
 
-Discriminates: passes in a backend copy of dev 176d31d1d that sets the chat's current message
-when the report is stored; on dev itself the tests that wait for the report fail on it. In backend
-copies the tests turn red when the dispatch waits for the sub-agent, the cap is ignored, a failure
-is reported as completed, the reports of two chats are mixed up, two finished sub-agents are
-reported one by one, the stop of the reply reaches the background sub-agent, or the stop of the
-chat leaves the foreground one running. In a frontend copy with the dispatch row named as a
-foreground one, the report row's result left out and its count of tasks dropped, the row tests
+Discriminates: passes on dev a5bc78300; on dev 176d31d1d the tests that wait for the report fail on
+that bug. In backend copies the tests turn red when the dispatch waits for the sub-agent, the cap
+is ignored, a failure is reported as completed, the reports of two chats are mixed up, two finished
+sub-agents are reported one by one, the stop of the reply reaches the background sub-agent, or the
+stop of the chat leaves the foreground one running. In a frontend copy with the dispatch row named
+as a foreground one, the report row's result left out and its count of tasks dropped, the row tests
 turn red while an unrelated journey stays green.
 """
 

@@ -9,9 +9,10 @@ channel the answer lands in the channel itself for every member. A file attached
 Files" posts with the message and the other member sees it on the message and can open its
 content.
 
-Two tests stay red on dev 176d31d1d for open bugs, each named in its docstring: the toast shows
-the raw mention markup, and a message sent while its file still uploads is posted with a file
-nobody can open instead of being held back (open-webui/open-webui#31587).
+One test stays red for an open bug, named in its docstring: a message sent while its file still
+uploads is posted with a file nobody can open instead of being held back
+(open-webui/open-webui#31587). The mention toast showed the raw mention markup until PR #31601
+(open-webui/open-webui#31586).
 
 Discriminates: passes on dev 176d31d1d; in a frontend copy, a picker that drops the mention type
 turns the person and thread model tests red, a toast that goes nowhere on click turns the person
@@ -113,10 +114,10 @@ def test_a_mentioned_member_elsewhere_gets_a_toast_that_opens_the_channel(people
 
 
 def test_the_mention_toast_reads_the_name_and_not_the_mention_markup(people, page_for):
-    """Red on 176d31d1d: the toast shows the stored `<@U:<id>|<name>>` markup as its text.
+    """#31586, fixed by PR #31601: the toast showed the stored `<@U:<id>|<name>>` markup as text.
 
-    The message itself reads "@<name>"; the toast strips HTML tags from the content, which leaves
-    the mention markup (not a tag) in place, user id included.
+    The message itself reads "@<name>"; the toast stripped HTML tags from the content, which left
+    the mention markup (not a tag) in place, user id included. Red on dev 176d31d1d.
     """
     sender, member, channel_id = people
     member_page = page_for(member)

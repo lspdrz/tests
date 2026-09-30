@@ -11,23 +11,22 @@ a second chat holds a background sub-agent back or mixes the reports. Stopping a
 through its task lists it as interrupted and a failing one as failed.
 
 The chat's stored current message follows the report's follow-up reply, which the open page
-reads when the server tells it to reload; on dev it keeps pointing at the earlier reply until the
-follow-up's first save, so the page shows neither the report nor the follow-up until it is
-reloaded (open-webui/open-webui#31566, fix PR #31576). The test deletes the chat's model while
-the sub-agent works, so the follow-up fails before any save of its own and only the storing of
-the report can set the pointer; it stays red until that is fixed.
+reads when the server tells it to reload. Before PR #31576 it kept pointing at the earlier reply
+until the follow-up's first save, so the page showed neither the report nor the follow-up until it
+was reloaded (open-webui/open-webui#31566). The test deletes the chat's model while the sub-agent
+works, so the follow-up fails before any save of its own and only the storing of the report can
+set the pointer.
 
-A report that comes while the answer to a later question is still written is attached to the
-answer before it and hides that question (open-webui/open-webui#31507, fix PR #31557); that
-test stays red until the fix merges.
+A report that came while the answer to a later question was still written was attached to the
+answer before it and hid that question (open-webui/open-webui#31507, fixed by PR #31557).
 
-Discriminates: passes on dev 176d31d1d apart from the two tests named above, which fail there. In
-backend copies each test turns red with its edit: the dispatch made to wait for the sub-agent,
-the sub-agent left out of the running tasks, the report not stored, stored without its metadata
-or under the wrong reply, the report never continuing the chat, a pending report dropped, the
-cap ignored, never released, applied to the unlimited setting or to a limit of zero, the switch
-ignored, the stop not reaching the task, the failure not reported, the concurrent limit applied
-to background work and the parent's id mixed up between chats.
+Discriminates: passes on dev a5bc78300; the two tests named above fail on dev 176d31d1d, before
+their fixes. In backend copies each test turns red with its edit: the dispatch made to wait for the
+sub-agent, the sub-agent left out of the running tasks, the report not stored, stored without its
+metadata or under the wrong reply, the report never continuing the chat, a pending report dropped,
+the cap ignored, never released, applied to the unlimited setting or to a limit of zero, the switch
+ignored, the stop not reaching the task, the failure not reported, the concurrent limit applied to
+background work and the parent's id mixed up between chats.
 """
 
 from __future__ import annotations
@@ -305,7 +304,7 @@ def test_the_stored_chat_points_at_the_follow_up_once_the_report_is_stored(
 def test_a_report_that_arrives_before_a_later_answer_ends_follows_the_answer_that_dispatched_it(
     background_on, make_user, upstream
 ):
-    """open-webui/open-webui#31507: the report hangs under the earlier answer and hides the turn."""
+    """open-webui/open-webui#31507: the report hung under the earlier answer and hid the turn."""
     background_on()
     first, prompt, task = unique("first question"), unique("hand this over"), unique("look it up")
     upstream.queue(

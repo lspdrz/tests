@@ -4,16 +4,16 @@
 `GET /api/v1/automations/{id}/runs` says `success` and names the chat it made, or `error` with
 the reason when the automation's model no longer exists.
 
-Bug, open-webui/open-webui#31580: the automation's `last_run_at` ("Last execution time" in the
-database reference) is only written when the scheduler claims a due automation, so after a
-Run now run the automation and its list entry still say it never ran, and the automations page
-shows "Last run Never" above the run it lists. `test_a_run_now_run_sets_the_last_run_time` stays
-red until it is fixed; the browser twin is in e2e/models/test_automation_runs.py.
+Bug, open-webui/open-webui#31580, fixed by PR #31583: the automation's `last_run_at` ("Last
+execution time" in the database reference) was only written when the scheduler claimed a due
+automation, so after a Run now run the automation and its list entry still said it never ran, and
+the automations page showed "Last run Never" above the run it listed.
+`test_a_run_now_run_sets_the_last_run_time` pins it; the browser twin is in
+e2e/models/test_automation_runs.py.
 
-Discriminates: passes on dev 176d31d1d except the last run test, which a backend copy writing
-`last_run_at` with every recorded run turns green. In a backend copy recording every run as
-`success` the failed run test goes red, and recording a success without its chat turns the
-success test red.
+Discriminates: passes on dev a5bc78300; the last run test fails on dev 176d31d1d, before PR #31583.
+In a backend copy recording every run as `success` the failed run test goes red, and recording a
+success without its chat turns the success test red.
 """
 
 from __future__ import annotations

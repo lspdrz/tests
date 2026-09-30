@@ -1,23 +1,24 @@
 """Journey: a user's notification targets and the admin's event webhooks, set up in the browser.
 
-With the admin's User Webhooks switch on (and the permission, which admins always hold) a user
-adds a target under Settings > Notifications: a URL, the events it receives and whether it fires
-always or only when the user is away. The list shows the URL masked, Send Test calls the URL, a
-finished reply calls every enabled target that subscribes to it (an away target stays quiet while
-the user is on the page, a switched-off one stays quiet always) and with the admin switch off the
-section is not offered and nothing is called. An admin adds an event webhook under Admin Settings
-> General, and a new account then reaches its URL as a `user.created` event until it is
-switched off. The chat link a finished reply sends must open that chat; it is rewritten from
-`/c/<id>` to `/<id>`, which the frontend has no route for (404), so that test is red until fixed.
-Loopback URLs are only fetchable on an instance booted with local fetching allowed.
+With the admin's User Webhooks switch on (and the permission, which admins always hold) a user adds
+a target under Settings > Notifications: a URL, the events it receives and whether it fires always
+or only when the user is away. The list shows the URL masked, Send Test calls the URL, a finished
+reply calls every enabled target that subscribes to it (an away target stays quiet while the user
+is on the page, a switched-off one stays quiet always) and with the admin switch off the section is
+not offered and nothing is called. An admin adds an event webhook under Admin Settings > General,
+and a new account then reaches its URL as a `user.created` event until it is switched off. The chat
+link a finished reply sends must open that chat; it was rewritten from `/c/<id>` to `/<id>`, which
+the frontend has no route for (404), until PR #31572 (open-webui/open-webui#31565). Loopback URLs
+are only fetchable on an instance booted with local fetching allowed.
 
-Discriminates: passes on the 176d31d1d frontend and backend; in frontend copies, with the target
-save sending no URL the save test fails, with the Send Test call removed the test-button test
-fails, with the row switch saving nothing the switched-off target test fails, with the section
-shown whatever the admin's switch says the admin switch test fails and with the event webhook
-form always saving every event the two admin tests fail; in a backend copy, with the away check
-skipped the on-the-page test fails (the away target is called), with the enabled check skipped the
-switched-off target test fails and with the admin switch ignored the switched-off test fails.
+Discriminates: passes on dev a5bc78300, and the chat link test fails on dev 176d31d1d, before PR
+#31572; in frontend copies of 176d31d1d, with the target save sending no URL the save test fails,
+with the Send Test call removed the test-button test fails, with the row switch saving nothing the
+switched-off target test fails, with the section shown whatever the admin's switch says the admin
+switch test fails and with the event webhook form always saving every event the two admin tests
+fail; in a backend copy, with the away check skipped the on-the-page test fails (the away target is
+called), with the enabled check skipped the switched-off target test fails and with the admin
+switch ignored the switched-off test fails.
 """
 
 from __future__ import annotations

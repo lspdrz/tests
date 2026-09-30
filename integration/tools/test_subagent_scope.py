@@ -11,20 +11,23 @@ stop request leaves a running sub-agent alone.
 The scripted model delegates, the sub-agent's provider requests show what it was offered and
 sent, and where a tool matters the sub-agent calls it and the test reads the result it got back.
 
-Three tests are red on dev on purpose, each a gap not yet reported upstream: a sub-agent started
-in a folder chat is offered the tools that browse every knowledge base where its parent has the
-folder's scoped ones, a temporary chat that delegates leaves the sub-agent's chat stored on the
-server (`Temporary Chat` keeps nothing there; the task tools are withheld from it for that
-reason, dev d2936c880), and a sub-agent's system prompt names each skill twice (the parent's
-already-assembled prompt carries the skill list the sub-agent builds again).
+Two tests are red on dev on purpose: a sub-agent started in a folder chat is offered the tools that
+browse every knowledge base where its parent has the folder's scoped ones
+(open-webui/open-webui#31569, fix PR #31574 open), and a sub-agent's system prompt names each skill
+twice, since the parent's already-assembled prompt carries the skill list the sub-agent builds
+again (open-webui/open-webui#31568, fix PR #31579 open). A temporary chat that delegated left the
+sub-agent's chat stored on the server, where `Temporary Chat` keeps nothing (the task tools are
+withheld from it for that reason, dev d2936c880); PR #31573 fixed that
+(open-webui/open-webui#31567).
 
-Discriminates: passes on dev 176d31d1d apart from those three, which turn green in a backend
-copy that passes the folder on, withholds delegation from a temporary chat, or strips the skill
-list from the parent's prompt. In backend copies the rest turn red with their edit: the
-sub-agent's tool ids, skill tool, terminal, filters or model dropped, the parent's system prompt
-replaced (with the model dropped as well for the model's own prompt), the parent's prompt put in
-its system prompt, all memory tools removed, every chat file passed on (or none), the sub-agent
-run as the instance owner or as an admin, and the owner check of the chat stop endpoint removed.
+Discriminates: passes on dev a5bc78300 apart from those two, which turn green in a backend copy
+that passes the folder on or strips the skill list from the parent's prompt; the temporary chat
+test fails on dev 176d31d1d, before PR #31573. In backend copies the rest turn red with their edit:
+the sub-agent's tool ids, skill tool, terminal, filters or model dropped, the parent's system
+prompt replaced (with the model dropped as well for the model's own prompt), the parent's prompt
+put in its system prompt, all memory tools removed, every chat file passed on (or none), the
+sub-agent run as the instance owner or as an admin, and the owner check of the chat stop endpoint
+removed.
 """
 
 from __future__ import annotations

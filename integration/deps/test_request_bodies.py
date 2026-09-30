@@ -16,8 +16,9 @@ the ones it does not name (integration/models/test_ollama_model_management.py), 
 tool's spec comes from a model pydantic builds from the method
 (integration/deps/test_tool_specs.py).
 
-A SCIM group member's `$ref` is always null: the member is built with `ref=`, which pydantic
-ignores on a field that only takes its alias. That test stays red until it is fixed.
+A SCIM group member's `$ref` was always null: the member was built with `ref=`, which pydantic
+ignores on a field that only takes its alias. PR #31529 (open-webui/open-webui#31525) fixed it, and
+that test fails on dev 176d31d1d.
 
 Discriminates: on dev ef67cc3fa, one backend copy with a default for the sign-in password, a
 `StrictBool` expanded state, `FolderForm` ignoring extra fields, `UserSettings` without

@@ -8,17 +8,17 @@ stored pinned state that section means (open-webui/open-webui#31368, issue #3136
 Each outcome is read back from what the server stored or after a reload, and the folder's
 settings from the request the scripted provider receives for a new chat started in the folder.
 
-Discriminates: passes on the dev 176d31d1d build; in a frontend copy of that build each test
-fails, one edit each: the subfolder dialog creating at the top level, the folder dialog saving
-without its prompt and files, a chat dropped on a folder not being moved, the in-place rename
-saving the old name, the delete confirmation inverting its checkbox (both delete tests), a chat
-started on the folder page sent without the folder and the expand toggle not being saved. In the
-a5bc78300 build with #31368 reverted, the pinned chat dropped on Chats stays under Pinned and the
-one dropped on Pinned ends unpinned.
+Discriminates: passes on the dev a5bc78300 build; in a frontend copy of the dev 176d31d1d build
+each test fails, one edit each: the subfolder dialog creating at the top level, the folder dialog
+saving without its prompt and files, a chat dropped on a folder not being moved, the in-place
+rename saving the old name, the delete confirmation inverting its checkbox (both delete tests), a
+chat started on the folder page sent without the folder and the expand toggle not being saved. In
+the a5bc78300 build with #31368 reverted, the pinned chat dropped on Chats stays under Pinned and
+the one dropped on Pinned ends unpinned.
 
-The in-place rename test is red on purpose until open-webui/open-webui#31582 is fixed: pressing
-Enter saves the folder twice, so two update requests and two "Folder updated successfully"
-toasts follow one rename.
+The in-place rename test also pins open-webui/open-webui#31582, fixed by PR #31584: pressing Enter
+saved the folder twice, so two update requests and two "Folder updated successfully" toasts
+followed one rename. It fails on dev 176d31d1d.
 """
 
 from __future__ import annotations

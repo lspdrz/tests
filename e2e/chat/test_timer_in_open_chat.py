@@ -6,12 +6,11 @@ model's follow-up reply appears under it, without a reload. A follow-up that is 
 shows the timer row first and the answer once the model has written it.
 
 The server tells the open page to reload the chat when a timer fires, and the page follows the
-current message the chat stores. On dev the timer leaves that pointing at the earlier reply, so
-the page shows neither the timer nor the follow-up until it is reloaded
-(open-webui/open-webui#31566, fix PR #31576 which also covers timers). Both tests stay red there.
+current message the chat stores. Before PR #31576 (open-webui/open-webui#31566, fixed for timers as
+well) the timer left that pointing at the earlier reply, so the page showed neither the timer nor
+the follow-up until it was reloaded.
 
-Discriminates: fails on dev 176d31d1d for the reason above; in a backend copy with PR #31576
-applied both pass.
+Discriminates: passes on dev a5bc78300; both tests fail on dev 176d31d1d for the reason above.
 """
 
 from __future__ import annotations

@@ -11,12 +11,13 @@ Two fixes to the chat's Share dialog, both in the frontend:
   private. It now says the link is private until you choose who can view it.
 - First click (issue open-webui/open-webui#31486). After 8fc416ee7 the first click inside a
   dialog opened from a menu was swallowed, so Copy Link needed two clicks. 0082c153f
-  (open-webui/open-webui#31488) fixed the sidebar chat menu only; these tests open Share from the
-  chat header menu and click once, so they stay red until that menu closes first too.
+  (open-webui/open-webui#31488) fixed the sidebar chat menu, and ef67cc3fa
+  (open-webui/open-webui#31496, issue open-webui/open-webui#31493) the chat header menu these
+  tests open Share from, clicking once.
 
-Discriminates: fails on dev 00a245b9f (the first Copy Link click creates no link); with the header
-menu closing first it passes, and fails on a build with the relinking or wording fix reverted
-(the relinked dialog still shows Public and the granted account, or the old sentence is shown).
+Discriminates: fails on dev 00a245b9f (the first Copy Link click creates no link) and passes on dev
+176d31d1d and a5bc78300; it fails on a build with the relinking or wording fix reverted (the
+relinked dialog still shows Public and the granted account, or the old sentence is shown).
 """
 
 from __future__ import annotations

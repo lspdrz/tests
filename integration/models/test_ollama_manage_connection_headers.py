@@ -9,13 +9,13 @@ to authentication "none" still sent its key. Verifying and chatting had applied 
 `bc2416c5d` (open-webui/open-webui#29868, covered in test_ollama_connection_headers.py).
 
 The Ollama stand-in records every request, so each test reads what the dialog's calls sent. The
-dialog's model file upload and the model selector's unload were left out of that fix; their two
-tests fail until open-webui/open-webui#31490 merges.
+dialog's model file upload and the model selector's unload were left out of that fix and followed
+in `e8d6a8734` (open-webui/open-webui#31490).
 
-Discriminates: passes on dev 00a245b9f apart from the two #31490 tests, which pass with that PR
-applied; with the fix reverted in `routers/ollama.py` every narrow row and the broad test fail (no
-custom header, and the key goes out as a bearer token despite `auth_type: none`, or no key at all
-on the version check); the other nearby tests pass on both.
+Discriminates: passes on dev 176d31d1d; on dev 00a245b9f the two #31490 tests fail, and they pass
+with that PR applied; with the fix reverted in `routers/ollama.py` every narrow row and the broad
+test fail (no custom header, and the key goes out as a bearer token despite `auth_type: none`, or
+no key at all on the version check); the other nearby tests pass on both.
 """
 
 from __future__ import annotations

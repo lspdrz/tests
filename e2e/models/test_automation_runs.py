@@ -6,16 +6,15 @@ Runs, and its chat holds the prompt and the model's answer. Every further run jo
 with its own chat, and a run whose model no longer exists is listed with the error it failed on
 and no chat.
 
-Bug, open-webui/open-webui#31580: a Run now run never sets the automation's last run time, so after
-it the page still says "Last run Never" above the run it lists (the list page says "Never" as
-well). Only the scheduler's own claim writes that time. `test_a_manual_run_shows_as_the_last_run`
-stays red until it is fixed.
+Bug, open-webui/open-webui#31580, fixed by PR #31583: a Run now run never set the automation's last
+run time, so after it the page still said "Last run Never" above the run it listed (the list page
+said "Never" as well), since only the scheduler's own claim wrote that time.
+`test_a_manual_run_shows_as_the_last_run` pins it.
 
-Discriminates: passes on dev ac00d40e3; in a backend copy, with `POST /api/v1/automations/{id}/run`
-answering without starting the run no run is ever listed. On dev 176d31d1d a frontend copy
-keeping only the newest run turns the history test red, and one hiding a run's error turns the
-failed run test red; a backend copy writing the last run time with every recorded run turns the
-last run test green.
+Discriminates: passes on dev a5bc78300, and the last run test fails on dev 176d31d1d, before PR
+#31583. On dev ac00d40e3, in a backend copy, with `POST /api/v1/automations/{id}/run` answering
+without starting the run no run is ever listed. On dev 176d31d1d a frontend copy keeping only the
+newest run turns the history test red, and one hiding a run's error turns the failed run test red.
 """
 
 from __future__ import annotations

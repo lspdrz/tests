@@ -7,18 +7,18 @@ text shows as a highlighted snippet. Hovering or arrowing onto a result previews
 and a click opens it. "Start a new conversation" sends the typed text as the first message of a
 new chat. Another account's matching chat never appears.
 
-Two tests stay red on known bugs: Enter on a highlighted chat closes the dialog without opening
-the chat (#31003, fix PR #31004), and a new conversation started from the dialog drops the text
-after an `&` because the query goes into the page address unencoded (#31469).
+Two tests pin fixed bugs: Enter on a highlighted chat closed the dialog without opening the chat
+(#31003, fixed by PR #31004), and a new conversation started from the dialog dropped the text after
+an `&` because the query went into the page address unencoded (#31469, fixed by PR #31592).
 
 Twin of integration/models/test_chat_search_filters.py.
 
-Discriminates: passes on the 176d31d1d build except the two tests above. On a build whose sidebar
-Search entries open nothing, whose snippet never highlights, whose result rows ignore the pointer,
-whose ArrowUp stays put, whose empty result list shows no text and whose new-conversation action
-drops the query, one test each goes red; on a backend whose search matches neither titles nor
-message text, whose filters are ignored or that searches every account's chats, the title,
-snippet, filter and other-account tests go red.
+Discriminates: passes on the a5bc78300 build; the two tests above fail on the 176d31d1d build,
+before their fixes. On a build whose sidebar Search entries open nothing, whose snippet never
+highlights, whose result rows ignore the pointer, whose ArrowUp stays put, whose empty result list
+shows no text and whose new-conversation action drops the query, one test each goes red; on a
+backend whose search matches neither titles nor message text, whose filters are ignored or that
+searches every account's chats, the title, snippet, filter and other-account tests go red.
 """
 
 from __future__ import annotations
