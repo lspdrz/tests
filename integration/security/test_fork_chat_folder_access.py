@@ -6,10 +6,17 @@ folder may be one the caller can no longer write to (someone else's folder whose
 reduced to read), so the fork landed in a folder the caller could not manage. The fix keeps the
 folder only when the caller has write access, as chat creation and chat moves already require.
 
+Clone and import took the opposite wrong turn, fix `d4d04dca0` (#31370, issue #31369): both go
+through the chat import, which kept a folder only when the caller owned it, so a clone of a chat
+in a folder shared with the caller for writing landed at the root of their chat list. The import
+now keeps a folder the caller may write to.
+
 Twin of unit/security/test_fork_chat_folder_access.py.
 
 Discriminates: passes on bbfa876af; with the write check of 48fb2b84b removed the fork after the
-grant is reduced to read is stored in the shared folder; the other tests pass on both.
+grant is reduced to read is stored in the shared folder. Passes on dev a5bc78300; with d4d04dca0
+reverted the clone and the import into a writable shared folder land outside it. The other tests
+pass on both.
 """
 
 from __future__ import annotations
@@ -136,6 +143,47 @@ def test_clone_of_a_chat_in_a_read_only_folder_lands_outside_it(shared_folder):
     assert cloned.json()["folder_id"] is None
 
 
+def _import_folder(actor, folder_id: str) -> str | None:
+    """The folder a chat imported into `folder_id` ended up in."""
+    with actor.client() as client:
+        imported = client.post(
+            "/api/v1/chats/import",
+            json={"chats": [{"chat": CONVERSATION, "folder_id": folder_id}]},
+        )
+    assert imported.status_code == 200, imported.text
+    return imported.json()[0]["folder_id"]
+
+
+def test_an_import_into_a_read_only_folder_lands_outside_it(shared_folder):
+    owner, member, folder_id, _ = shared_folder
+    _grant(owner, folder_id, member, "read")
+
+    assert _import_folder(member, folder_id) is None
+
+
+# narrow: a clone of a chat in a writable shared folder stays in it
+
+
+def test_clone_of_a_chat_in_a_writable_shared_folder_stays_in_it(shared_folder):
+    _, member, folder_id, chat_id = shared_folder
+
+    with member.client() as client:
+        cloned = client.post(f"/api/v1/chats/{chat_id}/clone", json={})
+        assert cloned.status_code == 200, cloned.text
+        stored = client.get(f"/api/v1/chats/{cloned.json()['id']}")
+
+    assert stored.json()["folder_id"] == folder_id, (
+        "the clone of a chat in a folder the member may write to landed at the root of their "
+        "chat list (#31369)"
+    )
+
+
+def test_an_import_into_a_writable_shared_folder_stays_in_it(shared_folder):
+    _, member, folder_id, _ = shared_folder
+
+    assert _import_folder(member, folder_id) == folder_id
+
+
 # nearby: a writable folder keeps the fork, a folderless chat stays folderless
 
 
@@ -153,6 +201,18 @@ def test_fork_of_a_chat_in_the_users_own_folder_stays_in_it(make_user):
     chat_id = _create_chat(owner, folder_id)
 
     assert _fork_folder(owner, chat_id) == folder_id
+
+
+def test_clone_of_a_chat_in_the_users_own_folder_stays_in_it(make_user):
+    owner = make_user()
+    folder_id = _create_folder(owner)
+    chat_id = _create_chat(owner, folder_id)
+
+    with owner.client() as client:
+        cloned = client.post(f"/api/v1/chats/{chat_id}/clone", json={})
+
+    assert cloned.status_code == 200, cloned.text
+    assert cloned.json()["folder_id"] == folder_id
 
 
 def test_fork_of_a_folderless_chat_stays_folderless(make_user):
