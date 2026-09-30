@@ -4,11 +4,13 @@ A fenced block in a reply shows its language above the code, highlights the code
 and offers Collapse, Copy and Save (plus Preview on HTML and SVG). A `mermaid` fence draws a
 diagram instead of showing its source, and falls back to the source with an error when the
 diagram does not parse. Running a Python block is legacy and not covered. The artifacts pane
-opened by an HTML block is covered in test_artifacts_pane_after_delete.py.
+opened by an HTML block is covered in test_artifacts_pane_after_delete.py. A fence made of
+tildes is a code block like a backtick one (open-webui/open-webui#31543, issue #31542).
 
 Discriminates: passes on the 176d31d1d build; with the language label, the highlighter, the
 clipboard write, the collapse toggle, the save handler, the preview button or the mermaid
-render removed, the matching test goes red.
+render removed, the matching test goes red. With the check that only backtick fences are code
+blocks restored (the a5bc78300 mutation build), the tilde-fence test finds one plain line.
 """
 
 from __future__ import annotations
@@ -84,6 +86,26 @@ def test_copy_puts_the_exact_code_on_the_clipboard(page_for, make_user, upstream
     expect(button(box, "Copied")).to_be_visible()
     assert page.evaluate("navigator.clipboard.readText()") == SCRIPT
     expect(button(box, "Copy")).to_be_visible()
+
+
+@pytest.mark.regression
+def test_a_tilde_fence_is_a_code_block_with_a_label_and_a_copy_button(
+    page_for, make_user, upstream
+):
+    page = page_for(make_user())
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+
+    box = ask_for(page, upstream, "~~~python\nfirst = 1\nsecond = 2\n~~~")
+
+    expect(
+        box.get_by_text("python", exact=True), "no language label on the ~~~ block"
+    ).to_be_visible()
+    expect(editor_lines(box), "the ~~~ block is not shown as lines of code").to_have_count(2)
+    expect(editor_lines(box).first).to_have_text("first = 1")
+    expect(editor_lines(box).last).to_have_text("second = 2")
+    button(box, "Copy").click()
+    expect(button(box, "Copied")).to_be_visible()
+    assert page.evaluate("navigator.clipboard.readText()") == "first = 1\nsecond = 2"
 
 
 def test_each_block_copies_its_own_code(page_for, make_user, upstream):
