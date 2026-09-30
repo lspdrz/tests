@@ -1,16 +1,17 @@
 """Journey: a reply streamed from any other provider or tool source is stored the same either way.
 
 The streaming handler builds a reply by appending each piece to the text it already holds, and
-`ENABLE_CHAT_RESPONSE_STREAM_INPLACE_APPEND` only changes how that append is done. Every test
-here runs on an instance with the toggle off and one with it on, and asserts the same literal
-outcome for both: the stored reply, the `response:completion` deltas a browser tab receives and
-what the provider is sent on the next turn of the same chat. The pieces arrive from an Ollama
-connection (text, thinking and a tool call in lines), a Responses API connection (its own events
-are reduced elsewhere, so only the deltas coalesced into fewer socket events reach the append), a
-direct connection served by the user's own tab, and tool calls whose arguments are split across
-deltas for a workspace Python tool, an OpenAPI tool server, an MCP server and a knowledge tool
-whose result carries a source. An Anthropic connection has no path of its own here: the messages
-endpoint only converts the handler's stream on the way out.
+`ENABLE_CHAT_RESPONSE_STREAM_INPLACE_APPEND` only changes how that append is done. Every test here
+runs on an instance with the toggle off and one with it on, and asserts the same literal outcome
+for both: the stored reply, the `response:completion` deltas a browser tab receives and what the
+provider is sent on the next turn of the same chat. Tool call arguments are compared as JSON: the
+server re-encodes them with its own codec, compact under orjson (the default since #31616). The
+pieces arrive from an Ollama connection (text, thinking and a tool call in lines), a Responses API
+connection (its own events are reduced elsewhere, so only the deltas coalesced into fewer socket
+events reach the append), a direct connection served by the user's own tab, and tool calls whose
+arguments are split across deltas for a workspace Python tool, an OpenAPI tool server, an MCP
+server and a knowledge tool whose result carries a source. An Anthropic connection has no path of
+its own here: the messages endpoint only converts the handler's stream on the way out.
 
 Discriminates: with the in-place branch of the append breaking only itself, every append-in-place
 case failed and every append-copies case passed; with the copying branch breaking only itself the
@@ -71,7 +72,8 @@ def shape(message):
     items = []
     for item in message["output"]:
         if item["type"] == "function_call":
-            items.append(("function_call", item["name"], item["arguments"]))
+            # re-encoded by the server's JSON codec, whose spacing is its own (#31616)
+            items.append(("function_call", item["name"], json.loads(item["arguments"])))
         elif item["type"] == "function_call_output":
             items.append(("function_call_output", item["output"][0]["text"]))
         else:
@@ -153,7 +155,7 @@ def test_ollama_tool_call_then_a_streamed_answer(ollama):
     stamp = json.loads(result_item["output"][0]["text"])["current_timestamp"]
     assert shape(replies[0])[:2] == [
         ("reasoning", "check clock"),
-        ("function_call", "get_current_timestamp", "{}"),
+        ("function_call", "get_current_timestamp", {}),
     ]
     assert shape(replies[0])[3:] == [("reasoning", "read it"), ("message", "It is late.")]
     assert replies[0]["content"] == "It is late."
@@ -306,7 +308,7 @@ def test_responses_function_call_arguments_are_coalesced_for_a_python_tool(respo
     assert replies[0]["content"] == "Three stops."
     assert shape(replies[0]) == [
         ("reasoning", "pick a tool"),
-        ("function_call", "plan_route", encoded),
+        ("function_call", "plan_route", arguments),
         ("function_call_output", "route from Vienna with 3 stops"),
         ("message", "Three stops."),
     ]
@@ -314,8 +316,14 @@ def test_responses_function_call_arguments_are_coalesced_for_a_python_tool(respo
         ("response.function_call_arguments.delta", encoded),
     ]
     second = provider.sent()[1]["input"]
+    second[-2]["arguments"] = json.loads(second[-2]["arguments"])
     assert second[-2:] == [
-        {"type": "function_call", "call_id": "call_9", "name": "plan_route", "arguments": encoded},
+        {
+            "type": "function_call",
+            "call_id": "call_9",
+            "name": "plan_route",
+            "arguments": arguments,
+        },
         {
             "type": "function_call_output",
             "call_id": "call_9",
@@ -362,7 +370,7 @@ def test_a_direct_connections_streamed_pieces_are_joined(streaming):
     assert replies[0]["content"] == "It is late."
     assert shape(replies[0])[:2] == [
         ("reasoning", "check clock"),
-        ("function_call", "get_current_timestamp", "{}"),
+        ("function_call", "get_current_timestamp", {}),
     ]
     assert shape(replies[0])[3] == ("message", "It is late.")
     assert deltas == [
@@ -444,8 +452,11 @@ def tool_round(listener, name: str, arguments: dict, result: str) -> None:
     first, second = [
         request.json()["messages"] for request in listener.requests_to("/v1/chat/completions")
     ][:2]
-    called = {"name": name, "arguments": json.dumps(arguments)}
-    assert second[len(first) :] == [
+    joined = second[len(first) :]
+    for call in joined[0].get("tool_calls", []):
+        call["function"]["arguments"] = json.loads(call["function"]["arguments"])
+    called = {"name": name, "arguments": arguments}
+    assert joined == [
         {
             "role": "assistant",
             "content": "",
@@ -472,7 +483,7 @@ def test_a_python_tool_gets_the_arguments_streamed_in_pieces(tooled, streaming):
 
     assert replies[0]["content"] == "Done."
     assert shape(replies[0]) == [
-        ("function_call", "compose_note", json.dumps(arguments)),
+        ("function_call", "compose_note", arguments),
         ("function_call_output", "TRIP:4"),
         ("message", "Done."),
     ]
@@ -526,7 +537,7 @@ def test_an_openapi_tool_gets_its_query_and_body_from_split_arguments(tooled, st
     assert sent.path.endswith("?dry_run=True")
     assert sent.json() == {"name": "Rex the third", "age": 12}
     assert shape(replies[0]) == [
-        ("function_call", "create_pet", json.dumps(arguments)),
+        ("function_call", "create_pet", arguments),
         ("function_call_output", CREATED),
         ("message", "Done."),
     ]
@@ -548,7 +559,7 @@ def test_an_mcp_tool_gets_the_text_streamed_in_pieces(tooled, streaming):
         )
 
     assert shape(replies[0]) == [
-        ("function_call", f"{server_id}_echo", json.dumps(arguments)),
+        ("function_call", f"{server_id}_echo", arguments),
         ("function_call_output", arguments["text"]),
         ("message", "Done."),
     ]
@@ -571,8 +582,8 @@ def test_a_knowledge_tool_result_keeps_its_source(tooled, streaming):
     [call_item, result_item, answer_item] = replies[0]["output"]
     result = json.loads(result_item["output"][0]["text"])
     assert (result["filename"], result["content"]) == ("notes.txt", "The meeting is at noon.")
-    assert (call_item["arguments"], answer_item["content"][0]["text"]) == (
-        json.dumps(arguments),
+    assert (json.loads(call_item["arguments"]), answer_item["content"][0]["text"]) == (
+        arguments,
         "Done.",
     )
     assert replies[0]["sources"] == [

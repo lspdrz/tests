@@ -9,10 +9,11 @@
 * The reminder poll compared a user-writable `meta.alert_minutes` to a number, so one event
   holding text there raised on every poll and no reminder went out for anyone (`abc69000b`,
   #28790). A sent reminder shows as `meta.alerted_at` on the event.
-* Searching a JSON column matches the text a JSON encoder wrote, and the stdlib codec (the
-  default) escapes non-ASCII while orjson (`ENABLE_ORJSON`) writes it raw. Automation search
-  matched only the raw spelling and model tag search only the escaped one, so each found
-  nothing under one of the two codecs (`189c14fc4`, #28399).
+* Searching a JSON column matches the text a JSON encoder wrote, and a row holds non-ASCII raw
+  or escaped: stdlib json escaped it until #31615 (321a24dfe) had every codec write it raw, so
+  rows saved before an upgrade keep the escapes. Automation search matched only the raw spelling
+  and model tag search only the escaped one, so each missed the rows of the other spelling
+  (`189c14fc4`, #28399). The escaped rows are rewritten in the database as stdlib json left them.
 * Forking a waiting timer chat copied its `meta`, and the scheduler claimed timers by `meta`,
   so the fork was a second claim target and the timer fired twice. Timers now hang off the
   `chat.timer_at` column, which a fork does not carry (`16c2a9eda`, #27663, issues
@@ -28,13 +29,14 @@ Twin of unit/models/test_automations_and_calendar.py.
 Discriminates: passes on dev bbfa876af; fails with each fix reverted (the expansion back on the
 server's clock, the COUNT check removed, `alert_minutes` compared unchecked, the single-spelling
 searches restored): occurrences move by the zone gap, a COUNT rule without DTSTART is stored, no
-reminder is sent while a text window exists, and a CJK prompt or tag is missed under one codec. On
+reminder is sent while a text window exists, and a CJK prompt or tag is missed in one spelling. On
 dev ef67cc3fa, claiming timers by `meta.timer_at` again fires the forked timer a second time.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import time
 import uuid
 from typing import Iterator
@@ -44,6 +46,7 @@ import httpx
 import pytest
 import sqlalchemy
 
+from harness import backends
 from harness import upstream as reply
 from harness.actors import create_user
 from harness.calendar_api import (
@@ -56,6 +59,7 @@ from harness.calendar_api import (
     to_ns,
 )
 from harness.chat import ask
+from harness.json_codecs import stored_text
 
 pytestmark = [
     pytest.mark.regression,
@@ -64,9 +68,8 @@ pytestmark = [
     pytest.mark.slow,
 ]
 
-# The reminder tests need a scheduler that polls every second, and the search tests need rows
-# written by orjson; one extra instance serves both.
-SECOND_INSTANCE_ENV = {"SCHEDULER_POLL_INTERVAL": "1", "ENABLE_ORJSON": "true"}
+# The reminder tests need a scheduler that polls every second.
+SECOND_INSTANCE_ENV = {"SCHEDULER_POLL_INTERVAL": "1"}
 
 # Fixed-offset zones only: a DST fold would make "same wall clock" ambiguous.
 FIXED_OFFSET_ZONES = ("Asia/Tokyo", "Asia/Kolkata", "UTC", "Pacific/Kiritimati", "Pacific/Honolulu")
@@ -313,16 +316,33 @@ def test_a_negative_alert_window_still_means_no_reminder(remind):
 # ---------------------------------------------------------------- narrow: both JSON spellings
 
 
-@pytest.fixture(params=["stdlib-codec", "orjson-codec"])
-def any_codec_admin(request, instance, instance_with) -> Iterator[httpx.Client]:
-    """The admin of an instance writing JSON with the stdlib codec, or with orjson."""
-    chosen = instance if request.param == "stdlib-codec" else instance_with(SECOND_INSTANCE_ENV)
-    with chosen.client() as client:
+@pytest.fixture(params=["raw", "escaped"])
+def spelling(request) -> str:
+    """How a row holds non-ASCII: raw as written now, or escaped as stdlib json saved it."""
+    return request.param
+
+
+@pytest.fixture
+def admin_client(admin) -> Iterator[httpx.Client]:
+    with admin.client() as client:
         yield client
 
 
-def test_automation_search_finds_a_non_ascii_prompt(any_codec_admin):
-    created = any_codec_admin.post(
+def _respell(instance, spelling: str, table: str, column: str, row_id: str) -> None:
+    """Rewrite a stored JSON column in `spelling`; stdlib json's default escapes non-ASCII."""
+    if spelling == "raw":
+        return
+    stored = json.loads(stored_text(instance, table, column, row_id))
+    backends.write_rows(
+        instance,
+        f'UPDATE "{table}" SET "{column}" = :value WHERE id = :row_id',
+        [{"value": json.dumps(stored), "row_id": row_id}],
+    )
+    assert "\\u" in stored_text(instance, table, column, row_id)
+
+
+def test_automation_search_finds_a_non_ascii_prompt(instance, admin_client, spelling):
+    created = admin_client.post(
         "/api/v1/automations/create",
         json={
             "name": f"forecast {uuid.uuid4().hex[:6]}",
@@ -337,12 +357,13 @@ def test_automation_search_finds_a_non_ascii_prompt(any_codec_admin):
     assert created.status_code == 200, created.text
     automation_id = created.json()["id"]
     try:
-        found = any_codec_admin.get("/api/v1/automations/list", params={"query": CJK}).json()
+        _respell(instance, spelling, "automation", "data", automation_id)
+        found = admin_client.get("/api/v1/automations/list", params={"query": CJK}).json()
     finally:
-        any_codec_admin.delete(f"/api/v1/automations/{automation_id}/delete")
+        admin_client.delete(f"/api/v1/automations/{automation_id}/delete")
 
     assert automation_id in [item["id"] for item in found["items"]], (
-        "searching an automation's non-ASCII prompt missed the row this codec wrote"
+        f"searching an automation's non-ASCII prompt missed a row stored {spelling}"
         " (#28399, on Postgres #31422)"
     )
 
@@ -369,28 +390,29 @@ def _models_tagged(client: httpx.Client, tag: str) -> list[str]:
     return [item["id"] for item in listed.json()["items"]]
 
 
-def test_model_tag_search_finds_a_non_ascii_tag(any_codec_admin):
-    model_id = _tagged_model(any_codec_admin, CJK)
+def test_model_tag_search_finds_a_non_ascii_tag(instance, admin_client, spelling):
+    model_id = _tagged_model(admin_client, CJK)
     try:
-        found = _models_tagged(any_codec_admin, CJK)
+        _respell(instance, spelling, "model", "meta", model_id)
+        found = _models_tagged(admin_client, CJK)
     finally:
-        any_codec_admin.post("/api/v1/models/model/delete", json={"id": model_id})
+        admin_client.post("/api/v1/models/model/delete", json={"id": model_id})
 
     assert model_id in found, (
-        "a non-ASCII model tag missed the row this codec wrote (#28399, on Postgres #31422)"
+        f"a non-ASCII model tag missed a row stored {spelling} (#28399, on Postgres #31422)"
     )
 
 
 # ---------------------------------------------------------------- nearby
 
 
-def test_an_ascii_tag_still_matches_whole_tags_case_insensitively(any_codec_admin):
-    model_id = _tagged_model(any_codec_admin, "Weather")
+def test_an_ascii_tag_still_matches_whole_tags_case_insensitively(admin_client):
+    model_id = _tagged_model(admin_client, "Weather")
     try:
-        found = _models_tagged(any_codec_admin, "weather")
-        unrelated = _models_tagged(any_codec_admin, "weathervane")
+        found = _models_tagged(admin_client, "weather")
+        unrelated = _models_tagged(admin_client, "weathervane")
     finally:
-        any_codec_admin.post("/api/v1/models/model/delete", json={"id": model_id})
+        admin_client.post("/api/v1/models/model/delete", json={"id": model_id})
 
     assert model_id in found
     assert model_id not in unrelated

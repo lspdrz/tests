@@ -2,43 +2,46 @@
 
 The switch moves request parsing, JSON responses, every stored JSON column, socket payloads and
 provider traffic from stdlib `json` to orjson (`72fdf238a`, #27583; native JSON columns since
-`8d6a7c830`, #28396). Two instances share one database, one per value, so every test writes
-through either and reads through either, as a deployment flipping the switch or rolling it out
-worker by worker does.
+`8d6a7c830`, #28396), and has been on by default since #31616 (`f98ca224c`). Two instances share
+one database, one per value set explicitly, so every test writes through either and reads through
+either, as a deployment flipping the switch or rolling it out worker by worker does.
 
-* The stored text of a JSON column shows which codec wrote it: stdlib escapes non-ASCII and
-  spaces its separators, orjson writes raw UTF-8 and compact. So the "on" path really runs.
+* The stored text of a JSON column shows which codec wrote it: stdlib spaces its separators and
+  orjson writes compact. Both write non-ASCII raw since #31615 (`321a24dfe`); stdlib escaped it
+  before. So the "on" path really runs, and it is the one the shared instance runs unset.
 * JSON response bodies are byte for byte the same on both values, and a request body is read
   the same whether the client wrote it compact, escaped or pretty-printed; a broken one is
   refused with the same 422.
 * The size limit on user and chat variables counts the characters of their JSON text, which
-  stdlib writes six per non-ASCII character. Long non-ASCII variables are refused (user
-  variables, HTTP 400) or silently left out of the system prompt (chat variables) with the switch
-  off, and accepted with it on.
+  stdlib wrote six per non-ASCII character until #31615. Long non-ASCII variables were refused
+  (user variables, HTTP 400) or silently left out of the system prompt (chat variables) with the
+  switch off, and accepted with it on.
 * Searching automation prompts, and on Postgres filtering models by a tag, match the stored JSON
   text case-insensitively. Folding case turns a raw `Ü` into `ü` but leaves its escape `\\u00dc`
-  alone, so a lower-case query for capitalised non-ASCII prompt text, or a capitalised non-ASCII
-  tag on Postgres, finds rows written with the switch on and misses rows written with it off.
-  SQLite matches a non-ASCII tag exact-case, so the tag filter behaves the same there.
+  alone, so while stdlib escaped (until #31615) a lower-case query for capitalised non-ASCII
+  prompt text, or a capitalised non-ASCII tag on Postgres, found rows written with the switch on
+  and missed rows written with it off. SQLite matches a non-ASCII tag exact-case, so the tag
+  filter behaved the same there.
 * A chat's context usage (shown in the chat and deciding when compaction starts) estimates
   tokens from the length of its tool call items as JSON, which stdlib spaces: the same chat
   with one tool call counts about 6% more tokens with the switch off.
 * The Anthropic-compatible stream carries the same text and tool arguments on both values, with
   every frame parsing when split the way the Anthropic SDK splits lines.
 
-The variable, search and context usage tests pin differences between the two values and stay red
-until the product behaves the same on both. The CJK tag and automation search (#28399, #31422), the
-line separators and the codec options are pinned by
+The variable and search tests pin the differences #31615 removed. The context usage test pins one
+that remains and stays red until the product behaves the same on both. The CJK tag and automation
+search (#28399, #31422), the line separators and the codec options are pinned by
 integration/models/test_automations_and_calendar.py and integration/config/test_json_codec.py.
 
-Discriminates: on dev 176d31d1d the stored-spelling, byte, body and Anthropic stream tests pass and
-the five difference tests fail (the tag test only on Postgres). In backend copies of dev 176d31d1d,
-the orjson codec decoding its output as Latin-1 turns the orjson side of the stored-spelling and
-Anthropic stream tests red; orjson request parsing that mangles non-ASCII (with indented responses)
-turns the byte-identity and the compact and pretty request tests red; the orjson request parser
-answering an unparseable body with an empty object turns the broken-body test red; the stdlib codec
-writing mojibake turns the stdlib sides red; and the stdlib codec writing compact raw UTF-8 like
-orjson turns all five difference tests green.
+Discriminates: on dev a5bc78300 every test passes but the context usage one. On dev 176d31d1d the
+variable and search tests fail too (the tag test only on Postgres), and so does the stdlib side of
+the stored-spelling test, which finds the old escapes, and the default test, the switch being off
+there. In backend copies of dev 176d31d1d, the orjson codec decoding its output as Latin-1 turns
+the orjson side of the stored-spelling and Anthropic stream tests red; orjson request parsing that
+mangles non-ASCII (with indented responses) turns the byte-identity and the compact and pretty
+request tests red; the orjson request parser answering an unparseable body with an empty object
+turns the broken-body test red; the stdlib codec writing mojibake turns the stdlib sides red; and
+the stdlib codec writing compact raw UTF-8 like orjson turns all five difference tests green.
 """
 
 from __future__ import annotations
@@ -130,11 +133,26 @@ def test_the_stored_json_shows_which_codec_wrote_it(pair, admin_client, codec):
                 f"{stored[:200]}"
             )
         else:
-            assert "Gr\\u00fc\\u00dfe" in stored and '": ' in stored, (
+            assert "Grüße" in stored and '": ' in stored, (
                 f"with ENABLE_ORJSON=false {table}.{column} was not written by stdlib json: "
                 f"{stored[:200]}"
             )
         assert json.loads(stored)["extra"] == nested()
+
+
+def test_the_shared_instance_writes_with_orjson_by_default(instance, admin):
+    """#31616: with `ENABLE_ORJSON` unset every test on the shared instance runs orjson."""
+    with admin.client() as client:
+        note = client.post(
+            "/api/v1/notes/create",
+            json={"title": MIXED_TEXT["german"], "data": {}, "meta": {"extra": nested()}},
+        )
+    assert note.status_code == 200, note.text
+
+    stored = stored_text(instance, "note", "meta", note.json()["id"])
+    assert "Grüße" in stored and '": ' not in stored, (
+        f"with ENABLE_ORJSON unset note.meta was not written by orjson: {stored[:200]}"
+    )
 
 
 # ---------------------------------------------------------------- the same bytes and bodies

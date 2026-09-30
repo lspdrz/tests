@@ -16,6 +16,8 @@ result returned unconverted fails the API client test.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from harness import responses_provider as responses_api
@@ -262,9 +264,11 @@ def test_an_api_client_gets_a_non_streamed_result_in_chat_completions_shape(resp
     choice = body["choices"][0]
     assert choice["finish_reason"] == "tool_calls"
     assert choice["message"]["content"] == "checking"
-    assert choice["message"]["tool_calls"] == [
-        {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": '{"id": 7}'}}
-    ]
+    [call] = choice["message"]["tool_calls"]
+    arguments = call["function"].pop("arguments")
+    assert call == {"id": "c1", "type": "function", "function": {"name": "lookup"}}
+    # a JSON string, spaced as the server's codec writes it (compact under orjson, #31616)
+    assert isinstance(arguments, str) and json.loads(arguments) == {"id": 7}, arguments
     assert body["usage"] == FIRST_USAGE
     [sent] = provider.sent()
     assert sent["instructions"] == SYSTEM_PROMPT

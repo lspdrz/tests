@@ -9,7 +9,9 @@ Three open-webui v0.11.1 fixes:
 * Commit 78ed5a0235: the orjson codec swallowed `dumps` and `loads` options. A note stored with
   structured markdown came back as one compact line instead of the indented JSON block the note
   sanitizer asks for, and a tag search stopped matching the ASCII-escaped spelling stdlib json
-  had stored, so switching `ENABLE_ORJSON` on hid every model tagged with a non-ASCII name.
+  had stored, so switching `ENABLE_ORJSON` on hid every model tagged with a non-ASCII name. Since
+  #31615 every codec stores non-ASCII raw, so the escaped spelling is in rows saved before an
+  upgrade; the test rewrites its row that way.
 * Commit a33fa05adc: when `CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE` meant "no limit" (unset, 0
   or negative) the provider stream was read through aiohttp's own line reader, which aborted any
   reply that arrived as one line over its limit (512 KiB on aiohttp 3.14). A configured limit
@@ -29,18 +31,16 @@ limit and empty stream tests pass on both.
 from __future__ import annotations
 
 import json
-import sqlite3
 import uuid
-from contextlib import closing
 
 import pytest
 
+from harness import backends
 from harness import upstream as reply
 from harness.actors import admin_of
 from harness.chat import ask
-from harness.instance import ADMIN_EMAIL, ADMIN_PASSWORD
+from harness.json_codecs import stored_text
 from harness.plugins import installed_function
-from harness.prepared_data import serving
 from harness.raw_provider import connect
 from harness.second_provider import OPENAI_CONFIG
 from harness.upstream import MOCK_MODEL_ID
@@ -190,21 +190,11 @@ def test_an_empty_provider_stream_ends_the_reply_quietly(admin, listener, preser
     assert not message.get("error"), message
 
 
-def _stored_meta(data_dir, model_id: str) -> str:
-    with closing(sqlite3.connect(data_dir / "webui.db")) as database:
-        row = database.execute("SELECT meta FROM model WHERE id = ?", (model_id,)).fetchone()
-    return row[0]
-
-
-def test_a_non_ascii_tag_stored_by_stdlib_json_is_still_found_under_orjson(tmp_path):
+def test_a_non_ascii_tag_stored_escaped_is_still_found_under_orjson(orjson_instance):
     tag = f"Café {uuid.uuid4().hex[:6]}"
     model_id = f"tagged-{uuid.uuid4().hex[:8]}"
-    account = {"name": "Admin", "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
 
-    with serving(tmp_path) as stdlib_backend, stdlib_backend.client() as client:
-        signed_up = client.post("/api/v1/auths/signup", json=account)
-        assert signed_up.status_code == 200, signed_up.text
-        client.headers["Authorization"] = f"Bearer {signed_up.json()['token']}"
+    with admin_of(orjson_instance).client() as client:
         created = client.post(
             "/api/v1/models/create",
             json={
@@ -216,14 +206,13 @@ def test_a_non_ascii_tag_stored_by_stdlib_json_is_still_found_under_orjson(tmp_p
             },
         )
         assert created.status_code == 200, created.text
-    assert "\\u00e9" in _stored_meta(tmp_path, model_id), "stdlib json no longer escapes the tag"
-
-    with serving(tmp_path, ORJSON) as orjson_backend, orjson_backend.client() as client:
-        signed_in = client.post(
-            "/api/v1/auths/signin", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+        meta = json.loads(stored_text(orjson_instance, "model", "meta", model_id))
+        backends.write_rows(
+            orjson_instance,
+            "UPDATE model SET meta = :meta WHERE id = :model_id",
+            [{"meta": json.dumps(meta), "model_id": model_id}],
         )
-        assert signed_in.status_code == 200, signed_in.text
-        client.headers["Authorization"] = f"Bearer {signed_in.json()['token']}"
+        assert "\\u00e9" in stored_text(orjson_instance, "model", "meta", model_id)
         found = client.get("/api/v1/models/list", params={"tag": tag})
 
     assert found.status_code == 200, found.text

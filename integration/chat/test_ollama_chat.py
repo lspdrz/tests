@@ -14,6 +14,7 @@ counters fails the API client test.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
@@ -244,7 +245,10 @@ def test_an_api_client_gets_a_non_streamed_reply_in_openai_shape(ollama):
     message = body["choices"][0]["message"]
     assert message["reasoning_content"] == "need the weather"
     [call] = message["tool_calls"]
-    assert call["function"] == {"name": "lookup", "arguments": '{"city": "Graz"}'}
+    arguments = call["function"]["arguments"]
+    assert call["function"]["name"] == "lookup"
+    # a JSON string, spaced as the server's codec writes it (compact under orjson, #31616)
+    assert isinstance(arguments, str) and json.loads(arguments) == {"city": "Graz"}, arguments
     assert (body["usage"]["prompt_tokens"], body["usage"]["completion_tokens"]) == (12, 5)
     sent = server.chat_requests()[-1]
     assert sent["stream"] is False

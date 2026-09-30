@@ -7,14 +7,15 @@ gets a streamed mixed reply that shows again after a reload; a chat stored throu
 from the sidebar; a tool returning a dict of mixed text shows its values when expanded; a note,
 a model preset with a tag and a prompt written under one value show under the other.
 
-Two differences between the values show here as they do over HTTP and stay red: on Postgres the
-tag filter hides a preset whose capitalised non-ASCII tag was written with the switch off, and
-two long Cyrillic user variables saved from the account settings are refused with it off and
-saved with it on (both explained in integration/config/test_json_codec_toggle.py).
+Two differences between the values showed here as they do over HTTP until #31615 had stdlib json
+store non-ASCII raw: on Postgres the tag filter hid a preset whose capitalised non-ASCII tag was
+written with the switch off, and two long Cyrillic user variables saved from the account settings
+were refused with it off and saved with it on (both explained in
+integration/config/test_json_codec_toggle.py).
 
-Discriminates: on dev 176d31d1d everything passes except the two differences named above (the tag
-case only on Postgres). In backend copies of dev 176d31d1d, the orjson codec writing mojibake or
-orjson request parsing that mangles non-ASCII turns the cases with an orjson side red, and the
+Discriminates: passes on dev a5bc78300; on dev 176d31d1d the two differences named above fail (the
+tag case only on Postgres). In backend copies of dev 176d31d1d, the orjson codec writing mojibake
+or orjson request parsing that mangles non-ASCII turns the cases with an orjson side red, and the
 stdlib codec writing mojibake the ones with a stdlib side.
 """
 
@@ -202,8 +203,8 @@ def test_a_note_with_mixed_text_opens_and_shows_it(page_for, pair, writer, reade
     _expect_texts(page.get_by_role("main").get_by_label("Write something..."), EMOJI, HEBREW)
 
 
-# a capitalised non-ASCII tag stored escaped is missed on Postgres (integration twin in
-# integration/config/test_json_codec_toggle.py)
+# a capitalised non-ASCII tag stored escaped was missed on Postgres before #31615 (integration
+# twin in integration/config/test_json_codec_toggle.py)
 TAG_SPELLINGS = {"cjk": "报告", "capitalised": "Überblick"}
 
 
@@ -291,7 +292,8 @@ def test_long_non_ascii_user_variables_save_from_the_account_settings(page_for, 
     assert saved.value.status == 200, (
         f"saving two {len(LONG_RUSSIAN)}-character Cyrillic user variables through the {codec} "
         f"instance answered {saved.value.status}: {saved.value.text()}. The limit counts JSON "
-        "characters, and stdlib json (ENABLE_ORJSON off) writes six per Cyrillic letter"
+        "characters, and stdlib json (ENABLE_ORJSON off) wrote six per Cyrillic letter"
+        " until #31615"
     )
     with person.client() as client:
         stored = client.get("/api/v1/users/user/variables").json()["variables"]

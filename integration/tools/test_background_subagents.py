@@ -372,7 +372,8 @@ def test_a_background_limit_of_one_refuses_the_next_delegation_and_frees_the_slo
             "Error: Async subagent capacity reached (1 running). "
             "Wait for one to finish or increase subagents.max_async."
         ]
-        assert len([text for text in outputs if '"status": "dispatched"' in text]) == 1
+        dispatched = [json.loads(text) for text in outputs if not text.startswith("Error:")]
+        assert [handle["status"] for handle in dispatched] == ["dispatched"]
         wait_for_message(client, turn.chat_id, finished_reply("One came back."))
 
         again = send_message(
@@ -428,9 +429,8 @@ def test_a_background_limit_of_zero_means_the_default_and_refuses_nothing(
     with make_user().client() as client:
         _, stored = ask(client, prompt)
 
-    outputs = tool_outputs(stored)
-    assert len(outputs) == 2
-    assert all('"status": "dispatched"' in text for text in outputs), outputs
+    handles = dispatch_handles(stored)
+    assert [handle["status"] for handle in handles] == ["dispatched"] * 2, handles
 
 
 def test_a_background_call_while_background_sub_agents_are_off_runs_as_an_ordinary_delegation(
