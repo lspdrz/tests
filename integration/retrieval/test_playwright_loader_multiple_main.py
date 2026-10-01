@@ -1,0 +1,103 @@
+"""Regression: the Playwright loader returned only the site menu for a page with two `<main>`s.
+
+Issue #28643, fix `4ef7e35b8` (#31644): the HTML parser behind the loader keeps the first `<main>`
+of a page and drops the rest, so a page whose first `<main>` holds the site menu and a later one the
+content came back as its menu alone. When a page has more than one `<main>` the loader now unwraps
+them and reads the whole page. A page with a single `<main>` still loads only that element.
+
+The instance runs its own headless Chromium, as in test_v0114_playwright_media_skip, and loads a
+local page through both loaders: the synchronous one behind an attached link and the async one
+behind web search.
+
+Discriminates: passes on dev 015dbc861; with the unwrapping call removed from both loaders in a
+backend copy the page with two `<main>` elements loads as its menu alone. The single `<main>` case
+passes on both.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from harness.listener import text_answer
+from harness.playwright_server import chromium_installed
+from harness.web_retrieval import (
+    LOCAL_WEB_FETCH,
+    save_web_settings,
+    serve_search_results,
+    web_settings_restored,
+)
+
+pytestmark = [
+    pytest.mark.regression,
+    pytest.mark.api,
+    pytest.mark.requires_source,
+    pytest.mark.requires_browser,
+]
+
+MENU = "Products Support Community"
+SPECS = "Antenna gain 24 dBi and range 30 km"
+FOOTER = "Copyright Example Networks"
+TWO_MAINS = f"""<html><body><header><main>{MENU}</main></header>
+<main><h1>Tech specs</h1><p>{SPECS}</p></main><footer>{FOOTER}</footer></body></html>"""
+ONE_MAIN = f"""<html><body><header><p>{MENU}</p></header>
+<main><h1>Tech specs</h1><p>{SPECS}</p></main><footer><p>{FOOTER}</p></footer></body></html>"""
+
+
+@pytest.fixture(scope="module")
+def browsing_instance(instance_with):
+    if not chromium_installed():
+        pytest.skip(
+            "no Chromium for the instance's Playwright loader (playwright install chromium)"
+        )
+    return instance_with(LOCAL_WEB_FETCH)
+
+
+@pytest.fixture
+def playwright_client(browsing_instance, listener):
+    """Admin client with the Playwright loader selected and web search listing the served page."""
+    with browsing_instance.client() as client, web_settings_restored(client):
+        save_web_settings(
+            client,
+            **serve_search_results(listener, [f"{listener.base_url}/page"]),
+            WEB_LOADER_ENGINE="playwright",
+            PLAYWRIGHT_WS_URL="",
+            BYPASS_WEB_SEARCH_WEB_LOADER=False,
+            BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL=True,
+        )
+        yield client
+
+
+def load_attached_link(client, page: str) -> str:
+    loaded = client.post("/api/v1/retrieval/process/web?process=false", json={"url": page})
+    assert loaded.status_code == 200, loaded.text
+    return loaded.json()["content"]
+
+
+def load_search_result(client, page: str) -> str:
+    searched = client.post("/api/v1/retrieval/process/web/search", json={"queries": ["specs"]})
+    assert searched.status_code == 200, searched.text
+    return searched.json()["docs"][0]["content"]
+
+
+LOADERS = pytest.mark.parametrize(
+    "load", [load_attached_link, load_search_result], ids=["attached-link", "web-search"]
+)
+
+
+@LOADERS
+def test_a_page_with_two_main_elements_loads_its_content(playwright_client, listener, load):
+    listener.route("GET", "/page", text_answer(TWO_MAINS))
+
+    text = load(playwright_client, f"{listener.base_url}/page")
+
+    assert SPECS in text, f"the page loaded without its content: {text!r} (#28643)"
+
+
+@LOADERS
+def test_a_page_with_one_main_element_loads_only_that_element(playwright_client, listener, load):
+    listener.route("GET", "/page", text_answer(ONE_MAIN))
+
+    text = load(playwright_client, f"{listener.base_url}/page")
+
+    assert SPECS in text
+    assert MENU not in text and FOOTER not in text
