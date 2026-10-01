@@ -21,6 +21,17 @@ the client's credentials (`authorization`) and database (`dbname`) travel. Setti
 `refuse_untyped_scalar_index` makes the server refuse a scalar index without a type, the way a
 Milvus Lite or an older standalone server does. `milvus_env(fake, multitenancy)` is the
 environment of an instance that stores its vectors there.
+
+`version` is what the server reports (`v2.6.0` unless a test sets another). From 2.5 on it takes
+a schema with a BM25 `Function` filling a SPARSE_FLOAT_VECTOR field and a SPARSE_INVERTED_INDEX
+with the BM25 metric on it, and answers a search whose `data` is text on that field by BM25 over
+the function's input column (the standard analyzer: lowercase, split on non-word characters;
+k1 1.2, b 0.75, scored against every row of the collection, only rows sharing a term returned).
+Older servers refuse a function. `sparse_searches` lists every such search as `(collection, text,
+limit, filter)`. A collection is released until loaded, and a search or query on a released one is
+refused as Milvus does; `rename_collection` keeps rows, indexes and load state. A search or
+query naming a column the schema lacks is refused unless the collection has the dynamic field,
+which returns nothing for it.
 """
 
 from __future__ import annotations
@@ -39,7 +50,10 @@ from typing import Iterator
 import grpc
 from pymilvus.grpc_gen import common_pb2, milvus_pb2, milvus_pb2_grpc, schema_pb2
 
-VECTOR_TYPES = {schema_pb2.FloatVector}
+VECTOR_TYPES = {schema_pb2.FloatVector, schema_pb2.SparseFloatVector}
+BM25_K1 = 1.2
+BM25_B = 0.75
+BM25_INDEX_TYPES = {"SPARSE_INVERTED_INDEX", "SPARSE_WAND"}
 ORDERINGS = {">": operator.gt, "<": operator.lt, ">=": operator.ge, "<=": operator.le}
 CLAUSE = re.compile(
     r"^\s*(?P<field>\w+)(?:\[\s*['\"](?P<key>[^'\"]+)['\"]\s*\])?\s*"
@@ -123,6 +137,35 @@ def matches(row: dict, expression: str) -> bool:
     return True
 
 
+def _tokens(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower())
+
+
+def bm25_scores(corpus: list[str], query: str) -> list[float]:
+    """Milvus's BM25 of `query` against each text of `corpus`."""
+    documents = [_tokens(text) for text in corpus]
+    average = sum(len(tokens) for tokens in documents) / len(documents) if documents else 0.0
+    scores = [0.0] * len(documents)
+    for term in set(_tokens(query)):
+        holding = sum(1 for tokens in documents if term in tokens)
+        idf = math.log(1 + (len(documents) - holding + 0.5) / (holding + 0.5))
+        for index, tokens in enumerate(documents):
+            frequency = tokens.count(term)
+            if frequency:
+                norm = frequency + BM25_K1 * (1 - BM25_B + BM25_B * len(tokens) / average)
+                scores[index] += idf * frequency * (BM25_K1 + 1) / norm
+    return scores
+
+
+def _output_names(collection: Collection, requested) -> list[str] | None:
+    """The requested columns the schema holds; None when one is missing and no dynamic field."""
+    known = {column.name for column in collection.schema.fields}
+    missing = [name for name in requested if name not in known and name != "count(*)"]
+    if missing and not collection.schema.enable_dynamic_field:
+        return None
+    return [name for name in requested if name in known]
+
+
 def _cosine(left: list[float], right: list[float]) -> float:
     dot = sum(a * b for a, b in zip(left, right))
     norms = math.sqrt(sum(a * a for a in left)) * math.sqrt(sum(b * b for b in right))
@@ -134,6 +177,7 @@ class Collection:
     schema: schema_pb2.CollectionSchema
     rows: dict[str, dict] = field(default_factory=dict)
     indexes: dict[str, str] = field(default_factory=dict)
+    loaded: bool = False
 
     @property
     def primary(self) -> str:
@@ -141,6 +185,13 @@ class Collection:
 
     def field_type(self, name: str) -> int:
         return next(field.data_type for field in self.schema.fields if field.name == name)
+
+    def bm25_input(self, output: str) -> str | None:
+        """The column a BM25 function fills `output` from, if one does."""
+        for function in self.schema.functions:
+            if function.type == schema_pb2.BM25 and output in function.output_field_names:
+                return function.input_field_names[0]
+        return None
 
 
 def _rows_from(fields_data, num_rows: int) -> list[dict]:
@@ -168,7 +219,8 @@ def _column(collection: Collection, name: str, rows: list[dict]) -> schema_pb2.F
     column = schema_pb2.FieldData(type=kind, field_name=name)
     cells = [row.get(name) for row in rows]
     if kind == schema_pb2.FloatVector:
-        dim = len(cells[0]) if cells else 0
+        declared = next(f for f in collection.schema.fields if f.name == name).type_params
+        dim = len(cells[0]) if cells else int(_params(declared).get("dim", 0))
         column.vectors.dim = dim
         column.vectors.float_vector.data.extend(value for cell in cells for value in cell)
     elif kind == schema_pb2.JSON:
@@ -191,6 +243,8 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
         self.index_settings: dict[tuple[str, str], dict[str, str]] = {}
         self.call_metadata: list[dict[str, str]] = []
         self.searches: list[tuple[str, str, int, list[str]]] = []
+        self.sparse_searches: list[tuple[str, str, int, str]] = []
+        self.version = "v2.6.0"
         self.refuse_untyped_scalar_index = False
         self.address = ""
         self.lock = threading.Lock()
@@ -204,7 +258,13 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
             )
             for column, cell in rows[0].items()
         ]
-        collection = Collection(schema=schema_pb2.CollectionSchema(name=name, fields=fields))
+        for column in fields:
+            if column.data_type == schema_pb2.FloatVector:
+                dim = len(rows[0][column.name])
+                column.type_params.append(common_pb2.KeyValuePair(key="dim", value=str(dim)))
+        collection = Collection(
+            schema=schema_pb2.CollectionSchema(name=name, fields=fields), loaded=True
+        )
         collection.rows = {row["id"]: row for row in rows}
         with self.lock:
             self.collections[name] = collection
@@ -212,11 +272,11 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
     # --- connection ------------------------------------------------------------------------
 
     def Connect(self, request, context):
-        info = common_pb2.ServerInfo(build_tags="v2.6.0-fake")
+        info = common_pb2.ServerInfo(build_tags=f"{self.version}-fake")
         return milvus_pb2.ConnectResponse(status=_ok(), server_info=info, identifier=1)
 
     def GetVersion(self, request, context):
-        return milvus_pb2.GetVersionResponse(status=_ok(), version="v2.6.0")
+        return milvus_pb2.GetVersionResponse(status=_ok(), version=self.version)
 
     def AllocTimestamp(self, request, context):
         return milvus_pb2.AllocTimestampResponse(status=_ok(), timestamp=1)
@@ -226,9 +286,18 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
     def CreateCollection(self, request, context):
         schema = schema_pb2.CollectionSchema()
         schema.ParseFromString(request.schema)
+        if len(schema.functions) and self._version_tuple() < (2, 5):
+            return _failed("functions are not supported before Milvus 2.5")
+        for function in schema.functions:
+            for column in schema.fields:
+                if column.name in function.output_field_names:
+                    column.is_function_output = True
         with self.lock:
             self.collections[request.collection_name] = Collection(schema=schema)
         return _ok()
+
+    def _version_tuple(self) -> tuple[int, ...]:
+        return tuple(int(part) for part in re.findall(r"\d+", self.version)[:2])
 
     def DescribeCollection(self, request, context):
         with self.lock:
@@ -260,13 +329,39 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
         return _ok()
 
     def LoadCollection(self, request, context):
+        with self.lock:
+            collection = self.collections.get(request.collection_name)
+            if collection is not None:
+                collection.loaded = True
+        return _ok() if collection is not None else _not_found(request.collection_name)
+
+    def ReleaseCollection(self, request, context):
+        with self.lock:
+            collection = self.collections.get(request.collection_name)
+            if collection is not None:
+                collection.loaded = False
+        return _ok() if collection is not None else _not_found(request.collection_name)
+
+    def RenameCollection(self, request, context):
+        with self.lock:
+            collection = self.collections.get(request.oldName)
+            if collection is None:
+                return _not_found(request.oldName)
+            if request.newName in self.collections:
+                return _failed(f"duplicated new collection name {request.newName}")
+            self.collections[request.newName] = self.collections.pop(request.oldName)
         return _ok()
 
     def GetLoadingProgress(self, request, context):
         return milvus_pb2.GetLoadingProgressResponse(status=_ok(), progress=100)
 
     def GetLoadState(self, request, context):
-        return milvus_pb2.GetLoadStateResponse(status=_ok(), state=common_pb2.LoadStateLoaded)
+        with self.lock:
+            collection = self.collections.get(request.collection_name)
+        if collection is None:
+            return milvus_pb2.GetLoadStateResponse(status=_not_found(request.collection_name))
+        state = common_pb2.LoadStateLoaded if collection.loaded else common_pb2.LoadStateNotLoad
+        return milvus_pb2.GetLoadStateResponse(status=_ok(), state=state)
 
     def Flush(self, request, context):
         return milvus_pb2.FlushResponse(status=_ok())
@@ -282,6 +377,10 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
             self.index_settings[(request.collection_name, request.field_name)] = settings
         if collection is None:
             return _not_found(request.collection_name)
+        if collection.bm25_input(request.field_name) and (
+            index_type not in BM25_INDEX_TYPES or settings.get("metric_type") != "BM25"
+        ):
+            return _failed("a BM25 function output needs a sparse index with the BM25 metric")
         is_scalar = collection.field_type(request.field_name) not in VECTOR_TYPES
         if self.refuse_untyped_scalar_index and is_scalar and index_type in ("", "AUTOINDEX"):
             return _failed(f"index type not supported for scalar field {request.field_name}")
@@ -359,6 +458,11 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
             rows = list(collection.rows.values()) if collection else []
         if collection is None:
             return milvus_pb2.QueryResults(status=_not_found(request.collection_name))
+        if not collection.loaded:
+            return milvus_pb2.QueryResults(status=_failed("collection not loaded"))
+        requested = _output_names(collection, request.output_fields)
+        if requested is None:
+            return milvus_pb2.QueryResults(status=_failed("field not found in output_fields"))
         params = _params(request.query_params)
         found = [row for row in rows if matches(row, request.expr)]
         found.sort(key=lambda row: row[collection.primary])
@@ -370,9 +474,7 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
         offset = int(params.get("offset", 0) or 0)
         limit = int(params.get("limit", 0) or 0)
         found = found[offset : offset + limit] if limit > 0 else found[offset:]
-        names = [name for name in request.output_fields if name != "count(*)"] or [
-            collection.primary
-        ]
+        names = requested or [collection.primary]
         if collection.primary not in names:
             names.append(collection.primary)
         return milvus_pb2.QueryResults(
@@ -389,18 +491,24 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
             rows = list(collection.rows.values()) if collection else []
         if collection is None:
             return milvus_pb2.SearchResults(status=_not_found(request.collection_name))
+        if not collection.loaded:
+            return milvus_pb2.SearchResults(status=_failed("collection not loaded"))
         placeholders = common_pb2.PlaceholderGroup()
         placeholders.ParseFromString(request.placeholder_group)
-        vectors = [list(memoryview(raw).cast("f")) for raw in placeholders.placeholders[0].values]
         params = _params(request.search_params)
+        if placeholders.placeholders[0].type == common_pb2.VarChar:
+            return self._search_text(request, collection, rows, placeholders, params)
+        vectors = [list(memoryview(raw).cast("f")) for raw in placeholders.placeholders[0].values]
         top_k = int(params.get("topk", params.get("limit", 10)))
         vector_field = params.get("anns_field") or next(
             field.name for field in collection.schema.fields if field.data_type in VECTOR_TYPES
         )
         columns = {column.name: column for column in collection.schema.fields}
-        missing = [name for name in [vector_field, *request.output_fields] if name not in columns]
-        if missing:
-            return milvus_pb2.SearchResults(status=_failed(f"field not found: {missing[0]}"))
+        if vector_field not in columns:
+            return milvus_pb2.SearchResults(status=_failed(f"field not found: {vector_field}"))
+        requested = _output_names(collection, request.output_fields)
+        if requested is None:
+            return milvus_pb2.SearchResults(status=_failed("field not found in output_fields"))
         dims = {len(row[vector_field]) for row in rows}
         if any(len(vector) not in dims for vector in vectors) and dims:
             return milvus_pb2.SearchResults(status=_failed("vector dimension mismatch"))
@@ -409,7 +517,7 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
             self.searches.append(
                 (request.collection_name, vector_field, top_k, list(request.output_fields))
             )
-        names = [name for name in request.output_fields] or [collection.primary]
+        names = requested or [collection.primary]
         result = schema_pb2.SearchResultData(num_queries=len(vectors), top_k=top_k)
         hits_all: list[dict] = []
         for vector in vectors:
@@ -418,6 +526,45 @@ class FakeMilvus(milvus_pb2_grpc.MilvusServiceServicer):
             )[:top_k]
             result.topks.append(len(ranked))
             result.scores.extend(_cosine(vector, row[vector_field]) for row in ranked)
+            result.ids.str_id.data.extend(row[collection.primary] for row in ranked)
+            hits_all.extend(ranked)
+        result.output_fields.extend(names)
+        result.fields_data.extend(_column(collection, name, hits_all) for name in names)
+        return milvus_pb2.SearchResults(
+            status=_ok(), results=result, collection_name=request.collection_name
+        )
+
+    def _search_text(self, request, collection, rows, placeholders, params):
+        """A search whose data is text: BM25 over the column a function fills the field from."""
+        field_name = params.get("anns_field", "")
+        source = collection.bm25_input(field_name)
+        if source is None:
+            return milvus_pb2.SearchResults(status=_failed(f"{field_name} takes no text search"))
+        if field_name not in collection.indexes:
+            return milvus_pb2.SearchResults(status=_failed(f"no index on {field_name}"))
+        requested = _output_names(collection, request.output_fields)
+        if requested is None:
+            return milvus_pb2.SearchResults(status=_failed("field not found in output_fields"))
+        top_k = int(params.get("topk", params.get("limit", 10)))
+        queries = [raw.decode() for raw in placeholders.placeholders[0].values]
+        candidates = [row for row in rows if matches(row, request.dsl)]
+        with self.lock:
+            self.searches.append((request.collection_name, field_name, top_k, list(requested)))
+            for query in queries:
+                self.sparse_searches.append((request.collection_name, query, top_k, request.dsl))
+        names = requested or [collection.primary]
+        result = schema_pb2.SearchResultData(num_queries=len(queries), top_k=top_k)
+        hits_all: list[dict] = []
+        for query in queries:
+            scores = bm25_scores([row[source] for row in rows], query)
+            by_id = {row[collection.primary]: score for row, score in zip(rows, scores)}
+            ranked = sorted(
+                (row for row in candidates if by_id[row[collection.primary]] > 0),
+                key=lambda row: by_id[row[collection.primary]],
+                reverse=True,
+            )[:top_k]
+            result.topks.append(len(ranked))
+            result.scores.extend(by_id[row[collection.primary]] for row in ranked)
             result.ids.str_id.data.extend(row[collection.primary] for row in ranked)
             hits_all.extend(ranked)
         result.output_fields.extend(names)

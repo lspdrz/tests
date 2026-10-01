@@ -581,7 +581,13 @@ def test_milvus_gets_the_token_database_and_index_the_admin_configured(
         fields = {field.name: field for field in milvus.collections[collection].schema.fields}
 
     types = {name: schema_pb2.DataType.Name(field.data_type) for name, field in fields.items()}
-    assert types == {"id": "VarChar", "vector": "FloatVector", "data": "JSON", "metadata": "JSON"}
+    assert types == {
+        "id": "VarChar",
+        "vector": "FloatVector",
+        "text": "VarChar",
+        "sparse": "SparseFloatVector",
+        "metadata": "JSON",
+    }
     assert fields["id"].is_primary_key
     dimension = {pair.key: pair.value for pair in fields["vector"].type_params}["dim"]
     assert int(dimension) == len(KEYWORDS) + 1
@@ -593,6 +599,8 @@ def test_milvus_gets_the_token_database_and_index_the_admin_configured(
         "M": "8",
         "efConstruction": "64",
     }
+    sparse = milvus.index_settings[(collection, "sparse")]
+    assert (sparse["index_type"], sparse["metric_type"]) == ("SPARSE_INVERTED_INDEX", "BM25")
     credentials = base64.b64encode(MILVUS_TOKEN.encode()).decode()
     assert milvus.call_metadata, "the instance never reached Milvus"
     assert all(metadata.get("authorization") == credentials for metadata in milvus.call_metadata)
