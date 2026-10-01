@@ -41,10 +41,18 @@ pandas keeps a workbook's text columns in pyarrow arrays, with unstructured and 
 Windows-1251 Cyrillic is decoded with the codec chardet names, which ftfy could not repair
 after a latin-1 fallback.
 
+Chinese full-width punctuation and curly quotes were rewritten to ASCII by ftfy (issue #17087, fix
+c3fbf3638, PR #31655): text, HTML and Word uploads keep ：（），！？ and “ ” as written, while
+mojibake such as "cafÃ©" is still repaired.
+
 EUC-KR and Shift-JIS text were decoded as GB18030 mojibake (issue #31352, fix 3c47f0d7e, PR
 #31356): chardet 7.4.3 says CP949 for EUC-KR, which the codec map in `_detect_text_encoding`
 lacked, and Shift-JIS was missing from its try order. Both cases pass on dev efe63bd34 and fail
 with 3c47f0d7e reverted.
+
+With `fix_character_width=False, uncurl_quotes=False` removed from the loader's `ftfy.fix_text`
+call (c3fbf3638 reverted) the full-width and smart quote cases and the entity case's apostrophe fail
+on dev 015dbc861; the other mojibake case still passes.
 
 Discriminates: passes on dev bbfa876af (.rst, .epub and .odt with a pandoc binary on PATH). One
 backend copy broke pypdf's `extract_text`, `docx2txt.process`, the xlsx, rst and epub partitions and
@@ -239,6 +247,14 @@ def _docx() -> bytes:
 
     document = docx.Document()
     document.add_paragraph(SENTENCE)
+    return _saved(document)
+
+
+def _docx_with(text: str) -> bytes:
+    import docx
+
+    document = docx.Document()
+    document.add_paragraph(text)
     return _saved(document)
 
 
@@ -754,12 +770,8 @@ def test_mojibake_is_repaired_and_a_literal_entity_is_kept(make_user):
     with make_user().client() as client:
         content = _upload_and_read(client, "notes.txt", garbled.encode(), "text/plain")
 
-    assert "budget wasn't cut" in content, f"the mojibake survived: {content!r}"
+    assert "budget wasn’t cut" in content, f"the mojibake survived: {content!r}"
     assert "&amp;" in content, f"the literal entity was unescaped: {content!r}"
-
-
-def _straightened(text: str) -> str:
-    return text.translate(str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"}))
 
 
 def test_smart_quotes_read_as_latin_1_are_repaired(make_user):
@@ -768,8 +780,40 @@ def test_smart_quotes_read_as_latin_1_are_repaired(make_user):
     with make_user().client() as client:
         content = _upload_and_read(client, "quotes.txt", garbled.encode(), "text/plain")
 
-    # ftfy also straightens curly quotes by default, which is fine
-    assert _straightened(content) == _straightened(intended), f"not repaired: {content!r}"
+    assert content == intended, f"not repaired: {content!r}"
+
+
+def test_accented_mojibake_is_repaired(make_user):
+    with make_user().client() as client:
+        content = _upload_and_read(
+            client, "cafe.txt", "The harbour cafÃ© is open.".encode(), "text/plain"
+        )
+
+    assert content == "The harbour café is open.", f"the mojibake survived: {content!r}"
+
+
+# Chinese full-width punctuation and curly quotes, as written (issue #17087, PR #31655)
+CJK_SENTENCE = "港口灯塔：预算（已批准），“通过”！是吗？"
+
+
+@pytest.mark.parametrize(
+    "name, build, content_type",
+    [
+        pytest.param("notes.txt", lambda: CJK_SENTENCE.encode(), "text/plain", id="text"),
+        pytest.param(
+            "notes.html",
+            lambda: f"<html><body><p>{CJK_SENTENCE}</p></body></html>".encode(),
+            "text/html",
+            id="html",
+        ),
+        pytest.param("notes.docx", lambda: _docx_with(CJK_SENTENCE), DOCX_TYPE, id="docx"),
+    ],
+)
+def test_full_width_punctuation_and_curly_quotes_are_kept(make_user, name, build, content_type):
+    with make_user().client() as client:
+        content = _upload_and_read(client, name, build(), content_type)
+
+    assert content.strip() == CJK_SENTENCE, f"the punctuation was rewritten: {content!r}"
 
 
 def test_control_characters_and_terminal_colours_are_removed(make_user):
