@@ -3,11 +3,14 @@
 The owner opens the chat's Share dialog, creates the link and grants one account read access.
 That account opens `/s/{id}` in its own browser and reads the conversation; an account left off
 the access list is sent back home. Once the owner deletes the link, the granted account is sent
-home too.
+home too. A signed-out visitor is sent to the sign-in page, which returns them to the chat
+(open-webui/open-webui#31337): the page used to send them home, where they were asked to sign in
+and then landed on a new chat with the link lost.
 
 Discriminates: passes on dev ac00d40e3; in a backend copy, with `DELETE /api/v1/chats/{id}/share`
 answering true without removing the share the deletion test fails (the old link still opens),
-and with `can_read_shared_chat` granting any signed-in account the stranger test fails.
+and with `can_read_shared_chat` granting any signed-in account the stranger test fails. With
+`2178777340` reverted (the 015dbc861 mutation build) the signed-out test fails (sent home).
 """
 
 from __future__ import annotations
@@ -87,3 +90,21 @@ def test_an_account_left_off_the_access_list_is_sent_home(shared_chat, page_for,
     stranger_page = page_for(make_user())
     stranger_page.goto(share_path)
     _sent_home(stranger_page)
+
+
+@pytest.mark.regression
+def test_a_signed_out_visitor_signs_in_and_comes_back_to_the_link(shared_chat, make_user, page):
+    _, dialog, share_path = shared_chat
+    viewer = make_user()
+    _grant(dialog, viewer)
+
+    page.goto(share_path)
+
+    expect(page, "a signed-out visitor was not sent to sign in (#31337)").to_have_url(
+        re.compile(r"/auth\?redirect=" + re.escape(share_path.replace("/", "%2F")) + "$")
+    )
+    page.get_by_label("Email").fill(viewer.email)
+    page.get_by_label("Password", exact=True).fill(viewer.password)
+    page.get_by_role("button", name="Sign in", exact=True).click()
+    expect(page).to_have_url(re.compile(re.escape(share_path) + "$"))
+    expect(conversation(page).get_by_text(ANSWER)).to_be_visible()
