@@ -8,16 +8,13 @@ a file or a whole knowledge base, the `scan` helper reads a collection back for 
 and the admin's vector reset drops the indexes. Elasticsearch is played by
 `harness/elasticsearch_server.py`; the instance is this module's own.
 
-Editing a knowledge file's content re-adds its chunks and then deletes the old ones, which it
-finds with the store's `query` (#20558). On Elasticsearch `query` filters on the top-level field
-(`file_id`) while the chunks keep it under `metadata`, so it finds nothing and the old text
-stays searchable next to the new; on Chroma the same edit replaces it. That test stays red until
-the Elasticsearch `query` filters on `metadata.<key>` the way its `delete` and `search` do.
+Editing a knowledge file's content is pinned in
+integration/retrieval/test_elasticsearch_knowledge_edit.py.
 
-Discriminates: passes on dev ef67cc3fa apart from the edit test, which passes once `query`
-filters on `metadata.<key>`. In a backend copy, `bulk` handed a keyword the client does not take
-(a bump renaming one) fails every test, `delete_collection` without its collection term empties
-the other knowledge base too and `scan` given `q=` in place of `query=` fails the hybrid search.
+Discriminates: passes on dev 015dbc861. In a backend copy, `bulk` handed a keyword the client does
+not take (a bump renaming one) fails every test, `delete_collection` without its collection term
+empties the other knowledge base too and `scan` given `q=` in place of `query=` fails the hybrid
+search.
 """
 
 from __future__ import annotations
@@ -105,22 +102,6 @@ def test_removing_a_file_and_deleting_the_knowledge_base_clear_their_chunks(clie
 
         assert _stored_texts(elasticsearch, knowledge_id) == []
         assert _stored_texts(elasticsearch, other_id) == [LIGHTHOUSE]
-
-
-def test_editing_a_knowledge_file_replaces_its_old_text(client, elasticsearch):
-    with knowledge_base(client) as knowledge_id:
-        file_id = add_text_file(client, knowledge_id, "harbour.txt", HARBOUR)
-
-        edited = client.post(
-            f"/api/v1/files/{file_id}/data/content/update", json={"content": LIGHTHOUSE}
-        )
-        assert edited.status_code == 200, edited.text
-
-        assert _stored_texts(elasticsearch, knowledge_id) == [LIGHTHOUSE], (
-            "the file's old chunks stayed in the knowledge base after its content was edited: "
-            "the Elasticsearch store's query filters on `file_id` instead of `metadata.file_id` "
-            "and finds none of them (#20558)"
-        )
 
 
 def test_hybrid_search_reads_the_collection_back(client, on_elasticsearch, preserve):
