@@ -7,12 +7,12 @@ collection holds nothing cannot be created. A chat that attaches the resulting k
 `#` is sent the rows nearest to its question. The database is a real Postgres with the vector
 extension, so the tests read what the settings showed and what the model was sent.
 
-Discriminates: red on dev 176d31d1d for the tests that search the table, since every search fails
-there (open-webui/open-webui#26663, fix in #31112); they pass once the query embedding is sent as
-a vector. In a frontend copy, with the provider switch leaving the API key field in place the
+Discriminates: passes on dev 015dbc861; the tests that search the table fail on dev a5bc78300,
+where every search fails (open-webui/open-webui#26663), until PR #31112 sends the query embedding
+as a vector. In a frontend copy, with the provider switch leaving the API key field in place the
 fields test fails, with the table name changed in the source the add test fails (the search reads
 a table that is not there) and with the Create button enabled before a test passed the no-rows
-test fails. In a backend copy with that fixed, searching the other collections turns the chat
+test fails. In a backend copy, searching the other collections turns the chat
 test red (another collection's row is sent).
 """
 

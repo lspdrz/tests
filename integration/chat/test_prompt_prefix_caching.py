@@ -18,19 +18,20 @@ the page names (Citations on, File Context on, the memory system context with a 
 changing, web search switched on mid-chat, an earlier message edited) and show the check goes
 red on each.
 
-Three tests stay red. A model that calls a second tool straight after the first, with no text
-in between, has both calls folded into one assistant message on the next round, so that round
-rewrites the assistant message the previous request ended with. The turn a timer or a
-background sub-agent's report starts is sent the chat's finished system prompt as its own and
-has the model's system prompt and attached knowledge added to it again, so the system message
-changes on that turn and changes back on the next; issue open-webui/open-webui#31568 reports the
-same reuse for the sub-agent's own prompt.
+Two tests stay red. The turn a timer or a background sub-agent's report starts is sent the
+chat's finished system prompt as its own and has the model's system prompt and attached knowledge
+added to it again, so the system message changes on that turn and changes back on the next;
+issue open-webui/open-webui#31568 reports the same reuse for the sub-agent's own prompt (fix PR
+#31579 open). A model that called a second tool straight after the first, with no text in
+between, had both calls folded into one assistant message on the next round, so that round
+rewrote the assistant message the previous request ended with; PR #31593 fixed that
+(open-webui/open-webui#31588).
 
-Discriminates: passes on dev 176d31d1d apart from those three, which fail there. In backend
-copies, a clock value added to the model's system prompt and the tool list shuffled per request
-each turned all twenty promise tests red; with each round's tool calls kept in an assistant
-message of their own and no stored system prompt handed to a timer or report, all of them
-passed. The controls pass on all four.
+Discriminates: passes on dev 015dbc861 apart from those two, which fail there; the multi-step
+tool loop test fails on dev a5bc78300, before PR #31593. In backend copies, a clock value added
+to the model's system prompt and the tool list shuffled per request each turned all twenty
+promise tests red; with no stored system prompt handed to a timer or report, all of them passed.
+The controls pass on all four.
 """
 
 from __future__ import annotations
@@ -247,7 +248,7 @@ def test_a_multi_step_tool_loop_only_appends(cached_setup, make_user, upstream):
     broken = first_break(chat.requests())
     assert broken is None, (
         "the second tool round folded its call into the assistant message the first round ended "
-        f"with, rewriting it: {broken}"
+        f"with, rewriting it (#31588): {broken}"
     )
 
 

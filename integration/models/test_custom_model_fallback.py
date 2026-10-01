@@ -1,19 +1,17 @@
-"""Open bug: a chat from the web client on a custom model whose base model is gone never falls back.
+"""Regression: a web client chat on a custom model whose base model is gone never fell back.
 
 With `ENABLE_CUSTOM_MODEL_FALLBACK=true` a custom model whose base model no connection serves any
 more is answered by the first default model instead of failing (docs: env-configuration,
-workspace/models). `chat_completion` does rebind the model to that fallback, but a request
-carrying a socket session and a chat id (every send from the web client) is then fanned out per
-entry of `message_ids`, and each entry still names the custom model. The provider router
-resolves the custom model's missing base again and the reply is stored as the error
-"Model '' was not found". An API client without a session never reaches the fan-out, and its
-request does fall back.
+workspace/models). `chat_completion` rebound the model to that fallback, but a request carrying a
+socket session and a chat id (every send from the web client) was then fanned out per entry of
+`message_ids`, and each entry still named the custom model. The provider router resolved the
+custom model's missing base again and the reply was stored as the error "Model '' was not
+found". An API client without a session never reaches the fan-out, and its request did fall
+back. PR #31353 (open-webui/open-webui#31345) hands the fallback to each fanned-out entry.
 
-Red on dev ef67cc3fa: the web client's send fails with "Model '' was not found". No upstream
-issue or fix yet.
-
-Discriminates: the API client test passes on dev ef67cc3fa and fails with the rebind to the
-fallback model removed (the request fails the same way).
+Discriminates: passes on dev 015dbc861; the web client test fails on dev a5bc78300, before PR
+#31353 (the send fails with "Model '' was not found"). The API client test passes on both and
+fails with the rebind to the fallback model removed (the request fails the same way).
 """
 
 from __future__ import annotations

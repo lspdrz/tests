@@ -29,8 +29,9 @@ Discriminates: passes on dev `bbfa876af`; each narrow test fails with its fix re
 removal, the sync update, the prefix strip, the passthrough timeout, the fallback ordering and the
 three self-reference guards, one mutation each). On dev ef67cc3fa, restoring the bypass early
 return fails all four backend cases and dropping the api.anthropic.com header rewrite fails the
-Anthropic key test. The fallback on the web client path fails on dev until its fix merges (#31345,
-PR #31353). A re-sync on the default SQLite setup (#31346) passes since PR #31349 (`ac00d40e3`).
+Anthropic key test. The fallback on the web client path fails on dev a5bc78300 and passes since
+PR #31353 (#31345). A re-sync on the default SQLite setup (#31346) passes since PR #31349
+(`ac00d40e3`).
 """
 
 from __future__ import annotations

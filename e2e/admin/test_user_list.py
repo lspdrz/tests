@@ -13,10 +13,10 @@ nothing turns the delete test red (the row stays) and the Email header sorting b
 sort test red; in a backend copy, the user search matching emails alone turns the search test red
 (the name finds nobody).
 
-The header test is red on dev 176d31d1d (open-webui/open-webui#31581): the sorted column's
+The header test fails on dev a5bc78300 (open-webui/open-webui#31581): the sorted column's
 `aria-sort`, added by #27501 to tell screen readers the sort, keeps the value it had on load,
 since in legacy mode Svelte does not re-run a template call to a helper when the state that
-helper reads changes. Writing the comparison into each header's attribute turns it green.
+helper reads changes. It passes since dev dc713a68a, which hands the sort state to that helper.
 """
 
 from __future__ import annotations

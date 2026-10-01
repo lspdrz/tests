@@ -7,9 +7,9 @@ with the vector extension, filled with rows in Open WebUI's own table layout, so
 what the search returned rather than what a fake was asked. A pgvector connection keeps no
 credentials of its own (they belong in the database URL) and the source needs a vector field.
 
-Discriminates: red on dev 176d31d1d, where the query embedding reaches Postgres as a float array
-and every search fails (open-webui/open-webui#26663, fix in #31112); the search tests pass once it
-is sent as a vector. In a backend copy with that fixed, filtering on the other collections turns
+Discriminates: passes on dev 015dbc861; the search tests fail on dev a5bc78300, where the query
+embedding reaches Postgres as a float array and every search fails (open-webui/open-webui#26663),
+until PR #31112 sends it as a vector. In a backend copy, filtering on the other collections turns
 the unsaved-connection and chat tests red (the other rows come back), ordering by descending
 distance turns the two route tests red, keeping the key of a pgvector connection turns the
 credentials test red, dropping the vector field check turns the refusal test red and reading a
