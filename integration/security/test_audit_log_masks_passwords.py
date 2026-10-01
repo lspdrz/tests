@@ -6,12 +6,19 @@ password), the LDAP `app_dn_password` and the YaCy `YACY_PASSWORD` were written 
 log as typed. Any JSON field whose name ends in `password`, in any letter case, is now replaced
 with asterisks before the entry is logged; the rest of the request still is.
 
-The tests run on an instance of their own with request auditing on, and read the audit log
-file in its data directory.
+Fix `3ef0d1543` (#31659): the mask stopped at the first double quote, so a password holding one
+was logged from that quote on, and a body with whitespace before the colon was not masked at all.
+Response bodies were logged unmasked, so the LDAP settings, which come back with the application
+password in them, put it in the log on every save and every read. The mask now runs to the
+closing quote, allows whitespace around the colon and covers responses as well.
 
-Discriminates: passes on dev a5bc78300; with the masking pattern reverted to the exact
+The tests run on an instance of their own with request and response auditing on, reads
+included, and read the audit log file in its data directory.
+
+Discriminates: passes on dev 015dbc861; with the masking pattern reverted to the exact
 `"password"` field, the self-service change, the LDAP and the YaCy tests go red (the new value
-is in the log), while the admin reset and the add-user tests stay green.
+is in the log), while the admin reset and the add-user tests stay green. With `3ef0d1543`
+reverted the double quote, spaced colon and LDAP response tests go red.
 """
 
 from __future__ import annotations
@@ -33,7 +40,11 @@ pytestmark = [
 ]
 
 MASK = "********"
-AUDIT_ENV = {"AUDIT_LOG_LEVEL": "REQUEST", "AUDIT_EXCLUDED_PATHS": ""}
+AUDIT_ENV = {
+    "AUDIT_LOG_LEVEL": "REQUEST_RESPONSE",
+    "AUDIT_EXCLUDED_PATHS": "",
+    "ENABLE_AUDIT_GET_REQUESTS": "true",
+}
 RETRIEVAL_CONFIG = ("/api/v1/retrieval/config", "/api/v1/retrieval/config/update")
 LDAP_SERVER = "/api/v1/auths/admin/config/ldap/server"
 
@@ -61,15 +72,44 @@ def _entries_for(instance, path_suffix: str, user_email: str) -> list[dict]:
     ]
 
 
-def _logged_request(instance, path_suffix: str, user_email: str) -> str:
-    """The request body of the newest audit entry for this route and account, once it lands."""
+def _logged_entry(instance, path_suffix: str, user_email: str, verb: str, marker: str = "") -> dict:
+    """The newest entry for this route, method and account that carries `marker`, once it lands."""
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        entries = _entries_for(instance, path_suffix, user_email)
+        entries = [
+            entry
+            for entry in _entries_for(instance, path_suffix, user_email)
+            if entry["verb"] == verb
+            and marker in entry["request_object"] + entry["response_object"]
+        ]
         if entries:
-            return entries[-1]["request_object"]
+            return entries[-1]
         time.sleep(0.2)
-    raise AssertionError(f"no audit entry for {path_suffix} by {user_email}")
+    raise AssertionError(f"no audit entry for {verb} {path_suffix} by {user_email}")
+
+
+def _logged_request(instance, path_suffix: str, user_email: str, marker: str = "") -> str:
+    return _logged_entry(instance, path_suffix, user_email, "POST", marker)["request_object"]
+
+
+def _logged_response(instance, path_suffix: str, user_email: str, verb: str, marker: str) -> str:
+    return _logged_entry(instance, path_suffix, user_email, verb, marker)["response_object"]
+
+
+def _directory_host() -> str:
+    # each test saves its own host, so an earlier test's entry is never taken for its own
+    return f"ldap-{uuid.uuid4().hex[:8]}.audit.invalid"
+
+
+def _ldap_settings(app_password: str, host: str) -> dict:
+    return {
+        "label": "Audit directory",
+        "host": host,
+        "app_dn": "cn=reader,dc=example,dc=com",
+        "app_dn_password": app_password,
+        "search_base": "dc=example,dc=com",
+        "use_tls": False,
+    }
 
 
 def test_a_users_own_password_change_logs_neither_password(audited):
@@ -126,23 +166,16 @@ def test_adding_a_user_still_masks_the_password_and_logs_the_email(audited):
 def test_an_ldap_app_password_is_masked_in_the_settings_save(audited):
     # Unset LDAP settings cannot be posted back, so the module's own instance is left as saved.
     app_password = _secret("ldap")
-    settings = {
-        "label": "Audit directory",
-        "host": "ldap.audit.invalid",
-        "app_dn": "cn=reader,dc=example,dc=com",
-        "app_dn_password": app_password,
-        "search_base": "dc=example,dc=com",
-        "use_tls": False,
-    }
+    host = _directory_host()
 
     with audited.client() as client:
-        saved = client.post(LDAP_SERVER, json=settings)
+        saved = client.post(LDAP_SERVER, json=_ldap_settings(app_password, host))
     assert saved.status_code == 200, saved.text
 
-    logged = _logged_request(audited, "/admin/config/ldap/server", ADMIN_EMAIL)
+    logged = _logged_request(audited, "/admin/config/ldap/server", ADMIN_EMAIL, host)
     assert app_password not in logged, f"the LDAP password reached the audit log (#31622): {logged}"
     assert json.loads(logged)["app_dn_password"] == MASK
-    assert json.loads(logged)["host"] == "ldap.audit.invalid"
+    assert json.loads(logged)["host"] == host
 
 
 def test_a_yacy_password_in_capitals_is_masked_in_the_retrieval_settings_save(audited, preserve):
@@ -162,3 +195,60 @@ def test_a_yacy_password_in_capitals_is_masked_in_the_retrieval_settings_save(au
         f"the YaCy password reached the audit log (#31622): {logged}"
     )
     assert json.loads(logged)["web"] == {"YACY_USERNAME": yacy_user, "YACY_PASSWORD": MASK}
+
+
+def test_a_password_holding_a_double_quote_is_masked_to_its_end(audited):
+    account = create_user(audited)
+    tail = _secret("tail")
+    new_password = f'Q"{tail}'
+
+    with audited.client(account.token) as client:
+        changed = client.post(
+            "/api/v1/auths/update/password",
+            json={"password": account.password, "new_password": new_password},
+        )
+    assert changed.status_code == 200, changed.text
+
+    logged = _logged_request(audited, "/auths/update/password", account.email)
+    assert tail not in logged, (
+        f"the password after its quote reached the audit log (#31659): {logged}"
+    )
+    assert json.loads(logged) == {"password": MASK, "new_password": MASK}
+
+
+def test_a_password_field_spaced_before_its_colon_is_masked(audited):
+    account = create_user(audited)
+    new_password = _secret("spaced")
+    body = f'{{"password" : "{account.password}", "new_password" : "{new_password}"}}'
+
+    with audited.client(account.token) as client:
+        changed = client.post(
+            "/api/v1/auths/update/password",
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+    assert changed.status_code == 200, changed.text
+
+    logged = _logged_request(audited, "/auths/update/password", account.email)
+    assert new_password not in logged, f"a spaced password field was logged (#31659): {logged}"
+    assert account.password not in logged
+    assert json.loads(logged) == {"password": MASK, "new_password": MASK}
+
+
+def test_the_ldap_app_password_sent_back_is_masked_in_the_logged_responses(audited):
+    app_password = _secret("ldap-response")
+    host = _directory_host()
+
+    with audited.client() as client:
+        saved = client.post(LDAP_SERVER, json=_ldap_settings(app_password, host))
+        read = client.get(LDAP_SERVER)
+    assert saved.status_code == 200, saved.text
+    assert read.json()["app_dn_password"] == app_password
+
+    for verb in ("POST", "GET"):
+        logged = _logged_response(audited, "/admin/config/ldap/server", ADMIN_EMAIL, verb, host)
+        assert app_password not in logged, (
+            f"the LDAP password in the {verb} response reached the audit log (#31659): {logged}"
+        )
+        assert json.loads(logged)["app_dn_password"] == MASK
+        assert json.loads(logged)["host"] == host
