@@ -165,7 +165,9 @@ def _audit_entries(target) -> list[dict]:
     for path in _archives(target):
         with zipfile.ZipFile(path) as archive:
             texts += [archive.read(member).decode() for member in archive.namelist()]
-    texts.append((target.data_dir / "audit.log").read_text())
+    current = target.data_dir / "audit.log"
+    if current.exists():  # gone for a moment while loguru rotates it
+        texts.append(current.read_text())
     return [json.loads(line) for text in texts for line in text.splitlines() if line.strip()]
 
 
@@ -184,11 +186,12 @@ def test_the_audit_log_rotates_into_zip_archives(json_audited):
 
 def test_only_audited_requests_reach_the_audit_log(json_audited):
     _filter_failure_log(json_audited)
+    before = len(_audit_entries(json_audited))
     _create_notes(json_audited, 1)
 
+    # the entry is written once the response has gone out
+    assert _eventually(lambda: _audit_entries(json_audited)[before:]), "the request was not audited"
     entries = _audit_entries(json_audited)
-
-    assert entries, "the audit log is empty"
     # an ordinary log line written there would be an entry without a request
     assert all(entry["verb"] and entry["request_uri"] for entry in entries), [
         entry for entry in entries if not entry["verb"]
