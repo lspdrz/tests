@@ -3,7 +3,7 @@
 * open-webui/open-webui#28880, fix `5f8d8f0c5` (PR open-webui/open-webui#30447): a queued
   message whose attachment failed to upload holds the whole queue back. Deleting or editing it
   took it out of the queue but never resumed the queue, so the messages behind it stayed
-  unsent until the chat was reopened.
+  unsent until the chat was reopened. Since dev 8a4547104 its Send now button reads Upload failed.
 * open-webui/open-webui#30027, fix `aea7d34f4`: Send now on one queued message stopped the
   running reply and sent that message, but the stopped reply's completion resumed the queue at
   the same moment, so the rest of the queue went out too and two replies streamed into the
@@ -27,7 +27,7 @@ from utils.chat_ui import chat_input, conversation, expect_reply, last_reply, se
 pytestmark = [pytest.mark.regression, pytest.mark.requires_browser, pytest.mark.requires_source]
 
 FIRST, SECOND, THIRD = "queued alpha", "queued bravo", "queued charlie"
-QUEUE_SEND_BUTTON = re.compile("^(Send now|Waiting for upload)$")
+QUEUE_SEND_BUTTON = re.compile("^(Send now|Waiting for upload|Upload failed)$")
 
 
 def queued_item(page: Page, text: str) -> Locator:
@@ -111,9 +111,7 @@ def test_a_failed_attachment_still_holds_the_queue_until_it_is_dealt_with(
     page.wait_for_timeout(1500)  # bounded: nothing may be sent while the failed message waits
     assert last_user_messages(upstream) == ["hello"]
     expect(queued_item(page, SECOND)).to_be_visible()
-    expect(
-        queued_item(page, FIRST).get_by_role("button", name="Waiting for upload")
-    ).to_be_disabled()
+    expect(queued_item(page, FIRST).get_by_role("button", name="Upload failed")).to_be_disabled()
 
 
 def test_send_now_sends_only_the_chosen_message(page, upstream):

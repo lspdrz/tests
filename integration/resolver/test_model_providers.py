@@ -260,7 +260,8 @@ def test_an_unresolvable_provider_leaves_the_model_list_and_fails_its_chats(
     assert listed.status_code == 200, listed.text
     listed_ids = [model["id"] for model in listed.json()["data"]]
     assert MOCK_MODEL_ID in listed_ids and NAMED_MODEL in listed_ids
-    assert (whole.status_code, whole.json()) == (400, {"detail": CONNECTION_ERROR})
+    # the router's 500 passes through since dev 015dbc861, which wrapped it in a 400 before
+    assert (whole.status_code, whole.json()) == (500, {"detail": CONNECTION_ERROR})
     assert stored["error"] == {"content": CONNECTION_ERROR}, stored
     slowest = max(listing_seconds, chat_seconds)
     assert slowest < FAILS_WITHIN, f"{resolver} took {slowest:.1f}s to refuse an unknown name"

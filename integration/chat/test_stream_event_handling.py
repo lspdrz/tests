@@ -12,7 +12,8 @@ Six 0.11.1 repairs on the path that turns a provider stream into the stored `out
   `started_at` crashed on `ended_at - started_at`.
 * #28016 (`f3f76095d`): every tool result was stamped `completed`; an error result is `failed`.
 * #28633 (`a610d77137`): a >= 400 answer to the request made after a tool ran ended the reply
-  silently; the provider's message is now stored as the reply's error.
+  silently; the provider's message is now stored as the reply's error, a plain-text one as written
+  since dev 015dbc861 (only the status was named before).
 
 The Responses streams come from a listener registered as a Responses-API connection; the tool
 cases run on the scripted provider through the web client's chat path.
@@ -295,7 +296,7 @@ def test_the_providers_own_error_message_is_stored(admin, listener, preserve, er
     assert (message.get("error") or {}).get("content") == shown
 
 
-def test_a_plain_text_error_after_a_tool_ran_names_the_status(admin, listener, preserve):
+def test_a_plain_text_error_after_a_tool_ran_is_stored_as_written(admin, listener, preserve):
     preserve(second_provider.OPENAI_CONFIG)
     with admin.client() as client:
         second_provider.attach(client, listener, PROVIDER_MODEL)
@@ -308,4 +309,4 @@ def test_a_plain_text_error_after_a_tool_ran_names_the_status(admin, listener, p
     with admin.client() as client:
         _, message = ask(client, "what time is it?", model=PROVIDER_MODEL)
 
-    assert (message.get("error") or {}).get("content") == "Provider returned HTTP 502", message
+    assert (message.get("error") or {}).get("content") == "gateway down", message

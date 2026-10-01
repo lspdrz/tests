@@ -708,7 +708,7 @@
     "integration/chat/test_stream_event_handling.py::test_a_failed_tool_call_is_stamped_failed": 0.336,
     "integration/chat/test_stream_event_handling.py::test_a_finished_output_item_is_applied": 0.206,
     "integration/chat/test_stream_event_handling.py::test_a_plain_responses_reply_is_stored": 0.208,
-    "integration/chat/test_stream_event_handling.py::test_a_plain_text_error_after_a_tool_ran_names_the_status": 0.208,
+    "integration/chat/test_stream_event_handling.py::test_a_plain_text_error_after_a_tool_ran_is_stored_as_written": 0.208,
     "integration/chat/test_stream_event_handling.py::test_a_provider_error_after_a_tool_ran_is_stored": 0.319,
     "integration/chat/test_stream_event_handling.py::test_a_stream_ending_in_reasoning_finishes_cleanly": 0.221,
     "integration/chat/test_stream_event_handling.py::test_a_successful_tool_call_is_stamped_completed": 0.328,

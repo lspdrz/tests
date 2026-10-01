@@ -10,7 +10,8 @@
   fails the upload with Docling's own messages, and a null `md_content` no longer raises.
 - HTML entities in uploaded text (fix `1bfa59acb`, PR #29736, issue #29732): every document went
   through `ftfy.fix_text`, whose default also decodes entities, so `&nbsp;` and `&gt;` in a file
-  were rewritten before being stored. Entity decoding is off; ftfy's other repairs stay.
+  were rewritten before being stored. Entity decoding is off; ftfy's mojibake repair stays, and
+  since PR #31655 (issue #17087) it keeps curly quotes and full-width punctuation as written.
 
 Tika and Docling are local services; each upload is processed before the response returns.
 
@@ -19,7 +20,8 @@ Twin of unit/retrieval/test_v0114_source_text_and_docling.py.
 Discriminates: passes on dev bbfa876af; removing `ino` from `known_source_ext` fails the sketch
 cases (the extraction server is called), dropping the conversion status check fails the refused
 and skipped cases, reading `md_content` with a `''` default fails the null case and decoding
-entities again fails the entity case.
+entities again fails the entity case. The mojibake case passes on dev 015dbc861 and fails on dev
+a5bc78300, before PR #31655 (the repaired quote comes back straightened).
 """
 
 from __future__ import annotations
@@ -163,4 +165,4 @@ def test_mojibake_is_still_repaired(extraction):
 
     data = upload(client, "mojibake.txt", "donâ€™t".encode(), "text/plain")
 
-    assert data["content"] == "don't"
+    assert data["content"] == "don’t"

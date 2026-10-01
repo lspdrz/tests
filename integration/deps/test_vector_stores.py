@@ -37,9 +37,10 @@ With `VECTOR_DB=milvus` the same knowledge and memory tests run through pymilvus
 `MilvusClient` against a local gRPC stand-in (`harness.milvus_server`), with a collection per
 knowledge base and with the shared collections of multitenancy mode: `create_schema` and
 `prepare_index_params` build the collection (a VARCHAR primary id, the vector at the embedding's
-dimension, JSON data and metadata, the HNSW index the admin configured), `insert`, `upsert`,
-`search`, `query_iterator` for filtered reads, `delete` by id and by filter, `drop_collection`
-and `list_collections` on a reset, and the token and database name travel with every call.
+dimension, the text with its BM25 sparse vector on a 2.5+ server since PR #31645, JSON metadata,
+the HNSW index the admin configured), `insert`, `upsert`, `search`, `query_iterator` for
+filtered reads, `delete` by id and by filter, `drop_collection` and `list_collections` on a
+reset, and the token and database name travel with every call.
 
 With `VECTOR_DB=qdrant` they go through qdrant-client to a local Qdrant (`harness.qdrant_server`),
 once with a collection per knowledge base, once in the default multitenancy mode (one shared
