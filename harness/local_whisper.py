@@ -4,7 +4,9 @@ Local Whisper (a blank speech-to-text engine) loads a CTranslate2 model through 
 by name or by path, and faster-whisper decodes the recording with PyAV first.
 `save_tiny_whisper(directory)` builds a model there without downloading anything: a one-layer
 Whisper with random weights and a word-level tokenizer of `WORDS`, converted by CTranslate2's
-own converter. Whatever it hears, its transcript is made of those words.
+own converter. Its decoder always favours the first word by far, so whatever it hears its
+transcript is that word over and over (with a random decoder faster-whisper's sampling retries
+came back empty now and then).
 `using_local_whisper(client, model_path)` saves the admin's audio settings on it and restores
 the previous ones through the config import, as `harness.audio_engine` does.
 """
@@ -87,7 +89,14 @@ def save_tiny_whisper(directory: Path) -> Path:
         begin_suppress_tokens=[],
     )
     torch.manual_seed(0)
-    transformers.WhisperForConditionalGeneration(config).save_pretrained(source)
+    model = transformers.WhisperForConditionalGeneration(config)
+    with torch.no_grad():
+        # one fixed decoder output that favours a word, so every decode at any temperature agrees
+        direction = torch.ones(config.d_model)
+        model.model.decoder.layer_norm.weight.zero_()
+        model.model.decoder.layer_norm.bias.copy_(direction)
+        model.model.decoder.embed_tokens.weight[vocabulary[WORDS[0]]] = direction
+    model.save_pretrained(source)
     converted = directory / "ctranslate2"
     converter = converters.TransformersConverter(str(source), copy_files=["tokenizer.json"])
     converter.convert(str(converted), force=True)
