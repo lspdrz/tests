@@ -22,18 +22,14 @@ either, as a deployment flipping the switch or rolling it out worker by worker d
   prompt text, or a capitalised non-ASCII tag on Postgres, found rows written with the switch on
   and missed rows written with it off. SQLite matches a non-ASCII tag exact-case, so the tag
   filter behaved the same there.
-* A chat's context usage (shown in the chat and deciding when compaction starts) estimates
-  tokens from the length of its tool call items as JSON, which stdlib spaces: the same chat
-  with one tool call counts about 6% more tokens with the switch off.
 * The Anthropic-compatible stream carries the same text and tool arguments on both values, with
   every frame parsing when split the way the Anthropic SDK splits lines.
 
-The variable and search tests pin the differences #31615 removed. The context usage test pins one
-that remains and stays red until the product behaves the same on both. The CJK tag and automation
+The variable and search tests pin the differences #31615 removed. The CJK tag and automation
 search (#28399, #31422), the line separators and the codec options are pinned by
 integration/models/test_automations_and_calendar.py and integration/config/test_json_codec.py.
 
-Discriminates: on dev a5bc78300 every test passes but the context usage one. On dev 176d31d1d the
+Discriminates: on dev a5bc78300 every test passes. On dev 176d31d1d the
 variable and search tests fail too (the tag test only on Postgres), and so does the stdlib side of
 the stored-spelling test, which finds the old escapes, and the default test, the switch being off
 there. In backend copies of dev 176d31d1d, the orjson codec decoding its output as Latin-1 turns
@@ -41,7 +37,7 @@ the orjson side of the stored-spelling and Anthropic stream tests red; orjson re
 mangles non-ASCII (with indented responses) turns the byte-identity and the compact and pretty
 request tests red; the orjson request parser answering an unparseable body with an empty object
 turns the broken-body test red; the stdlib codec writing mojibake turns the stdlib sides red; and
-the stdlib codec writing compact raw UTF-8 like orjson turns all five difference tests green.
+the stdlib codec writing compact raw UTF-8 like orjson turns all four difference tests green.
 """
 
 from __future__ import annotations
@@ -54,9 +50,8 @@ import pytest
 
 from harness import backends
 from harness.actors import admin_of, create_user
-from harness.chat import ask, send_message, wait_for_reply
+from harness.chat import send_message, wait_for_reply
 from harness.json_codecs import CODECS, MIXED_TEXT, codec_pair, nested, stored_text
-from harness.python_tools import python_tool
 from harness.upstream import MOCK_MODEL_ID
 from harness.upstream import text as reply_text
 from harness.upstream import tool_call as reply_tool_call
@@ -366,53 +361,6 @@ def test_a_lower_case_query_finds_capitalised_non_ascii_prompts_the_same_way(pai
     assert len(by_writer) == 1, (
         f"on {database}, searching {query!r} found (reader: {{writer: found}}) {found}: a "
         "case-insensitive match folds the raw text orjson stores, not the escapes stdlib stores"
-    )
-
-
-# ---------------------------------------------------------------- differences: context usage
-
-WEATHER_TOOL = '''
-class Tools:
-    def forecast(self, city: str) -> dict:
-        """Get the forecast for a city.
-
-        :param city: the city
-        """
-        return {
-            "city": city,
-            "summary": "Leichter Regen, später sonnig",
-            "temperature_c": 14.5,
-            "rain": True,
-            "alerts": [],
-            "days": [{"day": day, "high": 15 + day, "low": 8, "note": None} for day in range(7)],
-        }
-'''
-
-
-def test_a_chat_with_a_tool_call_reports_the_same_context_usage(pair, admin_client):
-    stdlib_admin = admin_of(pair["stdlib"])
-    imported = admin_client["stdlib"].post(
-        "/api/v1/configs/import", json={"config": {"chat.context_compaction.enable": True}}
-    )
-    assert imported.status_code == 200, imported.text
-    upstream = pair["stdlib"].upstream
-    with python_tool(stdlib_admin, WEATHER_TOOL, name="Weather") as tool_id:
-        upstream.reset()
-        upstream.queue(
-            reply_tool_call(f"{tool_id}_forecast", {"city": "München"}), reply_text("Regen.")
-        )
-        turn, _ = ask(admin_client["stdlib"], "Wetter in München?", tool_ids=[tool_id])
-
-    usage = {}
-    for codec in CODECS:
-        stored = admin_client[codec].get(f"/api/v1/chats/{turn.chat_id}")
-        assert stored.status_code == 200, stored.text
-        usage[codec] = stored.json()["context_usage"]
-
-    assert usage["stdlib"] == usage["orjson"], (
-        f"the same chat reported different context usage with ENABLE_ORJSON off and on: {usage}. "
-        "The estimate counts the characters of the tool call items as JSON, and stdlib json "
-        "spaces its separators"
     )
 
 

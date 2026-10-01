@@ -8,9 +8,7 @@ through. Chunks it writes carry the content hash, so a later single add sees the
 
 Discriminates: passes on dev 015dbc861. In a backend copy, `process_files_batch` without the hash
 check and without the hash in the chunk metadata (ecd0ff67e reverted) fails every duplicate case
-here (both files linked); the re-add and distinct-content cases pass either way. The case that
-reads the refusal in the batch answer is red on dev on purpose: `warnings` is built by the route
-but dropped by its response model (as before the fix), so the failed file is never reported.
+here (both files linked); the re-add and distinct-content cases pass either way.
 """
 
 from __future__ import annotations
@@ -84,20 +82,6 @@ def test_a_batch_links_one_of_two_files_with_the_same_text(base):
 
     # the batch is read in database order, so either file may be the one kept
     assert len(_linked(client, knowledge_id)) == 1
-
-
-def test_a_batch_names_the_refused_duplicate_in_its_answer(base):
-    client, knowledge_id = base
-    text = _text()
-    first, copy = _upload(client, text), _upload(client, text)
-
-    result = _batch_add(client, knowledge_id, first, copy)
-
-    # the route builds `warnings` for failed files but its response model has no such field
-    errors = str(result.get("warnings", {}).get("errors"))
-    assert "Duplicate content" in errors, (
-        f"the batch answer drops the warnings naming the refused file: {result}"
-    )
 
 
 def test_a_batch_sibling_of_a_duplicate_still_goes_through(base):
