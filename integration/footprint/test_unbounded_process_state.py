@@ -11,13 +11,15 @@ giving their source back is measured on the process size in
 Twin of unit/footprint/test_unbounded_process_state.py (its rate limiter, finished task and
 profile image cases). Tasks filed under an empty item id stay a unit test: no route creates one.
 
-Unpinned: read on upstream dev at v0.11.3 (a253bf0c3); upstream has since fixed two of the
-cases (#29977, #29971), so they assert the fixed behaviour. Unmarked because no issue is filed.
-Discriminates: passes on dev ef67cc3fa except the per-chat lock test, which is red there
-(`_parent_locks` in `utils/subagents.py` keeps one lock per chat that ever got a reply). In a
-copy of dev, never pruning the limiter's expired buckets fails the sign-in test, keeping every
-rejected avatar URL in a module-level set (#29971) fails the avatar test, and skipping
-`cleanup_task` for a finished reply fails the finished task test.
+Unpinned: read on upstream dev at v0.11.3 (a253bf0c3); upstream has since fixed three of the
+cases (#29977, #29971, #31521), so they assert the fixed behaviour. Unmarked because no issue is
+filed, apart from the per-chat lock test, pinned to issue #31521 and its fix PR #31534.
+Discriminates: passes on dev 015dbc861, where the per-chat lock is dropped once unused (#31521,
+fix `0f46d6096`); with `_parent_locks` in `utils/subagents.py` back to a plain dict in a copy, the
+per-chat lock test is red (20 chats leave 20 locks). In a copy of dev, never pruning the
+limiter's expired buckets fails the sign-in test, keeping every rejected avatar URL in a
+module-level set (#29971) fails the avatar test, and skipping `cleanup_task` for a finished reply
+fails the finished task test.
 """
 
 from __future__ import annotations
@@ -150,9 +152,10 @@ def _running_tasks(client, chat_id: str) -> list[str]:
     return client.get(f"/api/tasks/chat/{chat_id}").json()["task_ids"]
 
 
+@pytest.mark.regression
 def test_finished_chats_leave_nothing_behind_per_chat(admin, make_user, upstream):
     """Every reply ends by looking for queued subagent results, taking a lock keyed by the chat;
-    the lock is never dropped, so the server holds one for every chat ever answered."""
+    the lock was never dropped, so the server held one for every chat ever answered (#31521)."""
     person = make_user()
     with probing(admin) as probe, person.client() as client:
         before = probe.containers()
