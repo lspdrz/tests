@@ -5,12 +5,16 @@ and offers Collapse, Copy and Save (plus Preview on HTML and SVG). A `mermaid` f
 diagram instead of showing its source, and falls back to the source with an error when the
 diagram does not parse. Running a Python block is legacy and not covered. The artifacts pane
 opened by an HTML block is covered in test_artifacts_pane_after_delete.py. A fence made of
-tildes is a code block like a backtick one (open-webui/open-webui#31543, issue #31542).
+tildes is a code block like a backtick one (open-webui/open-webui#31543, issue #31542). Saving
+an edited block keeps its dollar signs as typed, in a reply with output items and in one with
+only text (open-webui/open-webui#31386, issue #31385): the edit used to go in as a replacement
+pattern, so `$$` became `$` and `$&` the old code.
 
 Discriminates: passes on the 176d31d1d build; with the language label, the highlighter, the
 clipboard write, the collapse toggle, the save handler, the preview button or the mermaid
 render removed, the matching test goes red. With the check that only backtick fences are code
 blocks restored (the a5bc78300 mutation build), the tilde-fence test finds one plain line.
+With `99f1eaa3f` reverted (the 015dbc861 mutation build) both dollar sign tests go red.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import pytest
 from playwright.sync_api import Locator, Page, expect
 
 from harness import upstream as reply
+from harness.chat_history import seed_chat
 from utils.chat_ui import expect_reply, last_reply, send
 
 pytestmark = [pytest.mark.journey, pytest.mark.requires_browser, pytest.mark.requires_source]
@@ -205,6 +210,67 @@ def test_saving_an_edited_block_rewrites_the_reply(page_for, make_user, upstream
     assert "```python\\ntotal = 1 + 41\\n```" in stored
     page.reload()
     expect(editor_lines(last_reply(page)).first).to_have_text("total = 1 + 41")
+
+
+# replacement patterns in String.replace: `$$` is one dollar, `$&` the matched text
+DOLLAR_EDIT = " # pays $$5 and keeps $&"
+
+
+def save_an_edit(page: Page, box: Locator, chat_id: str, typed: str) -> None:
+    editor_lines(box).first.click()
+    page.keyboard.press("End")
+    page.keyboard.type(typed)
+    with page.expect_response(
+        lambda r: r.request.method == "POST" and f"/chats/{chat_id}" in r.url
+    ):
+        button(box, "Save").click()
+    expect(button(box, "Saved")).to_be_visible()
+
+
+@pytest.mark.regression
+def test_a_saved_block_keeps_its_dollar_signs(page_for, make_user, upstream):
+    account = make_user()
+    page = page_for(account)
+    box = ask_for(page, upstream, fenced("python", "total = 1"))
+    chat_id = page.url.rsplit("/", 1)[-1]
+
+    save_an_edit(page, box, chat_id, DOLLAR_EDIT)
+
+    with account.client() as client:
+        stored = stored_reply_text(client, chat_id)
+    assert "total = 1 # pays $$5 and keeps $&" in stored, (
+        f"the saved code lost its dollar signs (#31386): {stored!r}"
+    )
+    page.reload()
+    expect(editor_lines(last_reply(page)).first).to_have_text("total = 1 # pays $$5 and keeps $&")
+
+
+@pytest.mark.regression
+def test_a_saved_block_in_a_reply_without_output_items_keeps_its_dollar_signs(page_for, make_user):
+    account = make_user()
+    answer = fenced("python", "total = 1") + "\n\nThat is all."
+    with account.client() as client:
+        chat_id, _ = seed_chat(
+            client,
+            [
+                {"role": "user", "content": "show me the code"},
+                {"role": "assistant", "content": answer},
+            ],
+        )
+    page = page_for(account)
+    page.goto(f"/c/{chat_id}")
+    box = last_reply(page)
+    expect(editor_lines(box).first).to_have_text("total = 1")
+
+    save_an_edit(page, box, chat_id, DOLLAR_EDIT)
+
+    with account.client() as client:
+        stored = stored_reply_text(client, chat_id)
+    assert "total = 1 # pays $$5 and keeps $&" in stored, (
+        f"the saved code lost its dollar signs (#31386): {stored!r}"
+    )
+    page.reload()
+    expect(editor_lines(last_reply(page)).first).to_have_text("total = 1 # pays $$5 and keeps $&")
 
 
 def test_only_html_and_svg_blocks_offer_a_preview(page_for, make_user, upstream):

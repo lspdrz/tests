@@ -7,12 +7,16 @@ the dialog shows them again after a reload. On the admin function list a pipe's 
 saved the same way, and a valve switched back to Default runs with its default again. Users
 set their own user valves from a chat, through the knob beside a tool in the Integrations menu
 or the Valves section of the chat controls; the tool sees each user's own value, and the
-default until a user saves one.
+default until a user saves one. A list user valve in the chat controls is saved the way the
+valves dialog saves it (open-webui/open-webui#31300, issue #31299): left unset it keeps its
+default when another valve is saved, a typed list loses its empty entries and later edits
+still save.
 
 Discriminates: passes on dev 176d31d1d; in a frontend copy, the valves dialog saving an empty
 form turned the tool, pipe, reset and Integrations menu tests red and left the chat controls test
 green, while the Default button leaving a custom value in place together with the chat controls
-never saving turned only the reset and chat controls tests red.
+never saving turned only the reset and chat controls tests red. With `be35c8f65` reverted (the
+015dbc861 mutation build) both list valve tests go red.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 import textwrap
+import time
 import uuid
 
 import pytest
@@ -84,6 +89,24 @@ NAMING_TOOL = source(
         def whoami(self, __user__: dict) -> str:
             \"\"\"Say what the tool calls the user.\"\"\"
             return f"calling you {__user__['valves'].nickname}"
+    """
+)
+
+BOOKING_TOOL = source(
+    """
+    import json
+
+    from pydantic import BaseModel, Field
+
+    class Tools:
+        class UserValves(BaseModel):
+            nickname: str = Field("guest", description="What the tool calls you")
+            rooms: list[str] = Field(["lobby"], description="Rooms you may book")
+
+        def booking(self, __user__: dict) -> str:
+            \"\"\"Say what the user may book.\"\"\"
+            valves = __user__["valves"]
+            return json.dumps({"nickname": valves.nickname, "rooms": valves.rooms})
     """
 )
 
@@ -332,16 +355,22 @@ def test_each_user_sets_their_own_user_valves_from_the_integrations_menu(
     assert tool_results(upstream, "which name is mine?") == ["calling you Doc"]
 
 
+def open_chat_controls_valves(page: Page, tool_name: str) -> Locator:
+    page.get_by_role("button", name="Controls").click()
+    page.get_by_role("button", name="Valves").click()
+    tool_picker = page.get_by_role("combobox").filter(
+        has=page.get_by_role("option", name=tool_name)
+    )
+    tool_picker.select_option(label=tool_name)
+    return page.locator("form").filter(has=tool_picker)
+
+
 def test_user_valves_set_in_the_chat_controls_replace_the_default(page_for, naming_tool, upstream):
     name, first, _ = naming_tool
     page = page_for(first)
     ask_tool(page, upstream, name, "whoami", "who am I to you?")
 
-    page.get_by_role("button", name="Controls").click()
-    page.get_by_role("button", name="Valves").click()
-    tool_picker = page.get_by_role("combobox").filter(has=page.get_by_role("option", name=name))
-    tool_picker.select_option(label=name)
-    panel = page.locator("form").filter(has=tool_picker)
+    panel = open_chat_controls_valves(page, name)
     nickname_valve = valve(panel, "Nickname", "What the tool calls you")
     customise(nickname_valve)
     nickname_valve.get_by_role("textbox").fill("Skipper")
@@ -351,3 +380,87 @@ def test_user_valves_set_in_the_chat_controls_replace_the_default(page_for, nami
     ask_tool(page, upstream, name, "whoami", "who am I to you now?")
     assert tool_results(upstream, "who am I to you?") == ["calling you guest"]
     assert tool_results(upstream, "who am I to you now?") == ["calling you Skipper"]
+
+
+@pytest.fixture
+def booking_tool(admin, make_user):
+    """A tool with a text and a list user valve, shared for reading with a fresh user."""
+    booker = make_user()
+    name = f"Booking {uuid.uuid4().hex[:6]}"
+    tool_id = _create_tool(admin, name, BOOKING_TOOL, [grant("user", booker.id, "read")])
+    yield name, tool_id, booker
+    with admin.client() as client:
+        client.delete(f"/api/v1/tools/id/{tool_id}/delete")
+
+
+def booking_result(upstream, question: str) -> dict:
+    return json.loads(tool_results(upstream, question)[0])
+
+
+def type_into(row: Locator, text: str) -> None:
+    # the panel saves a moment after a field changes
+    row.get_by_role("textbox").fill(text)
+    row.get_by_role("textbox").press("Tab")
+
+
+def saved_user_valves(account, tool_id: str, expected: dict) -> dict:
+    """The account's stored user valves, polled until they read `expected` or 10 seconds pass."""
+    deadline = time.monotonic() + 10
+    while True:
+        with account.client() as client:
+            saved = client.get(f"/api/v1/tools/id/{tool_id}/valves/user").json()
+        if saved == expected or time.monotonic() > deadline:
+            return saved
+        time.sleep(0.2)
+
+
+def test_an_unset_list_valve_keeps_its_default_when_the_chat_controls_save_another(
+    page_for, booking_tool, upstream
+):
+    name, tool_id, booker = booking_tool
+    page = page_for(booker)
+    ask_tool(page, upstream, name, "booking", "what may I book?")
+
+    panel = open_chat_controls_valves(page, name)
+    rooms_valve = valve(panel, "Rooms", "Rooms you may book")
+    expect(
+        rooms_valve.get_by_role("button", name="Default"), "the unset list shows as Custom (#31300)"
+    ).to_be_visible()
+    nickname_valve = valve(panel, "Nickname", "What the tool calls you")
+    customise(nickname_valve)
+    type_into(nickname_valve, "Skipper")
+    expect(page.get_by_text("Valves updated", exact=True)).to_be_visible()
+
+    ask_tool(page, upstream, name, "booking", "what may I book now?")
+    assert booking_result(upstream, "what may I book now?") == {
+        "nickname": "Skipper",
+        "rooms": ["lobby"],
+    }, "saving another valve replaced the list's default (#31300)"
+
+
+def test_a_list_valve_set_in_the_chat_controls_drops_empty_entries_and_keeps_saving(
+    page_for, booking_tool, upstream
+):
+    name, tool_id, booker = booking_tool
+    with booker.client() as client:
+        seeded = client.post(
+            f"/api/v1/tools/id/{tool_id}/valves/user/update", json={"rooms": ["lobby", "hall"]}
+        )
+    assert seeded.status_code == 200, seeded.text
+    page = page_for(booker)
+    ask_tool(page, upstream, name, "booking", "which rooms are mine?")
+
+    panel = open_chat_controls_valves(page, name)
+    rooms_valve = valve(panel, "Rooms", "Rooms you may book")
+    expect(rooms_valve.get_by_role("textbox")).to_have_value("lobby,hall")
+    with page.expect_response(lambda response: "/valves/user/update" in response.url):
+        type_into(rooms_valve, "north, south, ")
+    nickname_valve = valve(panel, "Nickname", "What the tool calls you")
+    customise(nickname_valve)
+    type_into(nickname_valve, "Skipper")
+
+    expected = {"nickname": "Skipper", "rooms": ["north", "south"]}
+    saved = saved_user_valves(booker, tool_id, expected)
+    assert saved == expected, f"the list or a later edit was saved wrongly (#31300): {saved}"
+    ask_tool(page, upstream, name, "booking", "which rooms are mine now?")
+    assert booking_result(upstream, "which rooms are mine now?") == expected
