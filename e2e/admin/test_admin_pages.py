@@ -4,7 +4,7 @@ On Connections the admin adds an OpenAI connection pointing at a local listener,
 listener's model shows in the chat's model selector. On Users the admin adds an account through
 the form, which can then sign in, and changes its role; the new role is there after a reload. On
 Groups the admin creates a group and ticks a member, and the group counts that member after a
-reload. Each test works as a fresh admin.
+reload (as a direct member since d4c561d9f). Each test works as a fresh admin.
 
 Discriminates: passes on dev ac00d40e3; in a backend copy, with `/openai/config/update` storing
 only the first base URL the connection test fails (the selector never offers the listener's
@@ -109,7 +109,7 @@ def test_a_new_group_keeps_the_member_ticked_in_it(admin_page, make_user, group_
     creating.get_by_role("button", name="Save").click()
 
     groups.get_by_role("textbox", name="Search Groups").fill(group_name)
-    groups.get_by_role("button", name=re.compile(rf"^{group_name} 0 members")).click()
+    groups.get_by_role("button", name=re.compile(rf"^{group_name} 0 direct members")).click()
     editing = admin_page.get_by_role("dialog").filter(has_text="Edit User Group")
     editing.get_by_role("button", name="Users").click()
     editing.get_by_role("textbox", name="Search").fill(member.name)
@@ -119,5 +119,5 @@ def test_a_new_group_keeps_the_member_ticked_in_it(admin_page, make_user, group_
     admin_page.reload()
     groups.get_by_role("textbox", name="Search Groups").fill(group_name)
     expect(
-        groups.get_by_role("button", name=re.compile(rf"^{group_name} 1 members"))
+        groups.get_by_role("button", name=re.compile(rf"^{group_name} 1 direct members"))
     ).to_be_visible()

@@ -21,6 +21,8 @@ Usage:
     pytest e2e/test_page_accessibility.py -v -m admin_required
 """
 
+import re
+
 import pytest
 from playwright.sync_api import BrowserContext, Page, expect
 
@@ -31,6 +33,16 @@ from conftest import (
     AppConfig,
     AuthHelper,
 )
+
+
+def wait_until_loaded(page: Page) -> None:
+    """Wait until the app has removed its splash screen.
+
+    Not `networkidle`: since 24e30d1cb the app's timezone update gets a `no-store` reply it never
+    reads, which Chromium counts as a request in flight for as long as the page lives.
+    """
+    page.wait_for_load_state("load")
+    expect(page.locator("#splash-screen")).to_have_count(0)
 
 
 class PageAccessibilityResult:
@@ -89,7 +101,7 @@ def check_page_accessibility(
 
         start_time = time.time()
         response = page.goto(path)
-        page.wait_for_load_state("networkidle")
+        wait_until_loaded(page)
         end_time = time.time()
 
         result.load_time_ms = int((end_time - start_time) * 1000)
@@ -116,8 +128,9 @@ def check_page_accessibility(
 
         # Check for basic page structure
         # The page should have visible content (not blank)
-        body = page.locator("body")
-        if not body.is_visible():
+        try:
+            expect(page.locator("body")).to_be_visible()
+        except AssertionError:
             result.error_message = "Page body not visible"
             return result
 
@@ -166,7 +179,7 @@ class TestPublicPages:
     def test_auth_page_has_login_form(self, page: Page):
         """Test that the auth page has a functional login form."""
         page.goto("/auth")
-        page.wait_for_load_state("networkidle")
+        wait_until_loaded(page)
 
         # Check for email input (could be email or username for LDAP)
         email_input = page.locator('input[autocomplete="email"], input[autocomplete="username"]')
@@ -211,7 +224,7 @@ class TestUserPages:
     def test_home_page_structure(self, authenticated_page: Page):
         """Test that the home page has expected structure."""
         authenticated_page.goto("/")
-        authenticated_page.wait_for_load_state("networkidle")
+        wait_until_loaded(authenticated_page)
 
         # Should have visible content - Open WebUI uses #app as the main container
         main_content = authenticated_page.locator("main, [role='main'], #main, #app, .app")
@@ -233,22 +246,20 @@ class TestUserPages:
 
         for path in pages:
             authenticated_page.goto(path)
-            authenticated_page.wait_for_load_state("networkidle")
+            wait_until_loaded(authenticated_page)
 
             # Each page should have content
             body = authenticated_page.locator("body")
-            assert body.is_visible(), f"Page {path} body not visible"
+            expect(body, f"Page {path} body not visible").to_be_visible()
 
     @pytest.mark.auth_required
     def test_unauthenticated_redirect(self, page: Page):
         """Test that protected pages redirect unauthenticated users."""
         # Try to access a protected page without authentication
         page.goto("/workspace")
-        page.wait_for_load_state("networkidle")
 
         # Should be redirected to auth page
-        current_url = page.url
-        assert "/auth" in current_url, f"Expected redirect to /auth, but got {current_url}"
+        expect(page).to_have_url(re.compile(r"/auth"))
 
 
 # ============================================================================
@@ -280,11 +291,11 @@ class TestAdminPages:
     def test_admin_dashboard_structure(self, admin_page: Page):
         """Test that admin dashboard has expected structure."""
         admin_page.goto("/admin")
-        admin_page.wait_for_load_state("networkidle")
+        wait_until_loaded(admin_page)
 
         # Admin page should have navigation to settings
         body = admin_page.locator("body")
-        assert body.is_visible(), "Admin page body not visible"
+        expect(body, "Admin page body not visible").to_be_visible()
 
     @pytest.mark.admin_required
     def test_admin_settings_navigation(self, admin_page: Page):
@@ -298,10 +309,10 @@ class TestAdminPages:
 
         for path in settings_pages:
             admin_page.goto(path)
-            admin_page.wait_for_load_state("networkidle")
+            wait_until_loaded(admin_page)
 
             body = admin_page.locator("body")
-            assert body.is_visible(), f"Admin settings page {path} body not visible"
+            expect(body, f"Admin settings page {path} body not visible").to_be_visible()
 
     @pytest.mark.admin_required
     def test_regular_user_cannot_access_admin(
@@ -331,20 +342,9 @@ class TestAdminPages:
             pytest.skip("Could not authenticate as regular test user")
 
         page.goto("/admin")
-        page.wait_for_load_state("networkidle")
 
-        # Should either redirect or show access denied
-        current_url = page.url
-
-        # Regular user should not be on admin page
-        # They should be redirected to home or see an error
-        if "/admin" in current_url:
-            # Check for access denied message
-            body_text = page.locator("body").inner_text()
-            assert any(
-                phrase in body_text.lower()
-                for phrase in ["access denied", "forbidden", "not authorized", "permission"]
-            ), "Regular user appears to have access to admin page"
+        # Regular user is sent away from the admin page
+        expect(page).not_to_have_url(re.compile(r"/admin"))
 
         page.close()
 
