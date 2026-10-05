@@ -4,12 +4,19 @@ Regenerating a reply keeps the old one as a version behind a `1/2` switcher, edi
 question starts a branch with its own reply, and an edited reply or a deleted version is what a
 reload shows. Each test signs in as a fresh account and scripts every reply by its prompt.
 
+Two tests pin a fixed bug: saving an edited reply, or saving it as a copy, emptied the reply's
+plain text, so chat search no longer found the chat by the new words (#31471, fixed by PR #31844).
+
 Discriminates: passes on upstream dev `176d31d1d`; in a frontend build with the reply switcher
 removed, the edit-and-send branch replacing the question, an edited reply not saved, continue
-sent without its marker or a deleted version not stored, the matching tests turn red.
+sent without its marker or a deleted version not stored, the matching tests turn red; in the
+build with de9234a2b reverted (saving leaves the reply's plain text empty) the two search tests
+fail on the search finding nothing.
 """
 
 from __future__ import annotations
+
+import uuid
 
 import pytest
 from playwright.sync_api import Locator, Page, expect
@@ -169,3 +176,67 @@ def test_deleting_a_reply_version_leaves_the_other_one_after_a_reload(chat_page,
     chat_page.reload()
     expect_reply(chat_page, "version to keep")
     expect(conversation(chat_page).get_by_text("version to delete")).to_be_hidden()
+
+
+def _edit_reply(page: Page, text: str) -> Locator:
+    _reply_buttons(page).get_by_role("button", name="Edit").last.click()
+    editor = last_reply(page).locator("textarea")
+    editor.fill(text)
+    return last_reply(page)
+
+
+def _search_api(account, word: str) -> list[dict]:
+    with account.client() as client:
+        found = client.get("/api/v1/chats/search", params={"text": word})
+    assert found.status_code == 200, found.text
+    return found.json()
+
+
+def _search_dialog_hits(page: Page, word: str) -> Locator:
+    page.keyboard.press("Control+K")
+    dialog = page.get_by_role("dialog")
+    dialog.get_by_placeholder("Search").fill(word)
+    return dialog.get_by_role("link").filter(has_text=word)
+
+
+@pytest.mark.regression
+def test_chat_search_finds_a_chat_by_the_text_a_reply_was_edited_to(page_for, make_user, upstream):
+    account = make_user()
+    page = page_for(account)
+    page.goto("/")
+    word = f"quokka{uuid.uuid4().hex[:8]}"
+    upstream.queue(reply.text("a plain answer", match=reply.answering("say something")))
+    send(page, "say something")
+    expect_reply(page, "a plain answer")
+
+    editing = _edit_reply(page, f"an answer about the {word}")
+    editing.get_by_role("button", name="Save", exact=True).click()
+    expect_reply(page, word)
+
+    expect(_search_dialog_hits(page, word)).to_have_count(1)
+    assert len(_search_api(account, word)) == 1
+    page.reload()
+    expect_reply(page, f"an answer about the {word}")
+
+
+@pytest.mark.regression
+def test_chat_search_finds_a_chat_by_the_text_of_a_reply_saved_as_a_copy(
+    page_for, make_user, upstream
+):
+    account = make_user()
+    page = page_for(account)
+    page.goto("/")
+    word = f"quokka{uuid.uuid4().hex[:8]}"
+    upstream.queue(reply.text("the original answer", match=reply.answering("say something")))
+    send(page, "say something")
+    expect_reply(page, "the original answer")
+
+    editing = _edit_reply(page, f"a copy about the {word}")
+    editing.get_by_role("button", name="Save As Copy").click()
+    expect_reply(page, word)
+    expect(conversation(page).get_by_text("2/2")).to_be_visible()
+
+    expect(_search_dialog_hits(page, word)).to_have_count(1)
+    assert len(_search_api(account, word)) == 1
+    page.reload()
+    expect_reply(page, f"a copy about the {word}")
