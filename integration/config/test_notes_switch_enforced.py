@@ -1,10 +1,10 @@
 """Regression: with Notes switched off, the notes API keeps working.
 
-Issue #31414, open on dev ac00d40e3: turning Notes off (`ENABLE_NOTES=false`, or the Notes switch
-in the admin settings, both the `notes.enable` config) only hides notes in the interface. The
-notes routes check the user's `features.notes` permission and never the switch, so a user still
-creates and lists notes over the API. Channels, folders and memories refuse their routes when
-switched off.
+Issue #31414, open on dev b859124f9 (fix PR #31415 open): turning Notes off (`ENABLE_NOTES=false`,
+or the Notes switch in the admin settings, both the `notes.enable` config) only hides notes in the
+interface. The notes routes check the user's `features.notes` permission and never the switch, so a
+user still creates and lists notes over the API. Channels, folders and memories refuse their routes
+when switched off.
 
 Discriminates: fails on dev ac00d40e3 (with Notes off a user's create and list answer 200); passes
 with a `notes.enable` check in front of the notes routes, as `check_folders_permission` does for

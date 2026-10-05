@@ -1,11 +1,11 @@
 """Regression: a fast burst of note edits can leave the saved note behind the editor.
 
-Issue #31585 (open): every edit does awaited work on the server (loading the note, checking write
-access, storing and passing on the update) before it replaces the pending save with its own, so
-with edits a few milliseconds apart an older edit can finish that work after a newer one and its
-text is the one saved. The stored note then misses the last characters the editor shows. It hits
-a writer the note was shared with most, because the access check widens the window, and the
-owner as well.
+Issue #31585 (open, fix PR #31596 open): every edit does awaited work on the server (loading the
+note, checking write access, storing and passing on the update) before it replaces the pending save
+with its own, so with edits a few milliseconds apart an older edit can finish that work after a
+newer one and its text is the one saved. The stored note then misses the last characters the editor
+shows. It hits a writer the note was shared with most, because the access check widens the window,
+and the owner as well.
 
 Here a tab sends bursts of edits without waiting for the server, each carrying the full text so
 far, on several notes at once; once the save delay has passed every note must hold the last text.

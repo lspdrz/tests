@@ -27,7 +27,14 @@ message is only visible as CPU and is not pinned.
 Finding, red on purpose: an instance whose Redis account may use only the pub/sub channels Open
 WebUI needed before (`socketio` and `open-webui:*`) neither hears nor reaches the other instances
 with the switch on, since Redis refuses the pattern subscription `socketio#*` and every publish on
-a room channel (NOPERM) and the listener retries every second; with the switch off it works.
+a room channel (NOPERM) and the listener retries every second; with the switch off it works (fix
+PR open-webui/open-webui#31617 open).
+
+Also red on dev b859124f9, in some of its four cases per run: the direct connection answered by
+the browser. Since 24e30d1cb the socket router checks the tab's session token again for every
+event the tab sends, so the reply's pieces can overtake each other while those checks run and the
+stored reply comes back scrambled or empty; it passes on dev 015dbc861 and on b859124f9 with that
+check taken back out of the router.
 
 Discriminates: passes on dev 176d31d1d apart from that finding (red with the switch on only). In a
 backend copy: the room listener dropping room channel messages turns every switched-on case that

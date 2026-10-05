@@ -24,7 +24,8 @@ journal mode `DATABASE_ENABLE_SQLITE_WAL` chooses, which the database file keeps
 `<schema>.<table>`. The Alembic migrations take no notice of it and create the tables in the
 connection's default schema, so a fresh Postgres install with `DATABASE_SCHEMA` set stops at boot
 looking for `<schema>.config`; it works only when the connection's `search_path` happens to put
-that schema first. That test stays red until the migrations honour the setting.
+that schema first. That test stays red until the migrations honour the setting (fix PR
+#31533 open).
 
 Discriminates: passes on dev ef67cc3fa; in a backend copy with `aiosqlite.Connection.commit`
 made a no-op every write is lost, down to the admin account the boot signs up, so both SQLite

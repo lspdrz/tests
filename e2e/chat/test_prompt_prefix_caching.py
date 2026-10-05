@@ -12,8 +12,8 @@ with a file written, a command run and the file read back across a reload. Every
 pair of the provider's requests is checked.
 
 One terminal test stays red, on what the page does not name as a breaker: a reload with the
-terminal's shell open closes it, which drops the two user shell tools and rewrites the tool list
-at the very start of the prefix (open-webui/open-webui#31590).
+terminal's shell open closes it, which drops the two user shell tools and rewrites the tool list at
+the very start of the prefix (open-webui/open-webui#31590, fix PR #31602 open).
 
 Discriminates: passes on dev 176d31d1d apart from that one, which fails there. In backend
 copies, a clock value added to the model's system prompt and the tool list shuffled per request
