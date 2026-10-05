@@ -59,11 +59,24 @@ def grant(principal_type: str, principal_id: str, permission: str) -> dict:
     }
 
 
-def make_group(admin: Actor, members: list[Actor], permissions: dict | None = None) -> str:
-    """A group holding `members`, added the way the admin panel adds one."""
+def make_group(
+    admin: Actor,
+    members: list[Actor],
+    permissions: dict | None = None,
+    parent_id: str | None = None,
+    default_models: list[str] | None = None,
+) -> str:
+    """A group holding `members`, added the way the admin panel adds one.
+
+    `parent_id` nests it under that group; `default_models` set the models its members start with.
+    """
     form = {"name": f"group {uuid.uuid4().hex[:8]}", "description": "access matrix"}
     if permissions:
         form["permissions"] = permissions
+    if parent_id:
+        form["parent_group_id"] = parent_id
+    if default_models:
+        form["data"] = {"config": {"default_models": default_models}}
     with admin.client() as client:
         created = client.post("/api/v1/groups/create", json=form)
         assert created.status_code == 200, created.text

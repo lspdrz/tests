@@ -15,7 +15,10 @@ Discriminates: passes on dev ac00d40e3 for all six data sets; with the copy step
 `3ff2c63645b8` (config reshape) skipping the `ui.` keys in a copy of it, both v0.9.6 sets fail
 the settings test (default user role back to `pending`); with `b0018471bbbe` no longer adding
 `user.variables`, the v0.9.6 and v0.10.2 sets fail to boot (`no such column`) while the v0.11.4
-sets still pass.
+sets still pass. Every old group is top-level after the upgrade and can then be nested under a new
+group, whose grants its members inherit; with `b8e4f0a3c752` not adding the `parent_group_id`
+column in a copy of it, the two group tests error at setup on every set (the admin cannot sign
+in).
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ import httpx
 import pytest
 
 from harness import upstream as upstream_module
+from harness.access import grant
+from harness.knowledge_bases import knowledge_base
 from harness.prepared_data import RunningBackend, release_data, serving
 
 pytestmark = [
@@ -152,6 +157,63 @@ def test_the_group_keeps_its_members(upgraded):
     assert {member["id"] for member in members.json()} == {
         accounts[who]["id"] for who in group["members"]
     }
+
+
+def test_the_old_group_is_top_level_and_lists_as_a_direct_membership(upgraded):
+    group = upgraded.manifest["group"]
+    with upgraded.client("admin") as client:
+        stored = client.get(f"/api/v1/groups/id/{group['id']}")
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["parent_group_id"] is None
+    assert stored.json()["member_count"] == len(group["members"])
+    for who in group["members"]:
+        with upgraded.client(who) as client:
+            marked = client.get("/api/v1/users/groups", params={"include_inherited": "true"}).json()
+        assert [(entry["id"], entry["membership_type"]) for entry in marked] == [
+            (group["id"], "direct")
+        ]
+
+
+def test_the_old_group_can_be_nested_and_its_members_inherit_from_the_new_parent(upgraded):
+    group, handbook = upgraded.manifest["group"], upgraded.manifest["knowledge"]
+    accounts = upgraded.manifest["accounts"]
+    with upgraded.client("admin") as admin:
+        parent = admin.post(
+            "/api/v1/groups/create", json={"name": "Institute", "description": "the new parent"}
+        )
+        assert parent.status_code == 200, parent.text
+        parent_id = parent.json()["id"]
+        admin.post(
+            f"/api/v1/groups/id/{parent_id}/users/add", json={"user_ids": [accounts["carol"]["id"]]}
+        ).raise_for_status()
+        shared_with_parent = [grant("group", parent_id, "read")]
+        with knowledge_base(admin, "Institute notes", shared_with_parent) as notes_id:
+            nested = admin.post(
+                f"/api/v1/groups/id/{group['id']}/update",
+                json={"name": group["name"], "description": "", "parent_group_id": parent_id},
+            )
+            assert nested.status_code == 200, nested.text
+            assert nested.json()["parent_group_id"] == parent_id
+
+            for who in group["members"]:
+                opened = upgraded.get(who, f"/api/v1/knowledge/{notes_id}")
+                assert opened.status_code == 200, f"{who} does not inherit from the parent group"
+                kept = upgraded.get(who, f"/api/v1/knowledge/{handbook['id']}")
+                assert kept.status_code == 200, f"{who} lost the grant the old group held"
+            assert upgraded.get("carol", f"/api/v1/knowledge/{notes_id}").status_code == 200
+            assert _refused(upgraded.get("carol", f"/api/v1/knowledge/{handbook['id']}")), (
+                "the parent's member reads what only the subgroup holds"
+            )
+            members = admin.get(
+                f"/api/v1/groups/id/{parent_id}/members", params={"membership": "inherited"}
+            ).json()
+            assert {item["id"] for item in members["items"]} == {
+                accounts[who]["id"] for who in group["members"]
+            }
+
+        assert admin.delete(f"/api/v1/groups/id/{parent_id}/delete").json() is True
+        lifted = admin.get(f"/api/v1/groups/id/{group['id']}").json()
+        assert lifted["parent_group_id"] is None
 
 
 def _messages(chat: dict) -> dict:
