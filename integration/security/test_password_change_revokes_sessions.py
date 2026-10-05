@@ -3,13 +3,14 @@
 open-webui 0.11.1 fix `21e390561` (#28725): a password change wrote nothing to the token
 revocation list, so every session issued before it kept working until its JWT expired, four
 weeks by default. Both password paths, `POST /api/v1/auths/update/password` and an admin reset
-through `POST /api/v1/users/{id}/update`, now stamp the per-user `revoked_at` marker that token
-validation already checks, for as long as a token can live. The marker lives in Redis; without
-Redis nothing can be revoked and the backend now logs a warning naming the user.
+through `POST /api/v1/users/{id}/update`, now revoke every earlier session. The fix kept the
+revocation as a marker in Redis, for as long as a token can live, and without Redis revoked
+nothing; since 24e30d1cb it is kept with the account in the database (a session stamp every token
+carries), so it holds with no Redis at all and when anything Redis kept is gone.
 
 The revocation tests run on an instance of their own backed by `StatefulRedis`; the no-Redis
-warning is read from the shared instance's log, or from a Redis-less one of its own when the run
-puts the shared instance on Redis.
+test runs on the shared instance, or on a Redis-less one of its own when the run puts the shared
+instance on Redis.
 
 Fix `2062231f9` (#31621): `GET /api/config` decoded the session token but never asked the
 revocation list, so a signed-out or password-revoked session still received the signed-in
@@ -18,18 +19,17 @@ one an anonymous request gets, while a live session keeps the full one.
 
 Twin of unit/security/test_password_change_revokes_sessions.py.
 
-Discriminates: passes on dev bbfa876af, fails with both `revoke_user_tokens` calls removed
-from the password routes (earlier sessions keep answering 200, no marker is stored and no
-warning is logged), with the marker kept for a fixed 30 days (it expires before the 8-week
-tokens) and with the admin reset revoking even when no password was written. The app
+Discriminates: passes on dev b859124f9 and fails with the password write no longer revoking
+(earlier sessions keep answering 200). On dev 015dbc861, before 24e30d1cb, the Redis-loss and
+no-Redis tests fail (the earlier session answers 200 again once the marker is gone, and
+throughout without Redis). With the admin reset revoking even when no password was written its
+test fails (bbfa876af). The app
 configuration tests pass on dev a5bc78300 and fail with 2062231f9 reverted (the revoked sessions
 get the signed-in configuration back).
 """
 
 from __future__ import annotations
 
-import base64
-import json
 import time
 import uuid
 
@@ -105,11 +105,6 @@ def _change_password(instance, account, change: str) -> None:
     assert response.status_code == 200, f"{change} failed: {response.text}"
 
 
-def _expiry_of(token: str) -> int:
-    payload = token.split(".")[1]
-    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["exp"]
-
-
 def _keys_naming(store: StatefulRedis, user_id: str) -> list[str]:
     return [key for key in store.keys() if user_id in key]
 
@@ -133,20 +128,18 @@ def test_a_password_change_signs_out_every_earlier_session(redis_instance, chang
 
 
 @pytest.mark.parametrize("change", PASSWORD_CHANGES)
-def test_the_revocation_outlives_every_token_it_revokes(redis_instance, revocation_store, change):
+def test_the_revocation_outlives_anything_redis_kept(redis_instance, revocation_store, change):
     account = create_user(redis_instance)
-    token_expiry = _expiry_of(account.token)
+    other_device = sign_in(redis_instance, account.email, account.password)
 
     _change_password(redis_instance, account, change)
+    for key in _keys_naming(revocation_store, account.id):
+        revocation_store.forget(key)
 
-    markers = _keys_naming(revocation_store, account.id)
-    assert markers, f"the {change} stored no revocation for the account (#28725)"
-    for marker in markers:
-        expires_at = revocation_store.expires_at(marker)
-        assert expires_at is None or expires_at >= token_expiry, (
-            f"the {change} revocation expires before the tokens it revokes: once it is gone "
-            "every one of them authenticates again (#28725)"
-        )
+    assert _session_status(redis_instance, other_device) == 401, (
+        f"the session revoked by the {change} authenticates again once Redis forgets the "
+        "revocation: it expires before the tokens it revokes (#28725)"
+    )
 
 
 def test_a_wrong_current_password_is_refused_and_signs_nothing_out(
@@ -229,27 +222,16 @@ def test_signing_out_one_session_leaves_the_others(redis_instance):
     )
 
 
-def test_without_redis_the_change_logs_that_nothing_was_revoked(instance, instance_with):
+def test_without_redis_the_change_still_signs_out_earlier_sessions(instance, instance_with):
     if instance.redis_url:
         instance = instance_with({"REDIS_URL": ""})
     account = create_user(instance)
     other_device = sign_in(instance, account.email, account.password)
-    log_offset = instance.log_size()
 
     _change_password(instance, account, "self-service")
 
-    # Without Redis the earlier session necessarily survives, which is why the warning exists.
-    assert _session_status(instance, other_device) == 200
-    deadline = time.monotonic() + 10
-    warnings: list[str] = []
-    while not warnings and time.monotonic() < deadline:
-        log_lines = instance.log_since(log_offset).splitlines()
-        warnings = [line for line in log_lines if "WARNING" in line and account.id in line]
-        time.sleep(0.1)
-    assert any("redis" in line.lower() for line in warnings), (
-        "a password change without Redis revoked nothing and logged nothing naming the account: "
-        "the operator believes the other sessions were signed out while every one keeps "
-        "working (#28725)"
+    assert _session_status(instance, other_device) == 401, (
+        "without Redis a session issued before the password change still authenticates (#28725)"
     )
 
 

@@ -86,12 +86,12 @@ def test_a_query_value_of_the_wrong_type_is_refused_with_422(make_user):
     assert accepted.status_code == 200, accepted.text
 
 
-def test_a_json_body_without_a_required_field_is_refused_with_422(instance):
-    with _anonymous(instance) as client:
-        refused = client.post("/api/v1/auths/signin", json={"email": "someone@example.com"})
+def test_a_json_body_without_a_required_field_is_refused_with_422(make_user):
+    with make_user().client() as client:
+        refused = client.post("/api/v1/knowledge/create", json={"name": "harbour notes"})
 
     assert refused.status_code == 422, refused.text
-    assert [error["loc"] for error in refused.json()["detail"]] == [["body", "password"]]
+    assert [error["loc"] for error in refused.json()["detail"]] == [["body", "description"]]
 
 
 def test_the_user_search_answers_only_the_fields_its_response_model_lists(make_user):

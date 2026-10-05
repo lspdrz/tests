@@ -35,6 +35,8 @@ ROLE_OF_DEPENDENCY = {
     "get_admin_user": "admin",
     "get_verified_user": "verified",
     "get_current_user": "signed_in",
+    # a session token, not an API key, on top of get_current_user (24e30d1cb)
+    "get_human_user": "signed_in",
 }
 ROLE_STRENGTH = ["public", "signed_in", "verified", "admin"]
 # dependencies that neither grant nor check a role
@@ -61,6 +63,11 @@ PUBLIC_ROUTES = {
     ("POST", "/api/v1/auths/ldap"): "signs in",
     ("POST", "/api/v1/auths/signout"): "signs out whatever cookie it gets",
     ("POST", "/api/v1/auths/oauth/{provider}/token/exchange"): "signs in, off by default",
+    ("POST", "/api/v1/auths/mfa/challenge"): "resumes a sign-in from its challenge cookie",
+    ("POST", "/api/v1/auths/mfa/enroll/start"): "a sign-in's challenge token authorizes it",
+    ("POST", "/api/v1/auths/mfa/enroll/confirm"): "a sign-in's challenge token authorizes it",
+    ("POST", "/api/v1/auths/mfa/verify"): "a sign-in's challenge token authorizes it",
+    ("POST", "/api/v1/auths/mfa/recover"): "a challenge and an admin's reset token authorize it",
     ("GET", "/oauth/{provider}/login"): "starts an OAuth sign-in",
     ("GET", "/oauth/{provider}/login/callback"): "the provider redirects here",
     ("GET", "/oauth/{provider}/callback"): "the provider redirects here",

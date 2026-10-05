@@ -5,7 +5,8 @@ key, reads it back and signs requests with it as itself; generating again replac
 deleting it ends it. Switching API keys off, or withdrawing the permission, refuses generation
 and stops existing keys working, though an admin keeps the permission regardless. With endpoint
 restrictions on, a key only reaches the paths on the allowed list, while a session token of the
-same account goes everywhere as before.
+same account goes everywhere as before. A key acts on the account's status route: since
+24e30d1cb the session route `/api/v1/auths/` answers a signed-in session only.
 
 Discriminates: fails with the endpoint-restriction check in `get_current_user_by_api_key`
 removed (the key reaches a path outside the allowed list).
@@ -19,6 +20,7 @@ pytestmark = [pytest.mark.journey, pytest.mark.api, pytest.mark.requires_source]
 
 ADMIN_CONFIG = "/api/v1/auths/admin/config"
 DEFAULT_PERMISSIONS = "/api/v1/users/default/permissions"
+OWN_ACCOUNT = "/api/v1/users/user/status"
 
 
 def save_admin_config(admin, **changes) -> None:
@@ -44,7 +46,7 @@ def generate_key(account) -> str:
     return generated.json()["api_key"]
 
 
-def status_with_key(instance, api_key: str, path: str = "/api/v1/auths/") -> int:
+def status_with_key(instance, api_key: str, path: str = OWN_ACCOUNT) -> int:
     with instance.client(api_key) as client:
         return client.get(path).status_code
 
@@ -63,7 +65,7 @@ def test_a_key_is_generated_read_back_and_acts_as_its_owner(instance, make_user,
     with account.client() as client:
         read_back = client.get("/api/v1/auths/api_key")
     with instance.client(api_key) as client:
-        session = client.get("/api/v1/auths/")
+        session = client.get(OWN_ACCOUNT)
 
     assert api_key.startswith("sk-")
     assert read_back.json()["api_key"] == api_key
@@ -136,8 +138,8 @@ def test_a_restricted_key_reaches_only_the_allowed_paths(instance, admin, make_u
 
     assert status_with_key(instance, api_key, "/api/v1/chats/") == 200
     assert status_with_key(instance, api_key, "/api/models") == 200
-    assert status_with_key(instance, api_key, "/api/v1/auths/") == 403
+    assert status_with_key(instance, api_key, OWN_ACCOUNT) == 403
     assert status_with_key(instance, api_key, "/api/v1/users/user/settings") == 403
     with account.client() as client:
-        assert client.get("/api/v1/auths/").status_code == 200
+        assert client.get(OWN_ACCOUNT).status_code == 200
         assert client.get("/api/v1/users/user/settings").status_code == 200

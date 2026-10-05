@@ -9,7 +9,8 @@ WebSocket token through `get_verified_user_by_token`, which applies the HTTP rol
 
 Each case runs twice, for a `pending` account and, as the positive control, a verified one. The
 socket is opened without a token wherever a handler checks the token itself, so a failure names
-that handler and not the handshake.
+that handler and not the handshake. Since 24e30d1cb a handler may drop a refused socket, or fail
+on a deleted account's token, where it used to answer nothing; either counts as refused.
 
 Twin of unit/security/test_websocket_role_gate.py.
 
@@ -92,6 +93,14 @@ def _socket(
         client.disconnect()
 
 
+def _answer(client: socketio.Client, event: str, data: dict, expected: bool):
+    """The handler's answer; None once it drops a refused socket or fails on it (24e30d1cb)."""
+    try:
+        return client.call(event, data, timeout=30 if expected else ARRIVAL_TIMEOUT)
+    except socketio.exceptions.TimeoutError:
+        return None
+
+
 def _arrives(flag: threading.Event, expected: bool) -> bool:
     # A refused account is given a bounded quiet period, an admitted one the full timeout.
     return flag.wait(ARRIVAL_TIMEOUT if expected else QUIET_PERIOD)
@@ -145,7 +154,7 @@ def test_the_handshake_gives_only_a_verified_account_a_session(instance, admin, 
     verified = role in VERIFIED_ROLES
 
     with _socket(instance, owner.token, listen=("ydoc:document:state",)) as (client, arrived):
-        client.call("ydoc:document:join", {"document_id": f"note:{note_id}"}, timeout=30)
+        _answer(client, "ydoc:document:join", {"document_id": f"note:{note_id}"}, verified)
         served = _arrives(arrived["ydoc:document:state"], verified)
 
     assert served == verified, (
@@ -223,7 +232,7 @@ def test_a_token_of_no_live_account_opens_nothing(instance, admin, make_user, cr
         token = "not-a-jwt"
 
     with _socket(instance) as (client, _):
-        joined = client.call("user-join", {"auth": {"token": token}}, timeout=30)
+        joined = _answer(client, "user-join", {"auth": {"token": token}}, expected=False)
 
     assert joined is None
     assert _terminal_close(instance, {"type": "auth", "token": token}) == REFUSED

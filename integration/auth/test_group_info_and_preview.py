@@ -1,11 +1,12 @@
 """Journey: what the group info and the admin's group access preview show, and to whom.
 
 The access list of a shared resource names every group it is shared with, including groups the
-viewer is not in, so any signed-in account resolves a group id to its name, description and
-member count; the members and the group's permissions stay with the admin, who reads the full
-group. The admin's Preview Group Access, documented as admin-only, lists the models, knowledge
-bases and tools the group can read through its own grants or a public one, leaving out deactivated
-models and anything shared only elsewhere, next to the totals and the group's permissions.
+viewer is not in, so any signed-in account resolves a group id to its name, description and member
+count; the members and the group's permissions stay with the admin, who reads the full group. An
+unknown group id answers 404 (401 before d4c561d9f). The admin's Preview Group Access, documented
+as admin-only, lists the models, knowledge bases and tools the group can read through its own
+grants or a public one, leaving out deactivated models and anything shared only elsewhere, next to
+the totals and the group's permissions.
 
 No route reaches the group search in the groups model; the groups list is the only search there
 is, and it is covered by test_groups.
@@ -84,7 +85,7 @@ def test_the_full_group_and_its_members_stay_with_the_admin(make_user, team):
 def test_a_pending_account_and_an_unknown_group_get_no_info(make_user, team):
     group_id, member = team
     assert info(make_user(role="pending"), group_id).status_code == 401
-    assert info(member, str(uuid.uuid4())).status_code == 401
+    assert info(member, str(uuid.uuid4())).status_code == 404
 
 
 # --------------------------------------------------------------------------- preview

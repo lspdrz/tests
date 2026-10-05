@@ -20,6 +20,10 @@ A SCIM group member's `$ref` was always null: the member was built with `ref=`, 
 ignores on a field that only takes its alias. PR #31529 (open-webui/open-webui#31525) fixed it, and
 that test fails on dev 176d31d1d.
 
+Since 24e30d1cb the sign-in routes answer a refused body with one generic message, so the
+per-field entries are read from creating a knowledge base and the profile image's reason from the
+admin's edit of the account.
+
 Discriminates: on dev ef67cc3fa, one backend copy with a default for the sign-in password, a
 `StrictBool` expanded state, `FolderForm` ignoring extra fields, `UserSettings` without
 `extra="allow"`, `LoadUrlForm.url` typed `str`, the SCIM member field without its alias, the
@@ -27,7 +31,8 @@ upload's filename read as latin-1 and its metadata field dropped fails exactly t
 another without the profile image validator, without `_ensure_profile_image` and with the date
 of birth typed `str` fails the three profile tests, and with `model_dump_json()` in place of
 `exclude_none=True` the Ollama create test; a chat list whose page is typed `str` fails the
-numeric parameter test. The byte-for-byte and unparseable-body tests pin python-multipart's own
+numeric parameter test. On dev b859124f9 a default for a knowledge base's description fails the
+missing fields test. The byte-for-byte and unparseable-body tests pin python-multipart's own
 parsing, which no backend edit reaches. Twin of unit/deps/test_pydantic.py and the parser half
 of unit/deps/test_python_multipart.py.
 """
@@ -107,15 +112,15 @@ def test_a_body_that_is_not_multipart_is_refused(make_user):
 # ---------------------------------------------------------------- JSON bodies
 
 
-def test_a_body_missing_fields_is_refused_with_one_entry_per_field(instance):
-    with httpx.Client(base_url=instance.base_url, timeout=30.0) as client:
-        refused = client.post("/api/v1/auths/signin", json={})
+def test_a_body_missing_fields_is_refused_with_one_entry_per_field(make_user):
+    with make_user().client() as client:
+        refused = client.post("/api/v1/knowledge/create", json={})
 
     assert refused.status_code == 422, refused.text
     errors = refused.json()["detail"]
     assert sorted(tuple(error["loc"]) for error in errors) == [
-        ("body", "email"),
-        ("body", "password"),
+        ("body", "description"),
+        ("body", "name"),
     ]
     assert all(error["msg"] and error["type"] == "missing" for error in errors)
 
@@ -196,15 +201,22 @@ def test_a_date_of_birth_is_read_and_written_as_an_iso_date(make_user):
     assert session.json()["date_of_birth"] == "1990-05-17"
 
 
-def test_a_dangerous_profile_image_is_refused(make_user):
-    with make_user().client() as client:
+def test_a_dangerous_profile_image_is_refused(admin, make_user):
+    account = make_user()
+    with account.client() as client:
         before = client.get("/api/v1/auths/").json()["profile_image_url"]
         refused = _update_profile(client, profile_image_url="javascript:alert(1)")
         after = client.get("/api/v1/auths/").json()["profile_image_url"]
+    with admin.client() as client:
+        refused_for_the_admin = client.post(
+            f"/api/v1/users/{account.id}/update", json={"profile_image_url": "javascript:alert(1)"}
+        )
 
     assert refused.status_code == 422, refused.text
-    assert "image" in json.dumps(refused.json()["detail"]).lower()
     assert after == before
+    # the sign-in routes answer one generic message since 24e30d1cb, so the reason shows here
+    assert refused_for_the_admin.status_code == 422, refused_for_the_admin.text
+    assert "image" in json.dumps(refused_for_the_admin.json()["detail"]).lower()
 
 
 def test_an_empty_profile_image_becomes_the_default_avatar(make_user):

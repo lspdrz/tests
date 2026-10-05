@@ -128,8 +128,9 @@ def test_an_old_sso_link_still_signs_its_owner_in(upgraded, idp, who):
 
 
 def test_the_old_api_key_still_authenticates(upgraded):
+    # the session route takes a signed-in session only since 24e30d1cb
     with upgraded.client(LEGACY_API_KEY) as client:
-        answer = client.get("/api/v1/auths/")
+        answer = client.get("/api/v1/users/user/status")
     assert answer.status_code == 200, (
         f"the API key saved before the upgrade stopped working: {answer.text}"
     )

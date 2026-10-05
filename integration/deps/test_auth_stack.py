@@ -408,6 +408,8 @@ def test_accounts_keep_signing_in_when_the_hash_algorithm_switches(tmp_path):
                 json={"password": FIRST_PASSWORD, "new_password": LONG_PASSWORD},
             )
         assert changed.status_code == 200 and changed.json() is True, changed.text
+        # the change signs out every session, this one too (24e30d1cb)
+        token = sign_in(argon2_server, email, LONG_PASSWORD)
         _add_account(argon2_server, token, "twin-a@example.com", LONG_PASSWORD)
         _add_account(argon2_server, token, "twin-b@example.com", LONG_PASSWORD)
     hashes = _hashes_by_email(data_dir)

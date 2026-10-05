@@ -2,7 +2,7 @@
 
 GET, SET (with EX, PX, NX and XX), DEL and EXISTS work on real state with real expiry; every
 other command gets the empty-database reply of `fake_redis`. A test reads what the instance
-stored through `keys()` and `expires_at(key)`.
+stored through `keys()` and `expires_at(key)`, and expires a key early with `forget(key)`.
 """
 
 from __future__ import annotations
@@ -41,6 +41,11 @@ class StatefulRedis:
         """Epoch seconds at which `key` expires, None when it never does."""
         with self._lock:
             return self._values[key][1]
+
+    def forget(self, key: str) -> None:
+        """Drop `key` as if it had expired."""
+        with self._lock:
+            self._values.pop(key, None)
 
     def _live(self, key: str) -> str | None:
         entry = self._values.get(key)
