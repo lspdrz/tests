@@ -157,10 +157,12 @@ def test_a_compacted_chat_reopens_on_its_newest_turn(client):
     )
 
 
-def test_an_ordinary_current_message_stays_where_it_is(client):
-    chat_id = create_chat(client, {"history": compacted_history()})
+def test_an_ordinary_newest_message_stays_where_it_is(client):
+    history_on_leaf = compacted_history()
+    history_on_leaf["currentId"] = "followup"
+    chat_id = create_chat(client, {"history": history_on_leaf})
 
-    assert read_chat(client, chat_id)["history"]["currentId"] == "summary"
+    assert read_chat(client, chat_id)["history"]["currentId"] == "followup"
 
 
 def test_editing_an_older_message_keeps_the_current_position(client):
