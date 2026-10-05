@@ -63,7 +63,7 @@ def _search_groups(page: Page, name: str) -> Locator:
 
 def _group_row(page: Page, name: str, members: int) -> Locator:
     groups = _search_groups(page, name)
-    return groups.get_by_role("button", name=re.compile(rf"^{name} {members} members"))
+    return groups.get_by_role("button", name=re.compile(rf"^{name} {members} direct members"))
 
 
 def _open_group(page: Page, name: str, members: int) -> Locator:
