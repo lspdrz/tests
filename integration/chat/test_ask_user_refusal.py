@@ -82,7 +82,9 @@ def test_every_refused_ask_user_call_gets_a_result_and_the_turn_goes_on(user, up
 
     results = tool_results(message)
     assert set(results) == {"call_a", "call_b"}, message["output"]
-    assert all(text.startswith("Error:") and "did not run" in text for text in results.values())
+    assert all(
+        text == "Error: only one ask_user call is allowed per turn." for text in results.values()
+    ), results
     assert replayed_tool_messages(upstream) == results
     assert message["content"] == "I will ask one question at a time."
 
