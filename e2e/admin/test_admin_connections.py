@@ -4,7 +4,9 @@ The admin adds an OpenAI-compatible connection through the Add Connection dialog
 connection type, prefix, a model allowlist and a tag), verifies it and saves; its allowed models
 then show in the chat's model selector under the prefix, and nothing else it serves does. A
 connection switched off in its row, or deleted from its settings, takes its models out of the
-selector; a new key saved in its settings is the one the provider gets on the next chat. An Ollama
+selector; a new key saved in its settings is the one the provider gets on the next chat. Once a
+connection is verified, the allowlist's model field suggests the models the provider served that
+are not yet on the list, and Enter in that field does not save the dialog. An Ollama
 connection added the same way lists its models under its prefix. Every provider is a local
 stand-in, and every test puts the connection settings back afterwards.
 
@@ -15,7 +17,8 @@ allowlist turns the add test red (the model left off the list shows), the row sw
 turns the switch-off test red, the edited key not reaching the saved settings turns the key test
 red (the provider gets the old key), the delete not saving turns the delete test red, and the
 Ollama add dropping the dialog's settings turns the Ollama test red (its model shows without the
-prefix).
+prefix). In a frontend build without the verified models' suggestions and the Enter guard, the two
+allowlist tests go red (no suggestions; the dialog saves on Enter).
 """
 
 from __future__ import annotations
@@ -136,7 +139,7 @@ def test_an_added_connection_lists_only_its_allowed_models_under_the_prefix(
     form.get_by_role("button", name="Advanced").click()
     form.get_by_role("textbox", name="Prefix ID").fill(prefix)
     for allowed in ("alpha", "beta"):
-        form.get_by_role("textbox", name="Add a model ID").fill(allowed)
+        form.get_by_placeholder("Add a model ID").fill(allowed)
         form.get_by_role("button", name="Add", exact=True).click()
         expect(form.get_by_text(allowed, exact=True)).to_be_visible()
     form.get_by_placeholder("Add a tag...").fill(tag)
@@ -269,3 +272,63 @@ def test_an_added_ollama_connection_lists_its_models_under_the_prefix(
     open_chat(page)
     expect(model_options(page, f"{prefix}.llama3:latest")).to_have_count(1)
     assert server.listener.requests_to("/api/tags"), "the Ollama stand-in was never asked"
+
+
+# --------------------------------------------------------------------------- allowlist suggestions
+
+
+def verified_dialog(page: Page, listener: Listener, url: str) -> Locator:
+    """The Add Connection dialog with `url` verified and its Advanced section open."""
+    settings = open_admin_connections(page)
+    tooltip_button(settings, "Add Connection").click()
+    form = connection_dialog(page, "Add Connection")
+    form.get_by_label("URL", exact=True).fill(url)
+    form.get_by_role("button", name="Verify Connection").click()
+    expect(page.get_by_text("Server connection verified")).to_be_visible()
+    form.get_by_role("button", name="Advanced").click()
+    return form
+
+
+def suggested_models(form: Locator) -> list[str]:
+    field = form.get_by_placeholder("Add a model ID")
+    return field.evaluate("(input) => [...(input.list?.options ?? [])].map((o) => o.value)")
+
+
+def test_the_verified_models_are_suggested_for_the_allowlist(
+    page_for, make_user, preserve, listener
+):
+    preserve(OPENAI_CONFIG)
+    served = [{"id": name, "object": "model"} for name in SERVED_MODELS]
+    listener.route("GET", "/v1/models", json_answer({"object": "list", "data": served}))
+    page = page_for(make_user(role="admin"))
+    settings = open_admin_connections(page)
+    tooltip_button(settings, "Add Connection").click()
+    form = connection_dialog(page, "Add Connection")
+    form.get_by_label("URL", exact=True).fill(f"{listener.base_url}/v1")
+    form.get_by_role("button", name="Advanced").click()
+    assert suggested_models(form) == [], "models were suggested before the connection was verified"
+    form.get_by_role("button", name="Verify Connection").click()
+    expect(page.get_by_text("Server connection verified")).to_be_visible()
+
+    assert suggested_models(form) == list(SERVED_MODELS)
+
+    form.get_by_placeholder("Add a model ID").fill("beta")
+    form.get_by_role("button", name="Add", exact=True).click()
+    expect(form.get_by_text("beta", exact=True)).to_be_visible()
+    assert suggested_models(form) == ["alpha", "gamma"]
+
+
+def test_enter_in_the_model_field_does_not_save_the_connection(
+    page_for, make_user, admin, preserve, listener
+):
+    preserve(OPENAI_CONFIG)
+    url = f"{listener.base_url}/v1"
+    listener.route("GET", "/v1/models", json_answer({"object": "list", "data": [{"id": "alpha"}]}))
+    page = page_for(make_user(role="admin"))
+    form = verified_dialog(page, listener, url)
+
+    form.get_by_placeholder("Add a model ID").fill("alpha")
+    form.get_by_placeholder("Add a model ID").press("Enter")
+
+    expect(form).to_be_visible()
+    assert saved_openai_connection(admin, url) is None, "Enter in the model field saved the dialog"
