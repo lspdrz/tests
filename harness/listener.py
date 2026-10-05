@@ -3,8 +3,11 @@
 Stands in for whatever outside service the instance calls: a page to fetch, an image engine,
 a tool server, a search provider. `route(method, path, handler)` registers an answer; a handler
 gets the recorded request and returns `(status, headers, body)`. Unrouted paths answer 404,
-CORS preflights (`OPTIONS`) included. `listening(host)` binds another local address, an IPv6
-one included.
+CORS preflights (`OPTIONS`) included. A route path ending in `*` answers every path under that
+prefix. A handler may return an iterator of byte chunks as the body: the listener sends them as they
+come, and when the client has gone away it closes the iterator, so a handler that finishes work
+after its last chunk can tell a client that read to the end from one that did not. `listening(host)`
+binds another local address, an IPv6 one included.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterable, Iterator
 
 from harness.object_storage import self_signed_certificate
 
@@ -34,7 +37,7 @@ class ReceivedRequest:
         return json.loads(self.body)
 
 
-Answer = tuple[int, dict[str, str], bytes]
+Answer = tuple[int, dict[str, str], bytes | Iterable[bytes]]
 Handler = Callable[[ReceivedRequest], Answer]
 
 
@@ -58,6 +61,19 @@ class Listener:
         """Answer `method path` (path without the query string) with a handler or a fixed answer."""
         answer = handler if callable(handler) else (lambda _request, fixed=handler: fixed)
         self.routes[(method.upper(), path)] = answer
+
+    def handler_for(self, method: str, path: str) -> Handler | None:
+        exact = self.routes.get((method, path))
+        if exact:
+            return exact
+        for (route_method, route_path), handler in self.routes.items():
+            if (
+                route_method == method
+                and route_path.endswith("*")
+                and path.startswith(route_path[:-1])
+            ):
+                return handler
+        return None
 
     def requests_to(self, path: str) -> list[ReceivedRequest]:
         with self.lock:
@@ -97,17 +113,32 @@ def listening(host: str = "127.0.0.1", tls: bool = False) -> Iterator[Listener]:
             )
             with listener.lock:
                 listener.received.append(request)
-            handler = listener.routes.get((self.command, self.path.split("?")[0]))
+            handler = listener.handler_for(self.command, self.path.split("?")[0])
             status, headers, body = (
                 handler(request) if handler else (404, {"Content-Type": "text/plain"}, b"")
             )
             self.send_response(status)
             for name, value in headers.items():
                 self.send_header(name, value)
+            if not isinstance(body, bytes):
+                self._send_chunks(body)
+                return
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
+
+        def _send_chunks(self, chunks: Iterable[bytes]) -> None:
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                for chunk in chunks:
+                    self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            except OSError:
+                self.close_connection = True
+            finally:
+                getattr(chunks, "close", lambda: None)()
 
         do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _serve
 

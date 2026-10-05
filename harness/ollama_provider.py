@@ -6,7 +6,12 @@ and the server reports it) and answers what Open WebUI asks an Ollama server: `/
 finished reply (or the next answer queued with `server.queue_chat(...)`, which `chat_stream` and
 `chat_line` shape), `/api/generate` (an empty prompt with `keep_alive: 0` unloads, as Ollama does),
 `/api/embed`, and the model management calls. `/api/pull` and `/api/create` stream NDJSON
-progress and add the model, `/api/copy` adds the copy and `/api/delete` removes the model; an
+progress and add the model once the client has read the stream to the end, as Ollama stops a
+pull or create whose client disconnected; `/api/create` with `stream: false` adds it and answers
+at once. `/api/blobs/sha256:...` keeps the pushed bytes in `server.blobs` (a digest that does not
+match the bytes is a 400) and a create from `files` needs its blobs there. `server.hold_pulls()`
+makes every pull stop after its first progress line until `server.release_pulls()`, so a test
+can cancel one in flight. `/api/copy` adds the copy and `/api/delete` removes the model; an
 unknown model is a 404 with Ollama's error body. `server.sent(path)` is what each call carried.
 `connect_ollama(client, listener, **config)` switches the Ollama API on with the listener as its
 only connection and that per-connection config (a `prefix_id`). Snapshot `OLLAMA_CONFIG` with
@@ -15,7 +20,10 @@ only connection and that per-connection config (a `prefix_id`). Snapshot `OLLAMA
 
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
+import time
 from dataclasses import dataclass, field
 
 import httpx
@@ -26,6 +34,8 @@ OLLAMA_CONFIG = ("/ollama/config", "/ollama/config/update")
 OLLAMA_VERSION = "0.12.3"
 EMBEDDING = [0.1, 0.2, 0.3]
 GENERATED = "generated text"
+STREAM_STEP = 0.1  # seconds between streamed lines, long enough for a gone client to be noticed
+HOLD_LIMIT = 30  # seconds a held pull waits before it carries on by itself
 
 
 def ndjson(*lines: dict) -> Answer:
@@ -45,6 +55,18 @@ def chat_stream(model: str, *messages: dict, **counters) -> Answer:
     return ndjson(*(chat_line(model, message) for message in messages), finished)
 
 
+def ndjson_stream(lines: list[dict], finish=lambda: None) -> Answer:
+    """NDJSON sent line by line; `finish` runs only once every line has been written."""
+
+    def body():
+        for line in lines:
+            yield (json.dumps(line) + "\n").encode()
+            time.sleep(STREAM_STEP)
+        finish()
+
+    return 200, {"Content-Type": "application/x-ndjson"}, body()
+
+
 def model_not_found(name: str) -> Answer:
     return json_answer({"error": f"model '{name}' not found"}, status=404)
 
@@ -54,6 +76,16 @@ def _requested_model(request: ReceivedRequest) -> str:
     return body.get("model") or body.get("name") or ""
 
 
+def _tagged(name: str) -> str:
+    return name if ":" in name else f"{name}:latest"
+
+
+def _released() -> threading.Event:
+    released = threading.Event()
+    released.set()
+    return released
+
+
 @dataclass
 class OllamaServer:
     listener: Listener
@@ -61,6 +93,14 @@ class OllamaServer:
     loaded: list[str] = field(default_factory=list)
     version: str = OLLAMA_VERSION
     chat_answers: list[Answer] = field(default_factory=list)
+    blobs: dict[str, bytes] = field(default_factory=dict)
+    pulls_released: threading.Event = field(default_factory=_released)
+
+    def hold_pulls(self) -> None:
+        self.pulls_released.clear()
+
+    def release_pulls(self) -> None:
+        self.pulls_released.set()
 
     def sent(self, path: str) -> list[dict]:
         return [request.json() for request in self.listener.requests_to(path) if request.body]
@@ -99,26 +139,51 @@ class OllamaServer:
 
     def pull(self, request: ReceivedRequest) -> Answer:
         name = _requested_model(request)
-        self._add(name)
-        return ndjson(
+        progress = {"status": f"pulling {name}", "digest": "sha256:0f", "total": 100}
+        lines = [
             {"status": "pulling manifest"},
-            {"status": f"pulling {name}", "digest": "sha256:0f", "total": 100, "completed": 50},
-            {"status": f"pulling {name}", "digest": "sha256:0f", "total": 100, "completed": 100},
+            {**progress, "completed": 50},
+            {**progress, "completed": 100},
             {"status": "verifying sha256 digest"},
             {"status": "writing manifest"},
             {"status": "success"},
-        )
+        ]
+
+        def body():
+            for index, line in enumerate(lines):
+                yield (json.dumps(line) + "\n").encode()
+                if index == 1:
+                    self.pulls_released.wait(HOLD_LIMIT)
+            self._add(name)
+
+        return 200, {"Content-Type": "application/x-ndjson"}, body()
+
+    def blob(self, request: ReceivedRequest) -> Answer:
+        digest = request.path.split("?")[0].rsplit("/", 1)[-1]
+        actual = f"sha256:{hashlib.sha256(request.body).hexdigest()}"
+        if digest != actual:
+            return json_answer({"error": f"digest mismatch, expected {digest}, got {actual}"}, 400)
+        self.blobs[digest] = request.body
+        return 201, {}, b""
 
     def create(self, request: ReceivedRequest) -> Answer:
-        base = request.json().get("from")
+        body = request.json()
+        base = body.get("from")
         if base and base not in self.models:
             return model_not_found(base)
-        self._add(_requested_model(request))
-        return ndjson(
+        missing = [digest for digest in body.get("files", {}).values() if digest not in self.blobs]
+        if missing:
+            return json_answer({"error": f"blob {missing[0]} not found"}, status=400)
+        name = _tagged(_requested_model(request))
+        if body.get("stream") is False:
+            self._add(name)
+            return json_answer({"status": "success"})
+        lines = [
             {"status": "using existing layer sha256:0f"},
             {"status": "writing manifest"},
             {"status": "success"},
-        )
+        ]
+        return ndjson_stream(lines, finish=lambda: self._add(name))
 
     def copy(self, request: ReceivedRequest) -> Answer:
         body = request.json()
@@ -181,6 +246,7 @@ def serve_ollama(listener: Listener, *models: str) -> OllamaServer:
     listener.route("POST", "/api/embed", server.embed)
     listener.route("POST", "/api/pull", server.pull)
     listener.route("POST", "/api/create", server.create)
+    listener.route("POST", "/api/blobs/*", server.blob)
     listener.route("POST", "/api/copy", server.copy)
     listener.route("DELETE", "/api/delete", server.delete)
     return server

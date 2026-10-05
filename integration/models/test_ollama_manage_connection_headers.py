@@ -192,7 +192,6 @@ def test_uploading_a_model_file_sends_the_headers(operator, ollama):
     connect(operator, ollama, **GATED_WITHOUT_KEY)
     content = b"GGUF tiny model"
     blob_path = f"/api/blobs/sha256:{hashlib.sha256(content).hexdigest()}"
-    ollama.listener.route("POST", blob_path, (201, {}, b""))
 
     with operator.client() as client:
         uploaded = client.post(
