@@ -4,14 +4,16 @@ The edit dialog changes an account's name, email, role and password at once: the
 new name and role, the old credentials stop working, the new ones sign in through the auth page
 and the promoted account opens the admin panel. Deleting an account from its row takes it off the
 list and its sign-in is refused. The search box narrows the list by name or email, and the Name
-and Email column headers sort what is left, flipping direction on a second click. Each test works
-as a fresh admin on accounts of its own.
+and Email column headers sort what is left, flipping direction on a second click. "Sign out all
+devices" in the edit dialog, after a confirmation that says API keys stay active, ends every
+session of that account. Each test works as a fresh admin on accounts of its own.
 
 Discriminates: passes on dev 176d31d1d; in a frontend copy, the edit dialog sending the stored
 role and no password turns the edit test red (the role stays user), the delete confirmation doing
 nothing turns the delete test red (the row stays) and the Email header sorting by name turns the
 sort test red; in a backend copy, the user search matching emails alone turns the search test red
-(the name finds nobody).
+(the name finds nobody), and the sessions route of the users router returning without revoking
+turns the sign-out test red (the account's browser stays in the chat).
 
 The header test fails on dev a5bc78300 (open-webui/open-webui#31581): the sorted column's
 `aria-sort`, added by #27501 to tell screen readers the sort, keeps the value it had on load,
@@ -183,3 +185,24 @@ def test_the_sorted_column_header_tells_assistive_technology_its_direction(admin
     stale = "aria-sort keeps its load value after a header click (open-webui/open-webui#31581)"
     expect(name_header, stale).to_have_attribute("aria-sort", "ascending")
     expect(created_header, stale).to_have_attribute("aria-sort", "none")
+
+
+def test_sign_out_all_devices_ends_the_accounts_sessions(admin_page, make_user, page_for):
+    account = make_user()
+    accounts_page = page_for(account)
+    expect(chat_input(accounts_page)).to_be_visible()
+
+    users = _user_list(admin_page)
+    _search(users, account.email)
+    _row(users, account.email).get_by_role("button", name="Edit User").click()
+    editing = admin_page.get_by_role("dialog").filter(has_text="Edit User")
+    editing.get_by_role("button", name="Sign out all devices").click()
+    confirming = admin_page.get_by_role("dialog").filter(has_text="Sign out all devices?")
+    expect(confirming).to_contain_text("API keys remain active.")
+    confirming.get_by_role("button", name="Confirm").click()
+    expect(admin_page.get_by_text("All sessions revoked")).to_be_visible()
+
+    accounts_page.reload()
+    expect(accounts_page).to_have_url(re.compile(r"/auth"))
+    with account.client() as client:
+        assert client.get("/api/v1/auths/").status_code == 401
