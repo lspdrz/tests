@@ -2,7 +2,8 @@
 
 `serve_ollama(listener, *models)` keeps the server's models in `server.models` (append one later
 and the server reports it) and answers what Open WebUI asks an Ollama server: `/api/tags`,
-`/api/ps` (the names in `server.loaded`), `/api/version`, `/api/show`, `/api/chat` with one
+`/api/ps` (the names in `server.loaded`, with the `expires_at` of a running model),
+`/api/version`, `/api/show`, `/api/chat` with one
 finished reply (or the next answer queued with `server.queue_chat(...)`, which `chat_stream` and
 `chat_line` shape), `/api/generate` (an empty prompt with `keep_alive: 0` unloads, as Ollama does),
 `/api/embed`, and the model management calls. `/api/pull` and `/api/create` stream NDJSON
@@ -120,7 +121,9 @@ class OllamaServer:
         return json_answer({"models": [_tag(name) for name in self.models]})
 
     def running(self, _request: ReceivedRequest) -> Answer:
-        return json_answer({"models": [_tag(name) for name in self.loaded]})
+        # a running model carries the time Ollama will free it, as the real /api/ps does
+        running = [{**_tag(name), "expires_at": "2099-01-01T00:00:00Z"} for name in self.loaded]
+        return json_answer({"models": running})
 
     def show(self, request: ReceivedRequest) -> Answer:
         name = _requested_model(request)
