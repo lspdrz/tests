@@ -6,8 +6,13 @@ ran, so the JSON Preview under the form showed the stored model whatever had bee
 preview now builds the object from the live fields: name, system prompt, advanced params and
 capabilities appear as they are edited, before anything is saved.
 
+The Copy button beside the preview was left reading the old object, so on dev it still copies the
+model as last saved while the preview shows the edits. Its test stays red until Copy copies what
+the preview shows.
+
 Discriminates: passes on the dev b859124f9 build, fails on that build with 571dafae3 reverted (the
-preview still shows the old name, no system prompt, no params and the old capabilities).
+preview still shows the old name, no system prompt, no params and the old capabilities). The Copy
+test fails on both (the copied JSON carries the saved name).
 """
 
 from __future__ import annotations
@@ -112,3 +117,22 @@ def test_the_json_preview_shows_unsaved_changes_of_the_editor(page_for, builder,
     assert shown["params"]["temperature"] == 0.3
     assert shown["meta"]["capabilities"]["file_upload"] is False
     assert _stored_name(builder, preset) == preset["name"], "the preview saved the model"
+
+
+def test_the_json_preview_copy_holds_the_unsaved_changes(page_for, builder, preset):
+    page = page_for(builder, permissions=["clipboard-read", "clipboard-write"])
+    editor = _open_editor(page, preset)
+    _show_preview(editor)
+    new_name = f"Lighthouse guide {uuid.uuid4().hex[:6]}"
+    editor.get_by_placeholder("Model Name").fill(new_name)
+    expect(editor.locator("textarea[readonly]")).to_have_value(re.compile(re.escape(new_name)))
+
+    editor.get_by_text("JSON Preview", exact=True).locator("xpath=..").get_by_role(
+        "button", name="Copy"
+    ).click()
+    expect(page.get_by_text("Copied to clipboard")).to_be_visible()
+
+    copied = json.loads(page.evaluate("() => navigator.clipboard.readText()"))
+    assert copied["name"] == new_name, (
+        "the JSON Preview's Copy copies the model as last saved, not what the preview shows"
+    )
