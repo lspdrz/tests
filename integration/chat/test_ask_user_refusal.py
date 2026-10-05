@@ -169,3 +169,91 @@ def test_an_accepted_ask_user_call_waits_for_the_user(user, upstream):
     assert arguments["questions"][0]["options"][0] == {"label": "A", "description": "first"}
     time.sleep(1)  # nothing more should reach the model while the question is open
     assert len(upstream.chat_requests()) == 1
+
+
+def test_a_rejected_calls_own_broken_json_does_not_poison_later_turns(user, upstream):
+    """A rejected ask_user call's own invalid arguments must never be persisted verbatim.
+
+    stage_ask_user_tool_calls stores the function_call item's `arguments` field into
+    the chat's `output`, and that gets reconstructed into every later request in the
+    SAME conversation (process_messages_with_output -> convert_output_to_messages).
+    If the stored string is raw, truncated JSON instead of a sanitized
+    placeholder, a real provider rejects every later message in the conversation
+    outright -- regardless of its own content -- because a historical tool call's
+    arguments must themselves be valid JSON.
+
+    Discriminates: without sanitizing the stored arguments, the third request's
+    replayed history still contains the original broken string verbatim.
+    """
+    upstream.queue(
+        Reply(
+            tool_calls=[
+                ask_user_call(
+                    "call_broken", '{"questions": [{"id": "q1", "question": "truncated mid'
+                )
+            ]
+        ),
+        reply.text("Let's try something else."),
+    )
+    with user.client() as client:
+        turn, message = ask(client, "ask me something")
+        assert message["content"] == "Let's try something else."
+
+        upstream.queue(reply.text("second reply"))
+        _, second_message = ask(
+            client,
+            "ok, something else then",
+            chat_id=turn.chat_id,
+            parent_id=turn.assistant_message_id,
+        )
+
+    requests = upstream.chat_requests()
+    assert len(requests) == 3, f"expected 3 model calls, got {len(requests)}"
+
+    third_request_tool_calls = [
+        tool_call
+        for entry in requests[-1]["messages"]
+        if entry.get("role") == "assistant"
+        for tool_call in entry.get("tool_calls", [])
+        if tool_call.get("id") == "call_broken"
+    ]
+    assert third_request_tool_calls, (
+        "the original ask_user call should still be present in replayed history"
+    )
+    assert third_request_tool_calls[0]["function"]["arguments"] == "{}", (
+        "the broken arguments must not be replayed verbatim into a later request"
+    )
+    assert second_message["content"] == "second reply"
+
+
+def test_a_rejected_calls_valid_but_schema_failing_arguments_are_preserved(user, upstream):
+    """A rejected ask_user call's arguments must only be wiped when they are
+    not valid JSON at all -- never for arguments that parse fine but fail a
+    different rule (missing a required field, wrong shape, etc).
+
+    Valid JSON can never poison a later request (a provider only rejects a
+    historical tool call's arguments for being invalid JSON, not for failing
+    ask_user's own schema), so wiping it needlessly throws away real context
+    the model could use to correct itself on retry.
+    """
+    missing_id_arguments = ask_user_call(
+        "call_missing_id",
+        '{"questions": [{"question": "Which one?", "options": '
+        '[{"label": "A", "description": "a"}, {"label": "B", "description": "b"}]}]}',
+    )
+    upstream.queue(Reply(tool_calls=[missing_id_arguments]), reply.text("retrying"))
+    with user.client() as client:
+        _, message = ask(client, "ask me something")
+
+    results = tool_results(message)
+    assert results == {"call_missing_id": "Error: Each question requires a non-empty id."}
+
+    function_calls = [
+        entry
+        for entry in message["output"]
+        if entry.get("type") == "function_call" and entry.get("call_id") == "call_missing_id"
+    ]
+    assert function_calls, message["output"]
+    assert function_calls[0]["arguments"] == missing_id_arguments["function"]["arguments"], (
+        "valid-but-schema-failing arguments must be preserved as-is, not wiped"
+    )
