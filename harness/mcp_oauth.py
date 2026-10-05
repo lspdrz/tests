@@ -15,10 +15,12 @@ registration answers, `token_base` names the token endpoint of its metadata by a
 `reached(url)` points a URL the browser was sent there back at this server. With
 `offline_access_only` a code grant carries a refresh token only when the authorize asked for
 `access_type=offline`, the way Google's does. `revoke_refresh_tokens()` withdraws the live refresh
-tokens and
-`ProtectedMcp.presented` lists every bearer token the MCP server was shown. Both servers listen
-on `host` and name themselves by `name` (the address by default), so a test reaches them by a
-host name.
+tokens and `ProtectedMcp.presented` lists every bearer token the MCP server was shown.
+`register_oauth_mcp()` registers the server as the admin panel does and saves the connection (after
+`preserve(TOOL_SERVERS)`). `scopes` is what the MCP server's protected-resource metadata asks for
+and its tools require (`mcp:tools` by default; `GOOGLE_WORKSPACE_SCOPES` is a list as long as
+Google Workspace's). Both servers listen on `host` and name themselves by `name` (the address by
+default), so a test reaches them by a host name.
 """
 
 from __future__ import annotations
@@ -41,10 +43,30 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from harness.instance import free_port
 from harness.listener import IPv6HTTPServer
-from harness.mcp_server import serving_mcp
+from harness.mcp_server import TOOL_SERVERS, serving_mcp
 
 SCOPE = "mcp:tools"
 GOOGLE_ACCOUNTS = "https://accounts.google.com"
+GOOGLE_WORKSPACE_SCOPES = [
+    f"https://www.googleapis.com/auth/{service}{kind}"
+    for service in (
+        "calendar",
+        "drive",
+        "gmail",
+        "documents",
+        "spreadsheets",
+        "presentations",
+        "tasks",
+    )
+    for kind in (
+        "",
+        ".readonly",
+        ".file",
+        ".metadata",
+        ".settings.basic",
+        ".events",
+    )
+]
 
 
 @dataclass
@@ -342,14 +364,16 @@ class ProtectedMcp:
 
 @contextmanager
 def serving_protected_mcp(
-    host: str = "127.0.0.1", name: str | None = None
+    host: str = "127.0.0.1", name: str | None = None, scopes: list[str] | None = None
 ) -> Iterator[ProtectedMcp]:
     auth_server, shutdown = serve_authorization_server(host, name)
     port = free_port()
     resource_url = f"http://{_url_host(host, name)}:{port}/mcp"
     verifier = IssuedTokenVerifier(auth_server, resource_url)
     settings = AuthSettings(
-        issuer_url=auth_server.issuer, resource_server_url=resource_url, required_scopes=[SCOPE]
+        issuer_url=auth_server.issuer,
+        resource_server_url=resource_url,
+        required_scopes=scopes or [SCOPE],
     )
     try:
         # the SDK's Host check admits only loopback names, and a test reaches this one by others
@@ -365,3 +389,29 @@ def serving_protected_mcp(
             yield ProtectedMcp(url=url, auth_server=auth_server, verifier=verifier)
     finally:
         shutdown()
+
+
+def register_oauth_mcp(admin, mcp: ProtectedMcp, server_id: str, access_grants: list[dict]) -> None:
+    """Register `mcp` as the admin panel does and save the connection to it."""
+    with admin.client() as client:
+        registered = client.post(
+            "/api/v1/configs/oauth/clients/register",
+            params={"type": "mcp"},
+            json={"url": mcp.url, "client_id": server_id},
+        )
+        assert registered.status_code == 200, registered.text
+        connection = {
+            "url": mcp.url,
+            "path": "",
+            "type": "mcp",
+            "auth_type": "oauth_2.1",
+            "key": "",
+            "config": {"enable": True, "access_grants": access_grants},
+            "info": {
+                "id": server_id,
+                "name": server_id,
+                "oauth_client_info": registered.json()["oauth_client_info"],
+            },
+        }
+        saved = client.post(TOOL_SERVERS[1], json={"TOOL_SERVER_CONNECTIONS": [connection]})
+    assert saved.status_code == 200, saved.text
